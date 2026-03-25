@@ -1,0 +1,8 @@
+names:
+- transformer
+- overhead_tank
+- well
+nc: 3
+path: C:\Users\Dell\Downloads\geo_intel_stripfix\geo_intel_a4000\dataset\yolo_infra
+train: train/images
+val: val/images

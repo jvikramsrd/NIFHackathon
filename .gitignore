@@ -1,0 +1,70 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+logs/
+*.log
+
+# Project outputs and generated artifacts
+outputs/
+output/
+checkpoints/
+dataset/_split_train/
+dataset/_split_val/
+dataset/patches/
+dataset/patch_masks/
+dataset/building_crops/
+dataset/yolo_infra/images/
+dataset/yolo_infra/labels/
+dataset/masks/
+
+# Optional: keep large geospatial/source data out of Git
+# Uncomment if your raw datasets are not meant to be versioned:
+# data/
+# dataset/cg/
+# dataset/pb/
+
+# Misc
+*.tmp
+*.temp
+
+# Large model weights
+*.pt
+*.pth
+
+# Output and results
+results/
+
+# Temporary logs and scripts
+*preprocessing.txt
+test_*.py
