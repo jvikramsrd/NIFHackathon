@@ -1,5 +1,5 @@
 # Geo-Intel Hackathon — Two-Stage AI Pipeline
-# Problem Statement 1: AI-Based Feature Extraction from Drone Orthophotos
+# AI-Based Feature Extraction from Drone Orthophotos
 
 ## Architecture Overview
 
@@ -118,7 +118,7 @@ geo_intel/
     └── postprocess.py         ← CRF, morphology, vectorisation
 ```
 
-## Accuracy Strategy (targeting ≥95%)
+## Accuracy Strategy 
 1. **Pretrained backbone** — EfficientNet-B4 (ImageNet weights → strong feature extraction)
 2. **UNet++ skip connections** — denser feature reuse vs vanilla UNet
 3. **8-fold TTA** — averages predictions over rotations + flips
