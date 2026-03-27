@@ -192,26 +192,28 @@ def clean_segmentation_mask(
     bld = cv2.morphologyEx(bld, cv2.MORPH_CLOSE, kernel_close)
     bld = _remove_small_blobs(bld, min_bld)
     cleaned[bld == 1] = 1
-    cleaned[bld == 0] &= ~np.uint8(1)  # don't reset other classes
+    cleaned[(mask == 1) & (bld == 0)] = 0
 
     # --- Roads (class 2) ---
     road = (mask == 2).astype(np.uint8)
     # Aggressively bridge gaps in roads
     kernel_road_close = cv2.getStructuringElement(
-        cv2.MORPH_RECT, (min_road + 15, min_road + 15)
+        cv2.MORPH_ELLIPSE, (min_road + 15, min_road + 15)
     )
     kernel_road_open = cv2.getStructuringElement(cv2.MORPH_RECT, (min_road, min_road))
     road = cv2.morphologyEx(road, cv2.MORPH_CLOSE, kernel_road_close, iterations=2)
     road = cv2.morphologyEx(road, cv2.MORPH_OPEN, kernel_road_open)
     road = _remove_small_blobs(road, min_bld // 2)
-    cleaned = np.where(road == 1, 2, cleaned)
+    cleaned[road == 1] = 2
+    cleaned[(mask == 2) & (road == 0)] = 0
 
     # --- Waterbodies (class 3) ---
     water = (mask == 3).astype(np.uint8)
     kernel_water = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
     water = cv2.morphologyEx(water, cv2.MORPH_CLOSE, kernel_water)
     water = _remove_small_blobs(water, min_bld * 2)
-    cleaned = np.where(water == 1, 3, cleaned)
+    cleaned[water == 1] = 3
+    cleaned[(mask == 3) & (water == 0)] = 0
 
     return cleaned.astype(np.uint8)
 

@@ -601,8 +601,12 @@ def tile_image_and_mask(
                 pad_i = pi
                 pad_m = pm
             else:
-                pad_i = cv2.copyMakeBorder(pi, 0, patch_size - ph, 0, patch_size - pw, cv2.BORDER_REFLECT_101)
-                pad_m = cv2.copyMakeBorder(pm, 0, patch_size - ph, 0, patch_size - pw, cv2.BORDER_REFLECT_101)
+                pad_i = cv2.copyMakeBorder(
+                    pi, 0, patch_size - ph, 0, patch_size - pw, cv2.BORDER_REFLECT_101
+                )
+                pad_m = cv2.copyMakeBorder(
+                    pm, 0, patch_size - ph, 0, patch_size - pw, cv2.BORDER_REFLECT_101
+                )
 
             if np.sum(pad_m > 0) / patch_size**2 < min_fg:
                 continue
@@ -671,8 +675,8 @@ def _burn_strip_mask(
     row_off: int,
     strip_h: int,
 ) -> np.ndarray:
-    import rasterio.features
     import numpy as np
+    import rasterio.features
 
     actual_h = min(strip_h, H_full - row_off)
     mask = np.zeros((actual_h, W_full), dtype=np.uint8)
@@ -691,6 +695,7 @@ def _burn_strip_mask(
     strip_bounds_miny = transform.f + (row_off + actual_h) * transform.e
 
     from shapely.geometry import box
+
     strip_box = box(
         strip_bounds_minx,
         min(strip_bounds_miny, strip_bounds_maxy),
@@ -761,8 +766,12 @@ def _tile_strip(
             pad_i = pi
             pad_m = pm
         else:
-            pad_i = cv2.copyMakeBorder(pi, 0, patch_size - ph, 0, patch_size - pw, cv2.BORDER_REFLECT_101)
-            pad_m = cv2.copyMakeBorder(pm, 0, patch_size - ph, 0, patch_size - pw, cv2.BORDER_REFLECT_101)
+            pad_i = cv2.copyMakeBorder(
+                pi, 0, patch_size - ph, 0, patch_size - pw, cv2.BORDER_REFLECT_101
+            )
+            pad_m = cv2.copyMakeBorder(
+                pm, 0, patch_size - ph, 0, patch_size - pw, cv2.BORDER_REFLECT_101
+            )
 
         abs_r = row_off + r
         name = f"{safe_prefix}_{abs_r:06d}_{c:06d}.png"
@@ -788,6 +797,179 @@ def _tile_strip(
         saved = sum(results)
 
     return saved
+
+
+def _process_single_raster(raster_path, shps, built_up_shp, utility_shps):
+    import gc
+    import os
+    import re
+    import time
+
+    import geopandas as gpd
+    import numpy as np
+    import rasterio
+    from shapely.strtree import STRtree
+    from tqdm import tqdm
+
+    import config
+    from config import INFRA_TYPE_MAP, ROOF_TYPE_MAP, SHP_LAYER_ROLES
+
+    cfg1 = config.STAGE1
+    cfg2a = config.STAGE2A
+    cfg2b = config.STAGE2B
+
+    print(f"\n  Processing {raster_path.name} on PID {os.getpid()}")
+    try:
+        H, W, crs, transform, meta, dtype, n_bands = _raster_info(raster_path)
+    except Exception as e:
+        print(f"    [SKIP] Cannot open {raster_path.name}: {e}")
+        return 0, 0, 0, 1  # patches, crops, infra, failed
+
+    ram_gb = H * W * 3 / 1e9
+    print(
+        f"    {raster_path.name} : {W:,} x {H:,} px  ({ram_gb:.1f} GB if loaded whole)"
+    )
+
+    safe_prefix = re.sub(r"[^\w]", "_", raster_path.stem)[:40]
+    mask_tif_path = str(
+        config.TRAIN_MASKS / f"{safe_prefix}_{int(time.time())}_{os.getpid()}_mask.tif"
+    )
+    mask_meta = meta.copy()
+    mask_meta.update(count=1, dtype=rasterio.uint8, compress="lzw")
+
+    # --- PRELOAD SHAPEFILES FOR THIS RASTER ---
+    print(
+        f"    {raster_path.name}: Preloading and indexing SHP geometries into memory..."
+    )
+    preloaded_shps = []
+    for shp_path in shps:
+        stem_low = shp_path.stem.lower().rstrip("_")
+        role = SHP_LAYER_ROLES.get(stem_low)
+        if role is None:
+            for key, val in SHP_LAYER_ROLES.items():
+                if stem_low.startswith(key[:10]):
+                    role = val
+                    break
+        if role is None:
+            continue
+
+        class_id, _ = role
+        if class_id == 0:
+            continue
+
+        try:
+            gdf = gpd.read_file(str(shp_path))
+        except Exception:
+            continue
+
+        if len(gdf) == 0:
+            continue
+
+        if gdf.crs is not None and gdf.crs != crs:
+            try:
+                gdf = gdf.to_crs(crs)
+            except Exception:
+                continue
+
+        valid_geoms = []
+        for geom in gdf.geometry:
+            if geom is not None and not geom.is_empty:
+                if not geom.is_valid:
+                    try:
+                        geom = geom.buffer(0)
+                    except Exception:
+                        continue
+                if geom.is_valid:
+                    valid_geoms.append(geom)
+
+        if valid_geoms:
+            tree = STRtree(valid_geoms)
+            preloaded_shps.append((class_id, valid_geoms, tree))
+
+    patch_size = cfg1["patch_size"]
+    overlap = cfg1["overlap"]
+    strip_advance = STRIP_ROWS - patch_size
+    n_strips = max(1, (H - patch_size + strip_advance - 1) // strip_advance + 1)
+
+    raster_patches = 0
+    with rasterio.open(mask_tif_path, "w", **mask_meta) as mask_dst:
+        for strip_idx in range(n_strips):
+            row_off = strip_idx * strip_advance
+            if row_off >= H:
+                break
+
+            try:
+                img_strip = _read_strip_rgb(raster_path, row_off, STRIP_ROWS)
+            except Exception as e:
+                print(f"    [SKIP strip {strip_idx} on {raster_path.name}] {e}")
+                continue
+
+            actual_h = img_strip.shape[0]
+
+            mask_strip = _burn_strip_mask(
+                preloaded_shps, H, W, crs, transform, row_off, actual_h
+            )
+
+            write_row_start = 0 if strip_idx == 0 else patch_size
+            write_row_end = actual_h
+            if write_row_end > write_row_start:
+                WindowCls = getattr(rasterio.windows, "Window")
+                win = WindowCls(
+                    0, row_off + write_row_start, W, write_row_end - write_row_start
+                )
+                mask_dst.write(
+                    mask_strip[write_row_start:write_row_end][np.newaxis],
+                    window=win,
+                )
+
+            n = _tile_strip(
+                img_strip,
+                mask_strip,
+                row_off,
+                patch_size,
+                overlap,
+                str(config.PATCH_DIR),
+                str(config.MASK_DIR),
+                safe_prefix,
+                min_fg=0.003,
+            )
+            raster_patches += n
+
+            pct = min(100, int((row_off + actual_h) / H * 100))
+            print(
+                f"    {raster_path.name} | Strip {strip_idx + 1:2d}/{n_strips} | patches={n} [{pct}%]"
+            )
+
+            del img_strip, mask_strip
+            gc.collect()
+
+    n_crops = _extract_crops_streaming(
+        raster_path,
+        built_up_shp,
+        cfg2a["shp_roof_col"],
+        ROOF_TYPE_MAP,
+        str(config.CROP_DIR),
+        cfg2a["crop_size"],
+        cfg2a["min_crop_px"],
+    )
+
+    n_infra = 0
+    if utility_shps:
+        n_infra = _extract_infra_streaming(
+            raster_path,
+            utility_shps,
+            cfg2b["shp_infra_col"],
+            INFRA_TYPE_MAP,
+            cfg2b["class_names"],
+            str(config.YOLO_DIR / "images"),
+            str(config.YOLO_DIR / "labels"),
+            cfg2b["img_size"],
+            class_buffer_px=cfg2b.get("class_buffer_px"),
+            neg_tile_ratio=cfg2b.get("neg_tile_ratio", 0.0),
+        )
+
+    gc.collect()
+    return raster_patches, n_crops, n_infra, 0
 
 
 def preprocess_folder(folder: str, config) -> Dict:
@@ -833,197 +1015,39 @@ def preprocess_folder(folder: str, config) -> Dict:
     processed = 0
     failed = 0
 
-    for raster_path in rasters:
-        print(f"\n  {raster_path.name}")
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
-        # Get raster dimensions without reading pixels
-        try:
-            H, W, crs, transform, meta, dtype, n_bands = _raster_info(raster_path)
-        except Exception as e:
-            print(f"    [SKIP] Cannot open: {e}")
-            failed += 1
-            continue
+    max_workers = max(1, multiprocessing.cpu_count() // 2)
+    max_workers = min(max_workers, 5)  # 5 concurrent rasters is roughly 17GB RAM
+    print(f"  Spawning ProcessPoolExecutor with {max_workers} workers...")
 
-        ram_gb = H * W * 3 / 1e9
-        print(f"    Size : {W:,} x {H:,} px  ({ram_gb:.1f} GB if loaded whole)")
-        print(f"    Mode : strip-based  ({STRIP_ROWS} rows/strip)")
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _process_single_raster, r, shps, built_up_shp, utility_shps
+            ): r
+            for r in rasters
+        }
 
-        safe_prefix = re.sub(r"[^\w]", "_", raster_path.stem)[:40]
-
-        # Open output mask TIF for writing (written strip-by-strip)
-        import time
-        mask_tif_path = str(config.TRAIN_MASKS / f"{safe_prefix}_{int(time.time())}_mask.tif")
-        mask_meta = meta.copy()
-        mask_meta.update(count=1, dtype=rasterio.uint8, compress="lzw")
-
-        
-        # --- PRELOAD SHAPEFILES FOR THIS RASTER ---
-        import geopandas as gpd
-        from shapely.strtree import STRtree
-        print("    Preloading and indexing SHP geometries into memory...")
-        preloaded_shps = []
-        for shp_path in shps:
-            stem_low = shp_path.stem.lower().rstrip("_")
-            role = SHP_LAYER_ROLES.get(stem_low)
-            if role is None:
-                for key, val in SHP_LAYER_ROLES.items():
-                    if stem_low.startswith(key[:10]):
-                        role = val
-                        break
-            if role is None:
-                continue
-
-            class_id, _ = role
-            if class_id == 0:
-                continue
-
+        for future in as_completed(futures):
+            raster_path = futures[future]
             try:
-                gdf = gpd.read_file(str(shp_path))
-            except Exception:
-                continue
-
-            if len(gdf) == 0:
-                continue
-
-            if gdf.crs is not None and gdf.crs != crs:
-                try:
-                    gdf = gdf.to_crs(crs)
-                except Exception:
-                    continue
-
-            valid_geoms = []
-            for geom in gdf.geometry:
-                if geom is not None and not geom.is_empty:
-                    if not geom.is_valid:
-                        try:
-                            geom = geom.buffer(0)
-                        except Exception:
-                            continue
-                    if geom.is_valid:
-                        valid_geoms.append(geom)
-
-            if valid_geoms:
-                # Build an STRtree for lightning fast bounding box queries
-                tree = STRtree(valid_geoms)
-                preloaded_shps.append((class_id, valid_geoms, tree))
-        print("    Done preloading SHPs.")
-        # ------------------------------------------
-
-        patch_size = cfg1["patch_size"]
-        overlap = cfg1["overlap"]
-        # Strip advance = STRIP_ROWS but we overlap by patch_size so boundary
-        # patches between strips are not cut off
-        strip_advance = STRIP_ROWS - patch_size
-        n_strips = max(1, (H - patch_size + strip_advance - 1) // strip_advance + 1)
-
-        print(f"    Strips: {n_strips}  |  Burning SHPs + tiling per strip ...")
-
-        raster_patches = 0
-        with rasterio.open(mask_tif_path, "w", **mask_meta) as mask_dst:
-            for strip_idx in tqdm(range(n_strips), desc="    Strips", leave=False):
-                row_off = strip_idx * strip_advance
-                if row_off >= H:
-                    break
-
-                # Read RGB strip
-                try:
-                    img_strip = _read_strip_rgb(raster_path, row_off, STRIP_ROWS)
-                except Exception as e:
-                    print(f"    [SKIP strip {strip_idx}] {e}")
-                    continue
-
-                actual_h = img_strip.shape[0]
-
-                # Burn mask for this strip
-                mask_strip = _burn_strip_mask(
-                    preloaded_shps,
-                    H,
-                    W,
-                    crs,
-                    transform,
-                    row_off,
-                    actual_h,
-                )
-
-                # Write mask strip to disk (non-overlapping rows only)
-                write_row_start = 0 if strip_idx == 0 else patch_size
-                write_row_end = actual_h
-                if write_row_end > write_row_start:
-                    WindowCls = getattr(rasterio.windows, "Window")
-                    win = WindowCls(
-                        0, row_off + write_row_start, W, write_row_end - write_row_start
-                    )
-                    mask_dst.write(
-                        mask_strip[write_row_start:write_row_end][np.newaxis],
-                        window=win,
-                    )
-
-                # Tile this strip
-                n = _tile_strip(
-                    img_strip,
-                    mask_strip,
-                    row_off,
-                    patch_size,
-                    overlap,
-                    str(config.PATCH_DIR),
-                    str(config.MASK_DIR),
-                    safe_prefix,
-                    min_fg=0.003,
-                )
-                raster_patches += n
-
-                # Show progress
-                pct = min(100, int((row_off + actual_h) / H * 100))
-                fg = int((mask_strip > 0).sum())
-                tot = actual_h * W
+                p, c, i, f = future.result()
+                total_patches += p
+                total_crops += c
+                total_infra += i
+                failed += f
+                if f == 0:
+                    processed += 1
+            except Exception as e:
                 print(
-                    f"    Strip {strip_idx + 1:2d}/{n_strips}  "
-                    f"rows {row_off:6d}-{row_off + actual_h:6d}  "
-                    f"patches={n}  fg={100 * fg / tot:.1f}%  [{pct}%]"
+                    f"    [CRASH] Raster {raster_path.name} failed with exception: {e}"
                 )
+                import traceback
 
-                # Free strip memory before next iteration
-                del img_strip, mask_strip
-                gc.collect()
-
-        print(f"    Total patches: {raster_patches}")
-        total_patches += raster_patches
-
-        # Building crops — read one building at a time (no full raster load)
-        print("    Extracting building crops (streaming) ...")
-        n_crops = _extract_crops_streaming(
-            raster_path,
-            built_up_shp,
-            cfg2a["shp_roof_col"],
-            ROOF_TYPE_MAP,
-            str(config.CROP_DIR),
-            cfg2a["crop_size"],
-            cfg2a["min_crop_px"],
-        )
-        total_crops += n_crops
-        print(f"    Building crops: {n_crops}")
-
-        # Infrastructure YOLO labels
-        if utility_shps:
-            print("    Extracting infrastructure labels ...")
-            n_infra = _extract_infra_streaming(
-                raster_path,
-                utility_shps,
-                cfg2b["shp_infra_col"],
-                INFRA_TYPE_MAP,
-                cfg2b["class_names"],
-                str(config.YOLO_DIR / "images"),
-                str(config.YOLO_DIR / "labels"),
-                cfg2b["img_size"],
-                class_buffer_px=cfg2b.get("class_buffer_px"),
-                neg_tile_ratio=cfg2b.get("neg_tile_ratio", 0.0),
-            )
-            total_infra += n_infra
-            print(f"    Infrastructure objects: {n_infra}")
-
-        processed += 1
-        gc.collect()
-
+                traceback.print_exc()
+                failed += 1
     return {
         "folder": str(folder),
         "rasters": processed,
@@ -1048,6 +1072,7 @@ def _extract_crops_streaming(
 
     try:
         import geopandas as gpd
+
         gdf = gpd.read_file(str(built_up_shp))
     except Exception as e:
         print(f"      [SKIP crops] {e}")
@@ -1055,13 +1080,16 @@ def _extract_crops_streaming(
 
     saved = 0
     import re
+
     stem = re.sub(r"[^\w]", "_", raster_path.stem)[:20]
 
     try:
-        import rasterio
         from pathlib import Path
+
         import cv2
         import numpy as np
+        import rasterio
+
         with rasterio.open(str(raster_path)) as src:
             crs = src.crs
             H, W = src.height, src.width
@@ -1075,7 +1103,9 @@ def _extract_crops_streaming(
             # Sequential reading is safe, stable, and often faster due to GDAL's block cache vs locking overhead
             from tqdm import tqdm
 
-            for idx, row in tqdm(gdf.iterrows(), total=len(gdf), desc="      Crops", leave=False):
+            for idx, row in tqdm(
+                gdf.iterrows(), total=len(gdf), desc="      Crops", leave=False
+            ):
                 raw_type = str(row.get(roof_col, "other") or "other").lower().strip()
                 label = roof_type_map.get(raw_type)
                 if label is None:
@@ -1120,7 +1150,9 @@ def _extract_crops_streaming(
                             crop = crop.astype(np.uint8)
 
                     # Better interpolation for downscaling/upscaling
-                    crop = cv2.resize(crop, (crop_size, crop_size), interpolation=cv2.INTER_AREA)
+                    crop = cv2.resize(
+                        crop, (crop_size, crop_size), interpolation=cv2.INTER_AREA
+                    )
                     out_p = label_dir / f"{stem}_{idx:06d}.png"
                     cv2.imwrite(str(out_p), cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
                     saved += 1
@@ -1131,6 +1163,7 @@ def _extract_crops_streaming(
         print(f"      [SKIP crops] Cannot open raster: {e}")
 
     return saved
+
 
 def _extract_infra_streaming(
     raster_path: Path,
@@ -1231,7 +1264,7 @@ def _extract_infra_streaming(
         tc = max(0, min(pc - half, W - tile_size))
         # Snap to nearest existing tile if close (within half tile)
         merged = False
-        for (etr, etc) in list(tile_contents.keys()):
+        for etr, etc in list(tile_contents.keys()):
             if abs(tr - etr) < half and abs(tc - etc) < half:
                 tile_contents[(etr, etc)].append((cid, pc, pr))
                 merged = True
@@ -1241,7 +1274,9 @@ def _extract_infra_streaming(
 
     # ── Write positive tiles with class-specific bounding boxes ───────────
     with rasterio.open(str(raster_path)) as src:
-        for (tr, tc), pts in tqdm(tile_contents.items(), desc="      Infra+", leave=False):
+        for (tr, tc), pts in tqdm(
+            tile_contents.items(), desc="      Infra+", leave=False
+        ):
             r2, c2 = min(tr + tile_size, H), min(tc + tile_size, W)
             ph, pw = r2 - tr, c2 - tc
             if ph <= 0 or pw <= 0:
@@ -1291,6 +1326,7 @@ def _extract_infra_streaming(
         # These teach YOLO what buildings/roads look like WITHOUT infra.
         if neg_tile_ratio > 0:
             import random
+
             n_neg = max(1, int(len(tile_contents) * neg_tile_ratio))
             occupied = set(tile_contents.keys())
             neg_count = 0
@@ -1344,7 +1380,9 @@ def _extract_infra_streaming(
             if neg_count > 0:
                 print(f"      Negative tiles: {neg_count} (no-infra background)")
 
-    print(f"      Infrastructure objects: {total}  |  Positive tiles: {len(tile_contents)}")
+    print(
+        f"      Infrastructure objects: {total}  |  Positive tiles: {len(tile_contents)}"
+    )
     return total
 
 

@@ -43,7 +43,9 @@ class RooftopClassifier(nn.Module):
             global_pool="avg",
             drop_path_rate=0.4,  # stochastic depth — higher for larger models
         )
-        in_features = self.backbone.num_features  # 1536 for convnext_large, 1024 for base
+        in_features = (
+            self.backbone.num_features
+        )  # 1536 for convnext_large, 1024 for base
 
         # Scale hidden dim proportionally to backbone features
         hidden_dim = max(512, in_features // 2)
@@ -97,7 +99,9 @@ class RooftopClassifier(nn.Module):
 
     # ── 16-fold Multi-Scale TTA inference ───────────────────────────────────
     @torch.no_grad()
-    def predict(self, x: torch.Tensor, tta_steps: int = 16) -> torch.Tensor:
+    def predict(
+        self, x: torch.Tensor, tta_steps: int = 16, return_probs: bool = False
+    ) -> torch.Tensor:
         """
         16-fold TTA:
         Base scale (8 folds: D4 dihedral group of rotations + flips)
@@ -139,7 +143,12 @@ class RooftopClassifier(nn.Module):
                     aug = torch.flip(aug, [3])
                 preds.append(torch.softmax(self(aug), 1))
 
-        return torch.stack(preds).mean(0).argmax(1)
+        mean_probs = torch.stack(preds).mean(0)
+
+        if return_probs:
+            return mean_probs
+
+        return mean_probs.argmax(1)
 
     def class_weights(self) -> torch.Tensor:
         """Return uniform weights (override if you have counts)."""
@@ -205,6 +214,7 @@ class InfrastructureDetector:
             exist_ok=True,
             amp=True,  # native AMP
             verbose=True,
+            workers=self.cfg.get("workers", 0),
         )
 
     def predict(self, img_path: str) -> list:
@@ -272,11 +282,13 @@ def soft_nms_gaussian(
     N = len(boxes)
     indices = torch.arange(N, device=boxes.device)
     kept = []
+    kept_scores = []
 
     while len(scores) > 0:
         # Pick highest-scoring box
         max_idx = scores.argmax()
         kept.append(indices[max_idx].item())
+        kept_scores.append(scores[max_idx].item())
         max_box = boxes[max_idx]
 
         # Remove the selected box
@@ -300,7 +312,7 @@ def soft_nms_gaussian(
         iou = inter / (area_a + area_b - inter + 1e-6)
 
         # Gaussian decay
-        decay = torch.exp(-iou ** 2 / sigma)
+        decay = torch.exp(-(iou**2) / sigma)
         scores *= decay
 
         # Prune low-confidence boxes
@@ -310,7 +322,8 @@ def soft_nms_gaussian(
         indices = indices[keep]
 
     kept_idx = torch.tensor(kept, dtype=torch.long)
-    return kept_idx
+    out_scores = torch.tensor(kept_scores, dtype=torch.float32)
+    return kept_idx, out_scores
 
 
 def _build_frcnn(num_classes: int) -> nn.Module:

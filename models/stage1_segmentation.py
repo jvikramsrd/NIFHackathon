@@ -39,7 +39,13 @@ def get_parameter_groups(model: nn.Module, cfg: dict) -> List[dict]:
     """Two efficient parameter groups: encoder (lower LR) and decoder (full LR).
     Batching into 2 groups instead of one-per-param is critical for memory efficiency
     with 64M-param transformers."""
-    no_decay = {"bias", "LayerNorm.weight", "norm.weight", "norm1.weight", "norm2.weight"}
+    no_decay = {
+        "bias",
+        "LayerNorm.weight",
+        "norm.weight",
+        "norm1.weight",
+        "norm2.weight",
+    }
     enc_decay, enc_nodecay, dec_decay, dec_nodecay = [], [], [], []
     enc_lr = cfg["lr"] * cfg["encoder_lr_mult"]
     dec_lr = cfg["lr"]
@@ -54,10 +60,14 @@ def get_parameter_groups(model: nn.Module, cfg: dict) -> List[dict]:
         else:
             (dec_nodecay if no_wd else dec_decay).append(param)
     groups = []
-    if enc_decay:   groups.append({"params": enc_decay,   "lr": enc_lr, "weight_decay": wd})
-    if enc_nodecay: groups.append({"params": enc_nodecay, "lr": enc_lr, "weight_decay": 0.0})
-    if dec_decay:   groups.append({"params": dec_decay,   "lr": dec_lr, "weight_decay": wd})
-    if dec_nodecay: groups.append({"params": dec_nodecay, "lr": dec_lr, "weight_decay": 0.0})
+    if enc_decay:
+        groups.append({"params": enc_decay, "lr": enc_lr, "weight_decay": wd})
+    if enc_nodecay:
+        groups.append({"params": enc_nodecay, "lr": enc_lr, "weight_decay": 0.0})
+    if dec_decay:
+        groups.append({"params": dec_decay, "lr": dec_lr, "weight_decay": wd})
+    if dec_nodecay:
+        groups.append({"params": dec_nodecay, "lr": dec_lr, "weight_decay": 0.0})
     return groups
 
 
@@ -130,35 +140,58 @@ class TriLoss(nn.Module):
 
 @torch.no_grad()
 def tta_predict(
-    model: nn.Module, image: torch.Tensor, num_classes: int, amp_dtype=torch.bfloat16
+    model: nn.Module,
+    image: torch.Tensor,
+    num_classes: int,
+    amp_dtype=torch.bfloat16,
+    fast_tta=True,
 ) -> torch.Tensor:
-    """8-fold TTA: D4 dihedral symmetries (4 rotations × 2 flips). Returns (C,H,W) softmax probs."""
-    # Note: image is (1,C,H,W), output prob is (num_classes,H,W)
+    """TTA: D4 symmetries or fast mode (4 rotations + zoom). Returns (B,C,H,W) softmax probs."""
     model.eval()
-    
+
+    B, C_in, H, W = image.shape
     probs_sum = torch.zeros(
-        (num_classes, image.shape[2], image.shape[3]), 
-        device=image.device, 
-        dtype=torch.float32
+        (B, num_classes, H, W),
+        device=image.device,
+        dtype=torch.float32,
     )
-    
+
     with torch.amp.autocast("cuda", dtype=amp_dtype):  # type: ignore
         for k in range(4):
             # Rotations
             aug = torch.rot90(image, k, dims=[2, 3])
-            prob = torch.softmax(model(aug).float(), 1).squeeze(0)
-            prob = torch.rot90(prob, -k, dims=[1, 2])
+            prob = torch.softmax(model(aug).float(), 1)
+            prob = torch.rot90(prob, -k, dims=[2, 3])
             probs_sum += prob
-            
-            # Flips + Rotations
-            aug_f = torch.flip(image, [3])
-            aug_f = torch.rot90(aug_f, k, dims=[2, 3])
-            prob_f = torch.softmax(model(aug_f).float(), 1).squeeze(0)
-            prob_f = torch.rot90(prob_f, -k, dims=[1, 2])
-            prob_f = torch.flip(prob_f, [2])
-            probs_sum += prob_f
-            
-    return probs_sum / 8.0
+
+            if not fast_tta:
+                # Flips + Rotations
+                aug_f = torch.flip(image, [3])
+                aug_f = torch.rot90(aug_f, k, dims=[2, 3])
+                prob_f = torch.softmax(model(aug_f).float(), 1)
+                prob_f = torch.rot90(prob_f, -k, dims=[2, 3])
+                prob_f = torch.flip(prob_f, [3])
+                probs_sum += prob_f
+
+        # Add 1.25x zoomed scale
+        img_up = F.interpolate(
+            image, scale_factor=1.25, mode="bilinear", align_corners=False
+        )
+        probs_up = torch.softmax(model(img_up).float(), 1)
+        probs_down = F.interpolate(
+            probs_up,
+            size=(H, W),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        # In fast mode, we did 4 passes. Give zoom a weight of 2.0. Total weight = 6.0
+        # In full mode, we did 8 passes. Give zoom a weight of 4.0. Total weight = 12.0
+        zoom_weight = 2.0 if fast_tta else 4.0
+        probs_sum += probs_down * zoom_weight
+
+    total_weight = 6.0 if fast_tta else 12.0
+    return probs_sum / total_weight
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -190,13 +223,14 @@ class Stage1Module(nn.Module):
         return get_parameter_groups(self.model, self.cfg)
 
     @torch.no_grad()
-    def predict(self, images, use_tta=False, amp_dtype=torch.bfloat16):
+    def predict(self, images, use_tta=False, amp_dtype=torch.bfloat16, fast_tta=True):
         self.eval()
         if use_tta:
-            assert images.shape[0] == 1
-            return (
-                tta_predict(self.model, images, self.cfg["num_classes"], amp_dtype)
-                .argmax(0)
-                .unsqueeze(0)
-            )
+            return tta_predict(
+                self.model,
+                images,
+                self.cfg["num_classes"],
+                amp_dtype,
+                fast_tta=fast_tta,
+            ).argmax(1)
         return self.model(images).argmax(1)

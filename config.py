@@ -51,7 +51,8 @@ for d in [
 # ─── Hardware ────────────────────────────────────────────────────────────────
 DEVICE = "cuda"
 # Prevent CUDA memory fragmentation (recommended when OOM errors occur)
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# Note: expandable_segments is not supported on Windows.
+# os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -181,7 +182,7 @@ STAGE1 = dict(
     min_building_area_px=80,
     min_road_width_px=3,
     crf_inference=True,
-    crf_iter=12,
+    crf_iter=5,  # Reduced from 12 to 5 for significant speedup with nearly identical accuracy
 )
 
 # ─── Stage 2A: Rooftop Classification ───────────────────────────────────────
@@ -218,6 +219,7 @@ STAGE2B = dict(
     img_size=1280,
     cache="ram",
     batch_size=4,
+    workers=0,
     epochs=150,
     lr0=1e-3,
     lrf=0.01,
@@ -238,7 +240,7 @@ STAGE2B = dict(
     conf_thresh=0.25,
     iou_thresh=0.30,
     max_det=1000,
-    overlap=256,
+    overlap=512,
     # Per-class bounding box radius (pixels) — replaces fixed buffer_px=20
     # Sized to match actual object footprints in SVAMITVA drone imagery
     class_buffer_px={"transformer": 60, "overhead_tank": 50, "well": 25},

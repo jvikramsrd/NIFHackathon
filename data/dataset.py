@@ -137,6 +137,11 @@ class RooftopDataset(Dataset):
 def get_train_transforms(patch_size: int = 640):
     return A.Compose(
         [
+            A.PadIfNeeded(
+                min_height=patch_size,
+                min_width=patch_size,
+                border_mode=cv2.BORDER_REFLECT,
+            ),
             A.RandomCrop(height=patch_size, width=patch_size),
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),

@@ -6,6 +6,8 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .ipynb_checkpoints/
+runs/
+dataset/
 
 # Virtual environments
 venv/

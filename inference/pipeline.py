@@ -193,12 +193,17 @@ class GeoIntelPipeline:
     def _segment(self, img_rgb: np.ndarray) -> np.ndarray:
         H, W = img_rgb.shape[:2]
         ps = int(CFG.STAGE1["patch_size"])  # type: ignore
-        overlap = int(CFG.STAGE1["overlap"])
+        # Reduce overlap for faster inference (smooth blending prevents seams anyway)
+        overlap = min(int(CFG.STAGE1["overlap"]), 128)
         stride = ps - overlap  # type: ignore
         C = int(CFG.STAGE1["num_classes"])  # type: ignore
         prob_sum = np.zeros((C, H, W), dtype=np.float32)
         count_map = np.zeros((H, W), dtype=np.float32)
         window = self._spline_window(ps, overlap)
+
+        batch_size = 16
+        batch_inputs = []
+        batch_coords = []
 
         with torch.no_grad():
             for r in tqdm(range(0, H, stride), desc="  tiles"):
@@ -214,15 +219,46 @@ class GeoIntelPipeline:
                     else:
                         pad = patch
                     aug = self.seg_tf(image=pad)
-                    inp = aug["image"].unsqueeze(0).to(self.device)
+                    inp = aug["image"]
 
-                    # 16-fold TTA on A4000 is fast enough for inference
-                    probs = (
-                        tta_predict(self.seg.model, inp, C, CFG.AMP_DTYPE).cpu().numpy()
+                    batch_inputs.append(inp)
+                    batch_coords.append((r, r2, c, c2, ph, pw))
+
+                    if len(batch_inputs) == batch_size:
+                        inp_tensor = torch.stack(batch_inputs).to(self.device)
+                        probs = (
+                            tta_predict(
+                                self.seg.model,
+                                inp_tensor,
+                                C,
+                                CFG.AMP_DTYPE,
+                                fast_tta=True,
+                            )
+                            .cpu()
+                            .numpy()
+                        )
+                        for i, (br, br2, bc, bc2, bph, bpw) in enumerate(batch_coords):
+                            wind_slice = window[:bph, :bpw]
+                            prob_sum[:, br:br2, bc:bc2] += (
+                                probs[i, :, :bph, :bpw] * wind_slice
+                            )
+                            count_map[br:br2, bc:bc2] += wind_slice
+                        batch_inputs = []
+                        batch_coords = []
+
+            if len(batch_inputs) > 0:
+                inp_tensor = torch.stack(batch_inputs).to(self.device)
+                probs = (
+                    tta_predict(
+                        self.seg.model, inp_tensor, C, CFG.AMP_DTYPE, fast_tta=True
                     )
-                    wind_slice = window[:ph, :pw]
-                    prob_sum[:, r:r2, c:c2] += probs[:, :ph, :pw] * wind_slice
-                    count_map[r:r2, c:c2] += wind_slice
+                    .cpu()
+                    .numpy()
+                )
+                for i, (br, br2, bc, bc2, bph, bpw) in enumerate(batch_coords):
+                    wind_slice = window[:bph, :bpw]
+                    prob_sum[:, br:br2, bc:bc2] += probs[i, :, :bph, :bpw] * wind_slice
+                    count_map[br:br2, bc:bc2] += wind_slice
 
         print("  [DEBUG] Tiling loop finished. Returning averaged probability map...")
         return prob_sum / np.maximum(count_map, 1e-6)
@@ -235,7 +271,31 @@ class GeoIntelPipeline:
         gdf = gpd.read_file(bld_shp_path)
         preds = {}
         inv_transform = ~transform
-        for idx, row in gdf.iterrows():
+
+        batch_size = 64
+        batch_inputs = []
+        batch_indices = []
+
+        def _process_batch(inputs, indices):
+            if not inputs:
+                return
+            inp_tensor = torch.stack(inputs).to(self.device)
+            inp_tensor = cl_input(inp_tensor)
+            with torch.no_grad():
+                probs = self.clf.predict(
+                    inp_tensor, int(CFG.STAGE2A["tta_steps"]), return_probs=True
+                )  # type: ignore
+
+            class_names_2a = [str(x) for x in CFG.STAGE2A["class_names"]]  # type: ignore
+            max_probs, pids = torch.max(probs, dim=1)
+
+            for i, i_idx in enumerate(indices):
+                if max_probs[i].item() < 0.55:
+                    preds[i_idx] = "Other"
+                else:
+                    preds[i_idx] = class_names_2a[pids[i].item()]
+
+        for idx, row in tqdm(gdf.iterrows(), total=len(gdf), desc="  roofs"):
             geom = row.geometry
             if geom is None or geom.is_empty:
                 continue
@@ -275,12 +335,19 @@ class GeoIntelPipeline:
                 continue
 
             crop = cv2.resize(img_slice, (crop_sz, crop_sz))
-            inp = self.clf_tf(image=crop)["image"].unsqueeze(0).to(self.device)
-            inp = cl_input(inp)  # NHWC for ConvNeXt — consistent with training
-            with torch.no_grad():
-                pid = int(self.clf.predict(inp, int(CFG.STAGE2A["tta_steps"])).item())  # type: ignore
-            class_names_2a = [str(x) for x in CFG.STAGE2A["class_names"]]  # type: ignore
-            preds[idx] = class_names_2a[pid]
+            inp = self.clf_tf(image=crop)["image"]
+
+            batch_inputs.append(inp)
+            batch_indices.append(idx)
+
+            if len(batch_inputs) == batch_size:
+                _process_batch(batch_inputs, batch_indices)
+                batch_inputs = []
+                batch_indices = []
+
+        if len(batch_inputs) > 0:
+            _process_batch(batch_inputs, batch_indices)
+
         return preds
 
     # ── Stage 2B infrastructure detection (tiled) ────────────────────────────
@@ -334,11 +401,13 @@ class GeoIntelPipeline:
                 scores = torch.tensor(
                     [d["conf"] for d in cls_dets], dtype=torch.float32
                 )
-                keep_idx = soft_nms_gaussian(
+                keep_idx, keep_scores = soft_nms_gaussian(
                     boxes, scores, sigma=sigma, score_threshold=conf_thresh
                 )
-                for i in keep_idx.tolist():
-                    final_dets.append(cls_dets[i])
+                for i, new_score in zip(keep_idx.tolist(), keep_scores.tolist()):
+                    det = cls_dets[i].copy()
+                    det["conf"] = new_score
+                    final_dets.append(det)
         else:
             final_dets = []
 
