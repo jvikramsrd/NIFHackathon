@@ -1,5 +1,5 @@
 # Geo-Intel Hackathon — Two-Stage AI Pipeline
-# Problem Statement 1: AI-Based Feature Extraction from Drone Orthophotos
+# AI-Based Feature Extraction from Drone Orthophotos
 
 This repository contains a highly optimized, high-accuracy geospatial deep learning pipeline designed to automatically extract buildings, road networks, waterbodies, rooftop materials, and utility infrastructure from massive high-resolution drone orthophotos (like the SVAMITVA dataset).
 
@@ -133,3 +133,12 @@ geo_intel_a4000/
     ├── metrics.py             ← mIoU, Dice, Pixel Accuracy calculations
     └── postprocess.py         ← Dense CRF, Elliptical Morphology, Vectorisation
 ```
+
+## Accuracy Strategy 
+1. **Pretrained backbone** — MixTransformer B4 (mit_b4) (ImageNet weights → strong feature extraction)
+2. **UNet skip connections** — denser feature reuse
+3. **Fast Multi-Scale TTA** — averages predictions over rotations + zoom
+4. **Dense CRF** — sharpens boundary predictions
+5. **Weighted loss** — compensates for class imbalance (rare waterbodies / infra)
+6. **MixUp + label smoothing** — regularises rooftop classifier
+7. **YOLOv8-x** — state-of-the-art small-object detection for infrastructure
