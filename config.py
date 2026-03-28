@@ -237,8 +237,8 @@ STAGE2B = dict(
     fliplr=0.5,
     mixup=0.15,
     copy_paste=0.15,
-    conf_thresh=0.25,
-    iou_thresh=0.30,
+    conf_thresh=0.10,
+    iou_thresh=0.60,
     max_det=1000,
     overlap=512,
     # Per-class bounding box radius (pixels) — replaces fixed buffer_px=20
@@ -247,5 +247,5 @@ STAGE2B = dict(
     # Fraction of negative tiles (no infra) to add for reducing false positives
     neg_tile_ratio=0.3,
     # Soft-NMS sigma for Gaussian confidence decay on overlapping detections
-    soft_nms_sigma=0.5,
+    soft_nms_sigma=0.9,
 )
