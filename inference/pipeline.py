@@ -21,12 +21,12 @@ import cv2
 import numpy as np
 import rasterio
 import torch
+from models.stage1_segmentation import Stage1Module, tta_predict
+from models.stage2_models import InfrastructureDetector, RooftopClassifier
 from tqdm import tqdm
 
 import config as CFG
 from data.dataset import get_clf_val_transforms, get_val_transforms
-from models.stage1_segmentation import Stage1Module, tta_predict
-from models.stage2_models import InfrastructureDetector, RooftopClassifier
 from utils.hardware import (
     cl_input,
     clear_cuda_cache,
@@ -107,7 +107,7 @@ class GeoIntelPipeline:
         if img.dtype != np.uint8:
             img = _to_uint8(img)
 
-        # ── Stage 1 ──────────────────────────────────────────────────────────
+        # ── Stage 1: Segmentation (Segmentation Mask Generation) ──────────────────────────────────────────
         print("[Stage 1] Tiled segmentation …")
         prob_map = self._segment(img)  # (C, H, W) float32
         print("  [DEBUG] Finished _segment. Calculating argmax...")
@@ -143,31 +143,66 @@ class GeoIntelPipeline:
             with rasterio.open(str(mask_path), "w", **meta) as dst:
                 dst.write(seg_mask[np.newaxis])
 
-        print("  [DEBUG] Saved raster mask. Converting to shapefile...")
+        # *** CRITICAL STEP 1: GEOMETRY EXTRACTION FOR STAGE 2 CONSTRAINTS ***
+        print(
+            "  [DEBUG] Extracting detailed building/road geometry for context gating..."
+        )
         class_names = [str(x) for x in CFG.STAGE1["class_names"]]  # type: ignore
+        # This creates the building SHP and the combined feature SHP for subsequent stages
         mask_to_shapefile(seg_mask, transform, crs, class_names, str(out_dir_p), prefix)
-        print("  [DEBUG] Converted to shapefile.")
+
+        # Load the specific building polygon SHP (assuming it exists)
+        bld_shp = out_dir_p / f"{prefix}_building.shp"
+        building_polygons = None
+        if bld_shp.exists():
+            print(
+                "  [DEBUG] Successfully extracted Building Polygon SHP for contextual gating."
+            )
+            # We read it back to ensure geometry validity for later functions
+            try:
+                import geopandas as gpd
+
+                building_polygons = gpd.read_file(str(bld_shp))
+            except Exception as e:
+                print(
+                    f"  [CRITICAL WARNING] Could not load building polygon SHP for contextual gating: {e}"
+                )
+        else:
+            print(
+                "  [WARNING] Building polygon SHP not found. Contextual gating for Stage 2A will proceed without building constraint."
+            )
 
         # Free prob_map (can be large: C × H × W float32 for a 6 GB ortho)
         del prob_map
         clear_cuda_cache()
 
-        # ── Stage 2A ─────────────────────────────────────────────────────────
+        # ── Stage 2A: Rooftop Classification (Constrained by Building Footprint) ──────────
         print("[Stage 2A] Rooftop classification …")
         bld_shp = out_dir_p / f"{prefix}_building.shp"
         if bld_shp.exists():
-            roof_preds = self._classify_rooftops(img, str(bld_shp), transform)
+            # Pass the actual geometry constraints (polygons) to the classifier
+            roof_preds = self._classify_rooftops(
+                img, str(bld_shp), transform, building_polygons
+            )
             merge_rooftop_labels(
                 str(bld_shp),
                 roof_preds,
                 str(out_dir_p / f"{prefix}_building_rooftop.shp"),
             )
+        else:
+            print(
+                "[WARNING] Stage 2A skipped: Building footprint required for constraint."
+            )
 
         clear_cuda_cache()
 
-        # ── Stage 2B ─────────────────────────────────────────────────────────
+        # ── Stage 2B: Infrastructure Detection (Constrained by Built/Road Footprints) ──────
         print("[Stage 2B] Infrastructure detection …")
-        dets = self._detect(img)
+        # Pass building and road context to guide detection search area
+        context_polys = self._gather_context_polygons(
+            out_dir_p, prefix, building_polygons
+        )
+        dets = self._detect(img, context_polys)
         if dets:
             detections_to_shapefile(
                 dets, transform, crs, str(out_dir_p / f"{prefix}_infrastructure.shp")

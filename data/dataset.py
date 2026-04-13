@@ -169,12 +169,15 @@ def get_train_transforms(patch_size: int = 640):
             ),
             A.OneOf(
                 [
-                    A.GridDistortion(num_steps=5, distort_limit=0.15),
+                    
                     A.ElasticTransform(alpha=120, sigma=6),  # alpha_affine removed
-                    A.OpticalDistortion(distort_limit=0.1),  # shift_limit removed
+                    
+                    A.Perspective(scale=(0.05, 0.1)),
+                    
                 ],
                 p=0.40,
             ),
+            A.Affine(scale=(0.8, 1.2), translate_percent=(-0.1, 0.1), rotate=(-45, 45), p=0.5, border_mode=cv2.BORDER_REFLECT),
             # CoarseDropout: tuned heavily against tree occlusions
             A.CoarseDropout(
                 num_holes_range=(8, 16),

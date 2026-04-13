@@ -6,8 +6,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .ipynb_checkpoints/
-runs/
-dataset/
+/runs
+/dataset
+/outputs
 
 # Virtual environments
 venv/
@@ -70,3 +71,16 @@ results/
 # Temporary logs and scripts
 *preprocessing.txt
 test_*.py
+
+# Archives and large files
+*.zip
+*.rar
+*.tar
+*.gz
+*.7z
+*.cache
+*.tfrecord
+*.onnx
+*.pb
+*.h5
+*.pdf

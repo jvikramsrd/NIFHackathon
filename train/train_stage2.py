@@ -14,11 +14,13 @@ Stage 2B: YOLOv8x infrastructure detector
 """
 
 import sys
+from pathlib import Path
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 
 import argparse
 import math
+import os
 import time
 import typing
 
@@ -129,15 +131,22 @@ def train_stage2a(resume: bool = True):
         lr=float(cfg["lr"]),
         weight_decay=float(cfg["weight_decay"]),  # type: ignore
     )
-    # OneCycleLR provides super-convergence logic for extremely high classification metric yields
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimiser, 
-        max_lr=float(cfg["lr"]), 
-        epochs=int(cfg["epochs"]), 
-        steps_per_epoch=len(train_loader),
-        pct_start=0.1,        # 10% warmup
-        div_factor=10,        # Start at max_lr / 10
-        final_div_factor=1e3  # End completely decayed
+    # SequentialLR with Linear Warmup and CosineAnnealingWarmRestarts
+    # Allows the model to warm up linearly, then stabilize at local optima while preventing catastrophic forgetting.
+    warmup_iters = max(1, int(cfg["epochs"]) // 10) * len(train_loader)
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimiser, start_factor=0.1, total_iters=warmup_iters
+    )
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimiser,
+        T_0=max(1, (int(cfg["epochs"]) * len(train_loader) - warmup_iters) // 3),
+        T_mult=1,
+        eta_min=float(cfg["lr"]) / 1000,
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimiser,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_iters],
     )
 
     best_acc = 0.0
@@ -148,6 +157,7 @@ def train_stage2a(resume: bool = True):
     start_epoch = 1
 
     from utils.hardware import EMA
+
     ema = EMA(model, decay=0.9998)
 
     if resume and last_ckpt_path.exists():
@@ -198,7 +208,13 @@ def train_stage2a(resume: bool = True):
             optimiser.zero_grad(set_to_none=True)
             with amp_ctx:
                 logits = model(aug_imgs)
-                loss = model.mixup_loss(logits, ya, yb, lam)
+                # Explicit handling of the geometric label consistency for mixed/masked targets
+                loss_a = model.criterion(logits, ya)
+                loss_b = model.criterion(logits, yb)
+                # For CutMix, lam represents the exact unmasked area ratio
+                if isinstance(lam, torch.Tensor):
+                    lam = lam.mean()
+                loss = loss_a * lam + loss_b * (1.0 - lam)
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -216,9 +232,13 @@ def train_stage2a(resume: bool = True):
             )
 
         ema.apply_shadow(model)
-        val_acc, report = _val_clf(model, val_loader, device, cfg, amp_ctx, epoch=epoch)
-        ema.restore(model)
-        
+        try:
+            val_acc, report = _val_clf(
+                model, val_loader, device, cfg, amp_ctx, epoch=epoch
+            )
+        finally:
+            ema.restore(model)
+
         elapsed = time.time() - t0
         print(
             f"Ep {epoch:03d}/{cfg['epochs']:03d}  "
@@ -310,7 +330,7 @@ def _val_clf(model, loader, device, cfg: typing.Any, amp_ctx, epoch=None):
 
 def train_stage2b(resume: bool = True):
     cfg: typing.Any = CFG.STAGE2B
-    variant = cfg['model_variant']
+    variant = cfg["model_variant"]
     print(f"\n[Stage 2B] {variant} infrastructure detector")
     print(f"  Image size: {cfg['img_size']} px  |  batch: {cfg['batch_size']}")
     print(f"  Cache: {cfg.get('cache', 'disk')}  |  {vram_stats()}")
@@ -337,6 +357,7 @@ def train_stage2b(resume: bool = True):
         # Instead load weights and train fresh on our data.
         print(f"  Fine-tuning from: {finetune_from}")
         from ultralytics import YOLO
+
         model = YOLO(finetune_from)
         _ = model.train(
             data=data_yaml,
@@ -400,12 +421,43 @@ def _write_yolo_yaml() -> str:
 
                     shutil.copy2(lbl_p, dst_l)
 
+    import geopandas as gpd
+
+    canonical_classes = set()
+    print("  [DEBUG] Scanning dataset for dynamic YOLO classes...")
+    try:
+        for shp_path in CFG.DATA_ROOT.rglob("*.shp"):
+            if shp_path.name.startswith(
+                ("Utility", "Bridge", "Road", "Water", "Built")
+            ):
+                try:
+                    gdf = gpd.read_file(str(shp_path))
+                    col = cfg.get("shp_infra_col", "Utility_Ty")
+                    if col in gdf.columns:
+                        unique_vals = gdf[col].dropna().unique()
+                        for v in unique_vals:
+                            mapped = cfg.get("infra_type_map", {}).get(
+                                str(v).lower(), str(v)
+                            )
+                            canonical_classes.add(mapped)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    if canonical_classes:
+        final_names = sorted(list(canonical_classes))
+        print(f"  [INFO] Dynamically detected classes: {final_names}")
+    else:
+        final_names = cfg["class_names"]
+        print(f"  [INFO] Using fallback classes from config: {final_names}")
+
     data = {
         "path": str(yolo_dir.resolve()),
         "train": "train/images",
         "val": "val/images",
-        "nc": cfg["num_classes"],
-        "names": cfg["class_names"],
+        "nc": len(final_names),
+        "names": final_names,
     }
     yaml_path = yolo_dir / "data.yaml"
     yaml_path.write_text(yaml.dump(data, default_flow_style=False))

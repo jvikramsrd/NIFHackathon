@@ -144,7 +144,7 @@ STAGE1 = dict(
     shp_class_map={"building": 1, "road": 2, "waterbody": 3},
     # Model
     # UNet with mit_b4 (MixTransformer B4) gives excellent segmentation quality
-    # and stays under the 15GB VRAM limit on the A4000 (batch 8, grad_accum 4).
+    # and stays under the 15GB VRAM limit on the A4000 (batch 4, grad_accum 8).
     arch="Unet",
     encoder="mit_b4",
     encoder_weights="imagenet",
@@ -154,8 +154,8 @@ STAGE1 = dict(
     # safely fits in 15 GB with margin for optimizer states + SCSE attention
     patch_size=512,
     overlap=256,
-    batch_size=8,
-    grad_accum=4,  # effective batch = 32
+    batch_size=4,
+    grad_accum=8,  # effective batch = 32
     lr=1e-4,
     encoder_lr_mult=0.1,
     weight_decay=1e-4,
@@ -183,6 +183,8 @@ STAGE1 = dict(
     min_road_width_px=3,
     crf_inference=True,
     crf_iter=5,  # Reduced from 12 to 5 for significant speedup with nearly identical accuracy
+    # Preprocessing
+    neg_tile_ratio=0.05,  # Keep 5% of background tiles for Negative Hard Mining
 )
 
 # ─── Stage 2A: Rooftop Classification ───────────────────────────────────────
@@ -197,9 +199,9 @@ STAGE2A = dict(
     pretrained=True,
     crop_size=160,
     min_crop_px=24,
-    batch_size=80,
+    batch_size=48,
     lr=5e-5,
-    epochs=60,
+    epochs=150,
     label_smoothing=0.1,
     mixup_alpha=0.4,
     cutmix_alpha=1.0,
@@ -218,12 +220,12 @@ STAGE2B = dict(
     model_variant="yolov8x",
     img_size=1280,
     cache="ram",
-    batch_size=4,
+    batch_size=2,
     workers=0,
-    epochs=150,
+    epochs=200,
     lr0=1e-3,
     lrf=0.01,
-    warmup_epochs=5,
+    warmup_epochs=3,
     patience=20,
     cos_lr=True,
     mosaic=1.0,
