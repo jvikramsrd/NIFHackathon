@@ -150,22 +150,22 @@ STAGE1 = dict(
     encoder_weights="imagenet",
     in_channels=3,
     # Training
-    # patch 512, batch 8, grad_accum 4 → effective batch 32
+    # patch 512, batch 4, grad_accum 8 → effective batch 32
     # safely fits in 15 GB with margin for optimizer states + SCSE attention
     patch_size=512,
-    overlap=256,
+    overlap=128,
     batch_size=4,
     grad_accum=8,  # effective batch = 32
-    lr=1e-4,
+    lr=2e-4,
     encoder_lr_mult=0.1,
     weight_decay=1e-4,
     epochs=150,
     warmup_epochs=5,
     scheduler="cosine",
     # Loss
-    dice_weight=0.5,
-    bce_weight=0.25,
-    focal_weight=0.25,
+    dice_weight=0.6,
+    bce_weight=0.2,
+    focal_weight=0.2,
     focal_gamma=2.0,
     class_weights=[0.05, 1.6, 3.0, 2.0],
     # Regularisation
@@ -182,7 +182,7 @@ STAGE1 = dict(
     min_building_area_px=80,
     min_road_width_px=3,
     crf_inference=True,
-    crf_iter=5,  # Reduced from 12 to 5 for significant speedup with nearly identical accuracy
+    crf_iter=3,  # Reduced for further speedup
     # Preprocessing
     neg_tile_ratio=0.05,  # Keep 5% of background tiles for Negative Hard Mining
 )

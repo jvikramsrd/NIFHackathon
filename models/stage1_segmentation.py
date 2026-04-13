@@ -157,14 +157,21 @@ def tta_predict(
     )
 
     with torch.amp.autocast("cuda", dtype=amp_dtype):  # type: ignore
-        for k in range(4):
-            # Rotations
-            aug = torch.rot90(image, k, dims=[2, 3])
-            prob = torch.softmax(model(aug).float(), 1)
-            prob = torch.rot90(prob, -k, dims=[2, 3])
-            probs_sum += prob
+        if fast_tta:
+            # 2 passes: original and horizontal flip (scaled by 2 to match sum of 4 passes)
+            probs_sum += torch.softmax(model(image).float(), 1) * 2.0
+            probs_sum += (
+                torch.flip(torch.softmax(model(torch.flip(image, [3])).float(), 1), [3])
+                * 2.0
+            )
+        else:
+            for k in range(4):
+                # Rotations
+                aug = torch.rot90(image, k, dims=[2, 3])
+                prob = torch.softmax(model(aug).float(), 1)
+                prob = torch.rot90(prob, -k, dims=[2, 3])
+                probs_sum += prob
 
-            if not fast_tta:
                 # Flips + Rotations
                 aug_f = torch.flip(image, [3])
                 aug_f = torch.rot90(aug_f, k, dims=[2, 3])
