@@ -75,3 +75,14 @@ def test_context_polygons_are_pixel_gates():
 
     assert gates
     assert gates[0].intersects(box(10, -20, 20, -10))
+
+
+def test_clf_train_transforms_include_fog_and_sunflare():
+    from data.dataset import get_clf_train_transforms
+    import albumentations as A
+
+    tf = get_clf_train_transforms(224)
+    type_names = [type(t).__name__ for t in tf.transforms]
+
+    assert "RandomFog" in type_names, "RandomFog missing from clf train transforms"
+    assert "RandomSunFlare" in type_names, "RandomSunFlare missing from clf train transforms"

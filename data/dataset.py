@@ -270,6 +270,12 @@ def get_clf_train_transforms(
             ),
             # Simulate shadow (rooftop lighting variation)
             A.RandomShadow(shadow_roi=(0, 0.5, 1, 1), p=0.2),
+            A.RandomFog(fog_coef_range=(0.05, 0.15), p=0.10),
+            A.RandomSunFlare(
+                src_radius=80,
+                num_flare_circles_range=(2, 6),
+                p=0.15,
+            ),
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ToTensorV2(),
         ]
