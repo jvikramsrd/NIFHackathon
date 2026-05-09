@@ -44,28 +44,6 @@ def preprocess(data_root: str):
 
     data_root_path = Path(data_root)
 
-    # Find all sub-folders that contain rasters (cg/, pb/, or more)
-    # Also handle the case where data_root itself contains rasters
-    candidates = [data_root_path] + [d for d in data_root_path.iterdir() if d.is_dir()]
-
-    RASTER_EXTS = {".tif", ".tiff", ".ecw", ".img"}
-    folders_with_rasters = []
-    for d in candidates:
-
-import config as CFG
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PREPROCESS
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def preprocess(data_root: str):
-    from data.preprocessing import preprocess_folder
-
-    data_root_path = Path(data_root)
-
-    # Find all sub-folders that contain rasters (cg/, pb/, or more)
-    # Also handle the case where data_root itself contains rasters
     candidates = [data_root_path] + [d for d in data_root_path.iterdir() if d.is_dir()]
 
     RASTER_EXTS = {".tif", ".tiff", ".ecw", ".img"}
@@ -91,7 +69,6 @@ def preprocess(data_root: str):
         summary = preprocess_folder(str(folder), CFG)
         all_summaries.append(summary)
 
-    # Print overall summary
     log.info(f"\n{'=' * 60}")
     log.info("  PREPROCESSING COMPLETE")
     log.info(f"{'=' * 60}")
@@ -131,42 +108,117 @@ def train_all():
     from train.train_stage2 import train_stage2a, train_stage2b
     from utils.hardware import clear_cuda_cache
 
-    _header("STAGE 1 — Semantic Segmentation  (Swin-B UNet++)")
+    _header("STAGE 1 — Semantic Segmentation  (UNet++ mit_b5)")
     train_stage1()
-    clear_cuda_cache()  # free Swin-B weights before loading ConvNeXt
+    clear_cuda_cache()
 
-    _header("STAGE 2A — Rooftop Classifier  (ConvNeXt-Base)")
+    _header("STAGE 2A — Rooftop Classifier  (ConvNeXt-Large)")
     train_stage2a()
-    clear_cuda_cache()  # free ConvNeXt weights before YOLO
+    clear_cuda_cache()
 
     _header("STAGE 2B — Infrastructure Detector  (YOLOv9/OBB)")
-    num_classes = cast(int, cfg.get("num_classes", 4))
-    patch_size = cast(int, cfg.get("patch_size", 512))
-    val_fraction = cast(float, cfg.get("val_fraction", 0.15))
-    seed = cast(int, cfg.get("seed", 42))
-    class_names = cast(List[str], cfg.get("class_names", []))
+    train_stage2b()
 
-    _, val_ds = split_dataset(
-        str(CFG.PATCH_DIR),
-        str(CFG.MASK_DIR),
-        val_fraction,
-        seed,
-        num_classes,
-        patch_size,
-    )
-    loader = DataLoader(
-        val_ds,
-        batch_size=4,
-        shuffle=False,
-        num_workers=CFG.NUM_WORKERS,
-        pin_memory=True,
-        persistent_workers=(CFG.NUM_WORKERS > 0),
-    )
-    metrics = SegmentationMetrics(num_classes, class_names)
-    miou, _ = _validate(module, loader, device, metrics, amp_ctx)
-    log.info(metrics.summary())
-    log.info(f"\nCheckpoint mIoU : {ckpt.get('val_miou', 0.0):.4f}")
-    log.info(f"Re-eval mIoU    : {miou:.4f}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EVALUATE
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def evaluate():
+    import json
+
+    import torch
+    from torch.utils.data import DataLoader
+
+    from data.dataset import split_clf_dataset, split_dataset
+    from models.stage1_segmentation import Stage1Module
+    from models.stage2_models import RooftopClassifier
+    from train.train_stage1 import _validate
+    from train.train_stage2 import _val_clf
+    from utils.hardware import get_amp_context, setup
+    from utils.metrics import SegmentationMetrics
+
+    results: dict = {}
+    device = setup(seed=int(CFG.STAGE1["seed"]))
+    amp_ctx, _ = get_amp_context(CFG.AMP_DTYPE)
+    out_path = CFG.ROOT / "outputs" / "results.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # ── Stage 1 ──────────────────────────────────────────────────────────────
+    ckpt1 = CFG.CKPT_DIR / "stage1_best.pth"
+    if ckpt1.exists():
+        _header("EVALUATE — Stage 1 Segmentation")
+        cfg1 = CFG.STAGE1
+        _, val_ds = split_dataset(
+            str(CFG.PATCH_DIR), str(CFG.MASK_DIR),
+            cfg1["val_fraction"], cfg1["seed"],
+            cfg1["num_classes"], cfg1["patch_size"], cfg1.get("patch_sizes"),
+        )
+        val_loader = DataLoader(val_ds, batch_size=4, shuffle=False,
+                                num_workers=0, pin_memory=True)
+        module = Stage1Module(cfg1).to(device)
+        ckpt = torch.load(str(ckpt1), map_location=device, weights_only=False)
+        module.load_state_dict(ckpt.get("state_dict", ckpt), strict=False)
+        metrics = SegmentationMetrics(cfg1["num_classes"], cfg1["class_names"])
+        miou, _ = _validate(module, val_loader, device, metrics, amp_ctx)
+        r = metrics.compute()
+        results["stage1"] = {
+            "mIoU": r["mean_iou"],
+            "dice": r["mean_f1"],
+            "pixel_acc": r["pixel_acc"],
+            "class_iou": dict(zip(cfg1["class_names"], r["class_iou"])),
+        }
+        log.info(metrics.summary())
+        log.info(f"Stage 1 mIoU: {miou:.4f}")
+    else:
+        log.warning("Stage 1 checkpoint not found: %s", ckpt1)
+        results["stage1"] = {"error": "checkpoint not found"}
+
+    # ── Stage 2A ─────────────────────────────────────────────────────────────
+    ckpt2a = CFG.CKPT_DIR / "stage2a_best.pth"
+    if ckpt2a.exists():
+        _header("EVALUATE — Stage 2A Rooftop Classification")
+        cfg2a = CFG.STAGE2A
+        _, val_ds2a = split_clf_dataset(
+            str(CFG.CROP_DIR), cfg2a["class_names"],
+            val_fraction=float(CFG.STAGE1["val_fraction"]),
+            seed=int(CFG.STAGE1["seed"]),
+            crop_size=int(cfg2a["crop_size"]),
+        )
+        val_loader2a = DataLoader(val_ds2a, batch_size=32, shuffle=False, num_workers=0)
+        model2a = RooftopClassifier(cfg2a).to(device)
+        ckpt = torch.load(str(ckpt2a), map_location=device, weights_only=False)
+        model2a.load_state_dict(ckpt.get("state_dict", ckpt), strict=False)
+        acc, report = _val_clf(model2a, val_loader2a, device, cfg2a, amp_ctx)
+        results["stage2a"] = {"accuracy": float(acc)}
+        log.info(f"Stage 2A Accuracy: {acc:.4f}")
+        log.info(report)
+    else:
+        log.warning("Stage 2A checkpoint not found: %s", ckpt2a)
+        results["stage2a"] = {"error": "checkpoint not found"}
+
+    # ── Stage 2B — read YOLO's own results.csv ────────────────────────────────
+    variant = CFG.STAGE2B["model_variant"]
+    yolo_csv = CFG.CKPT_DIR / f"stage2b_{variant}" / "results.csv"
+    if yolo_csv.exists():
+        import pandas as pd
+        df = pd.read_csv(str(yolo_csv))
+        df.columns = [c.strip() for c in df.columns]
+        map50_cols = [c for c in df.columns if "map50" in c.lower() and "95" not in c.lower()]
+        if map50_cols:
+            best_map50 = float(df[map50_cols[0]].max())
+            results["stage2b"] = {"mAP_50": best_map50}
+            log.info(f"Stage 2B mAP@0.5: {best_map50:.4f}")
+        else:
+            results["stage2b"] = {"note": "mAP column not found in results.csv"}
+    else:
+        log.warning("Stage 2B results.csv not found (not trained yet)")
+        results["stage2b"] = {"error": "not trained yet"}
+
+    out_path.write_text(json.dumps(results, indent=2))
+    log.info(f"\nResults saved to: {out_path}")
+    return results
 
 
 # ─────────────────────────────────────────────────────────────────────────────
