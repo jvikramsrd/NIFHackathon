@@ -45,7 +45,7 @@ class SAM(torch.optim.Optimizer):
         super().__init__(base_optimizer.param_groups, defaults)
         self._base = base_optimizer
         self._param_groups = self._base.param_groups
-        self._defaults.update(self._base.defaults)
+        self.defaults.update(self._base.defaults)
 
     @torch.no_grad()
     def first_step(self, zero_grad: bool = False) -> None:
@@ -53,7 +53,7 @@ class SAM(torch.optim.Optimizer):
         grad_norm = _grad_norm(self._param_groups)
         # Clamp scale so the perturbation cannot explode when grad_norm ≈ 0
         # (e.g. first step of a frozen backbone or after gradient zeroing).
-        scale = (self._defaults["rho"] / (grad_norm + 1e-12)).clamp(max=0.2)
+        scale = (self.defaults["rho"] / (grad_norm + 1e-12)).clamp(max=0.2)
 
         for group in self._param_groups:
             for p in group["params"]:
