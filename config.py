@@ -49,7 +49,7 @@ for d in [
     d.mkdir(parents=True, exist_ok=True)
 
 # ─── Hardware ────────────────────────────────────────────────────────────────
-DEVICE = "cuda"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Reduce CUDA memory fragmentation on the 16 GB A4000.
 # max_split_size_mb prevents the allocator from creating huge free blocks
 # that can't be reused, which is the #1 cause of OOM on 16 GB cards.
@@ -169,7 +169,7 @@ STAGE1 = dict(
     lovasz_weight=0.15,
     touching_weight=0.10,
     focal_gamma=2.0,
-    class_weights=[0.30, 1.80, 3.50, 2.20],
+    class_weights=[0.30, 1.80, 4.50, 2.20],
     label_smoothing=0.05,
     use_swa=True,
     swa_lr=2e-5,
@@ -210,7 +210,7 @@ STAGE2A = dict(
     tta_steps=24,
     use_arcface=True,
     arcface_s=30.0,
-    arcface_m=0.50,
+    arcface_m=0.55,
     use_sam=True,
     sam_rho=0.05,
     sam_adaptive=True,
@@ -258,12 +258,13 @@ STAGE2B = dict(
     class_buffer_px={'transformer': 100, 'overhead_tank': 80, 'well': 40},
     neg_tile_ratio=0.3,
     soft_nms_sigma=0.9,
+    agnostic_nms=True,
     use_sahi=True,
     sahi_slice_size=640,
-    sahi_overlap_ratio=0.30,
+    sahi_overlap_ratio=0.40,
     class_conf_thresh={
         'transformer': 0.20,
         'overhead_tank': 0.12,
-        'well': 0.08,
+        'well': 0.03,
     },
 )
