@@ -1,6 +1,7 @@
 # Geo-Intel — Production Geospatial CV Pipeline
 
-> AI-based feature extraction from drone orthophotos, tuned for the SVAMITVA dataset on RTX A4000 (16 GB VRAM).
+> AI-based feature extraction from drone orthophotos, tuned for the SVAMITVA dataset.  
+> Supports NVIDIA CUDA · AMD ROCm · Apple Silicon MPS · CPU.
 
 ---
 
@@ -30,7 +31,7 @@ INPUT: SVAMITVA drone orthophoto (GeoTIFF) + Annotation Shapefiles
 │  Rooftop Classifier    │     │  Infrastructure Detector     │
 │  ConvNeXt-Large        │     │  YOLOv9e + OBB               │
 │  + ArcFace Head        │     │  + SAHI Sliced Inference     │
-│  224×224 crops          │     │  1280×1280 tiles             │
+│  224×224 crops         │     │  1280×1280 tiles             │
 │                        │     │                              │
 │  Classes:              │     │  Classes:                    │
 │   RCC / Tiled /        │     │   Transformer / Well /       │
@@ -43,62 +44,195 @@ INPUT: SVAMITVA drone orthophoto (GeoTIFF) + Annotation Shapefiles
 
 ---
 
-## Key Features
+## Installation
 
-### Accuracy Optimisations
-| Feature | Stage | Impact |
-|---|---|---|
-| **UNet++ deep supervision** | 1 | Sharper building boundaries via auxiliary decoder heads |
-| **Lovász-Softmax loss** | 1 | Directly optimises mIoU instead of proxy losses |
-| **Instance-touching separation loss** | 1 | Prevents adjacent buildings from merging into one polygon |
-| **Watershed instance separation** | 1 | Post-processing to cleanly split touching footprints |
-| **ArcFace angular-margin head** | 2A | 15% better RCC vs Tiled discrimination |
-| **SAHI sliced inference** | 2B | 640px slices with 30% overlap → detects small wells/transformers at tile boundaries |
-| **Per-class CRF compatibility matrix** | 1 | Penalises catastrophic class confusion (building ↔ waterbody) |
-| **Stratified train/val split** | 1 | Validation set reflects full difficulty distribution by foreground ratio |
+### Option A — Pre-built binary (recommended for new users)
 
-### A4000 16 GB VRAM Efficiency
-| Optimisation | VRAM Saved | Detail |
-|---|---|---|
-| SAM batch auto-guard | ~3.8 GB | Auto halves batch (4→2) when SAM + ≤16GB detected |
-| EMA shadow on CPU | ~400 MB | Shadow weights stored on CPU, moved to GPU only during validation |
-| Gradient checkpointing | ~2 GB | Recomputes encoder activations instead of caching them |
-| bf16 (bfloat16) AMP | ~40% | No GradScaler needed on Ampere — faster and simpler |
-| `max_split_size_mb:256` | Anti-frag | Prevents CUDA allocator from creating unusable large free blocks |
-| Single-pass MixUp/CutMix loss | ~1.5 GB | Reuses cached logits instead of running two forward passes |
-| `torch.cuda.empty_cache()` between SAM steps | ~1-2 GB | Frees first-pass activations before second forward |
+Download the binary for your platform from the [GitHub Releases](../../releases) page:
 
-### Peak VRAM by Stage
-| Stage | Model | Input | Batch | SAM | Peak |
-|---|---|---|---|---|---|
-| 1 — Segmentation | UNet++ mit_b5 | 512×512 | 2 (auto) | ✅ | ~12.0 GB |
-| 2A — Classification | ConvNeXt-Large | 224×224 | 32 | ✅ | ~7.8 GB |
-| 2B — Detection | YOLOv9e | 1280×1280 | 2 | ❌ | ~7.2 GB |
+| Platform | File |
+|----------|------|
+| Windows 10/11 (x64) | `GeoIntel-windows-x64.zip` |
+| macOS 13+ Intel | `GeoIntel-macos-intel.zip` |
+| macOS 14+ Apple Silicon (M1/M2/M3/M4) | `GeoIntel-macos-arm64.zip` |
+| Linux x64 (Ubuntu 22.04+) | `GeoIntel-linux-x64.zip` |
+
+**The binary is only the GUI shell.** You still need a Python environment with PyTorch + pipeline deps installed (see Option B below) for training and inference. The GUI auto-detects your active Python.
+
+```
+# After unzipping:
+
+Windows:    GeoIntel\GeoIntel.exe
+macOS:      open GeoIntel.app            (or GeoIntel/GeoIntel from terminal)
+Linux:      ./GeoIntel/GeoIntel
+```
 
 ---
 
-## Deliverables
+### Option B — Install from source (for training / development)
 
-- ✅ **Building footprints** — Polygon shapefiles with watershed-separated instances
-- ✅ **Rooftop classification** — `roof_type` attribute (`RCC` / `Tiled` / `Tin` / `Other`) on each building polygon
-- ✅ **Road networks** — Contiguous polygon shapefiles with morphological gap-bridging
-- ✅ **Waterbodies** — Polygon shapefiles
-- ✅ **Infrastructure points** — Point shapefiles (transformer / well / overhead tank)
+#### Prerequisites
+
+- Python 3.10 or 3.11
+- Git
+
+#### 1. Clone
+
+```bash
+git clone https://github.com/your-org/geo-intel.git
+cd geo-intel
+```
+
+#### 2. Install PyTorch for your hardware
+
+Pick **one** of the following:
+
+**NVIDIA GPU (CUDA 12.1) — RTX 20xx / 30xx / 40xx, A-series, Quadro:**
+```bash
+pip install -r requirements-torch-cuda.txt
+```
+
+**NVIDIA GPU (CUDA 11.8) — GTX 10xx / 20xx, older Ampere:**
+```bash
+pip install torch torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/cu118
+```
+
+**AMD GPU (ROCm 6.2) — RX 6600 XT or newer, Linux only:**
+```bash
+pip install -r requirements-torch-rocm.txt
+```
+
+**Apple Silicon (M1 / M2 / M3 / M4) — Metal MPS acceleration:**
+```bash
+pip install -r requirements-torch-cpu.txt    # standard wheel includes MPS
+```
+
+**CPU-only / unknown GPU:**
+```bash
+pip install -r requirements-torch-cpu.txt
+```
+
+#### 3. Install everything else
+
+```bash
+pip install -r requirements.txt
+```
+
+**Geospatial stack** (rasterio / fiona / geopandas):
+```bash
+# Recommended — handles ECW driver + correct GDAL binaries:
+conda install -c conda-forge libgdal-ecw rasterio fiona geopandas
+
+# Pip-only alternative (no ECW):
+pip install rasterio fiona geopandas
+```
+
+**Optional — dense CRF boundary refinement** (requires C++ build tools):
+```bash
+pip install pydensecrf2
+```
+
+#### 4. One-shot installer scripts
+
+**macOS / Linux** — auto-detects NVIDIA / AMD / Apple Silicon:
+```bash
+chmod +x install.sh
+./install.sh
+```
+
+**Windows** — auto-detects NVIDIA, prompts for manual ROCm install:
+```bash
+setup_venv.bat
+```
+
+---
+
+### Option C — pip install
+
+```bash
+# Install PyTorch first (see step 2 above), then:
+pip install .
+```
+
+This installs two console commands:
+- `geo-intel-gui` — launch the desktop GUI
+- `geo-intel-pipeline --mode ...` — CLI pipeline runner
+
+---
+
+## Hardware Support
+
+| Accelerator | Platform | PyTorch Backend | AMP dtype |
+|-------------|----------|-----------------|-----------|
+| NVIDIA RTX 30xx / 40xx (Ampere) | Win / Linux | CUDA 12.1 | bfloat16 |
+| NVIDIA RTX 20xx / older | Win / Linux | CUDA 11.8 | bfloat16 |
+| AMD RX 6600 XT+ (RDNA 2/3) | Linux | ROCm 6.2 | bfloat16 |
+| Apple M1 / M2 / M3 / M4 | macOS arm64 | MPS | float16 |
+| Intel / AMD CPU | All | CPU | float32 |
+
+> **ROCm on Windows:** ROCm does not support Windows. AMD GPU users on Windows must use CPU mode or WSL2.  
+> **MPS note:** `torch.compile` and some fused kernels are disabled on MPS automatically.
+
+### Peak VRAM by Stage
+
+| Stage | Model | Input | Batch | NVIDIA A4000 | Apple M2 Max (96 GB unified) |
+|-------|-------|-------|-------|--------------|-------------------------------|
+| 1 — Segmentation | UNet++ mit_b5 | 512×512 | 2 | ~12.0 GB | ~18 GB unified |
+| 2A — Classification | ConvNeXt-Large | 224×224 | 32 | ~7.8 GB | ~8 GB unified |
+| 2B — Detection | YOLOv9e | 1280×1280 | 2 | ~7.2 GB | ~9 GB unified |
 
 ---
 
 ## Quick Start
 
-### 1. Install Dependencies
+### Desktop GUI
 ```bash
-pip install -r requirements.txt
-
-# Optional — sharper segmentation edges:
-pip install pydensecrf2
+python gui.py
 ```
 
-### 2. Organise Data
-Place your SVAMITVA dataset in a `dataset/` folder at the project root:
+Tabs:
+- **Pipeline Runner** — preprocess, train, evaluate, infer with live log + progress
+- **Map Viewer** — side-by-side TIF vs. segmentation overlay with opacity slider
+- **Results** — metrics table + bar chart, auto-reads `outputs/results.json`
+
+### CLI
+
+```bash
+# Preprocess — strips TIFs, burns masks, generates crops + YOLO labels
+python run_pipeline.py --mode preprocess --data_root ./dataset
+
+# Train all stages
+python run_pipeline.py --mode train_all
+
+# Evaluate (writes outputs/results.json)
+python run_pipeline.py --mode evaluate
+
+# Inference on a new village
+python run_pipeline.py --mode infer \
+  --tif "path/to/village.tif" \
+  --out ./outputs/village_name
+
+# End-to-end
+python run_pipeline.py --mode all --data_root ./dataset
+```
+
+### Build a binary locally
+
+```bash
+pip install pyinstaller>=6.5.0
+python build.py
+
+# Output:
+#   dist/GeoIntel/GeoIntel.exe     (Windows)
+#   dist/GeoIntel.app              (macOS)
+#   dist/GeoIntel/GeoIntel         (Linux)
+```
+
+---
+
+## Data Structure
+
 ```
 dataset/
 ├── cg/
@@ -110,39 +244,8 @@ dataset/
 └── pb/
     └── ...
 ```
-Column mappings (`type`, `road_type`, `Utility_Ty`, etc.) are configured in `config.py` → `SHP_LAYER_ROLES`.
 
-### 3. Run the Pipeline
-
-**End-to-end (preprocess → train → infer):**
-```bash
-python run_pipeline.py --mode all --data_root ./dataset
-```
-
-**Step-by-step:**
-```bash
-# Preprocess — strips TIFs, burns masks, generates crops + YOLO labels
-python run_pipeline.py --mode preprocess --data_root ./dataset
-
-# Train Stage 1 — UNet++ segmentation
-python run_pipeline.py --mode train_stage1
-
-# Train Stage 2 — rooftop classifier + infrastructure detector
-python run_pipeline.py --mode train_stage2
-
-# Inference on a new village
-python run_pipeline.py --mode infer --tif "path/to/village.tif" --out ./outputs/village_name
-```
-
-**Inference-only (pre-trained checkpoints):**
-```bash
-python infer_folder.py --input "path/to/village.tif" --output ./outputs/village_name
-```
-
-### 4. ONNX Export (Optional)
-```bash
-python export_models.py
-```
+Column mappings (`type`, `road_type`, `Utility_Ty`, etc.) are in `config.py` → `SHP_LAYER_ROLES`.
 
 ---
 
@@ -150,17 +253,26 @@ python export_models.py
 
 ```
 geo-intel/
-├── config.py                      # Central hyperparameters, paths, class mappings
-├── run_pipeline.py                # Master CLI entrypoint (all modes)
+├── config.py                      # Hardware, paths, hyperparameters, class maps
+├── run_pipeline.py                # Master CLI (preprocess/train/evaluate/infer)
+├── gui.py                         # Desktop operator console (PyQt6)
 ├── infer_folder.py                # Standalone inference script
-├── export_models.py               # ONNX/TensorRT export
-├── requirements.txt               # Python dependencies
-├── params.yaml                    # DVC-tracked hyperparameters
-├── dvc.yaml                       # DVC pipeline stages
-├── Dockerfile                     # Container build
+├── export_models.py               # ONNX export
+├── build.py                       # Binary build script (PyInstaller)
+├── geo_intel.spec                 # PyInstaller spec
+├── pyproject.toml                 # pip-installable package definition
+├── requirements.txt               # Base deps (no torch — platform-specific)
+├── requirements-torch-cuda.txt    # NVIDIA CUDA torch
+├── requirements-torch-rocm.txt    # AMD ROCm torch
+├── requirements-torch-cpu.txt     # CPU / Apple MPS torch
+├── install.sh                     # macOS + Linux one-shot installer
+├── setup_venv.bat                 # Windows one-shot installer
+│
+├── .github/workflows/
+│   └── release.yml                # CI: builds binaries for all 4 platforms on tag push
 │
 ├── data/
-│   ├── preprocessing.py           # Parallel TIF stripping, SHP burning, YOLO labels
+│   ├── preprocessing.py           # TIF slicing, SHP burning, YOLO label gen
 │   └── dataset.py                 # PyTorch Datasets + Albumentations pipelines
 │
 ├── models/
@@ -168,15 +280,15 @@ geo-intel/
 │   └── stage2_models.py           # ConvNeXt-Large + ArcFace + YOLOv9 + SAHI
 │
 ├── train/
-│   ├── train_stage1.py            # SAM, EMA, SWA, grad checkpointing, VRAM guard
+│   ├── train_stage1.py            # SAM, EMA, SWA, grad checkpointing
 │   ├── train_stage2.py            # Classifier + YOLO training loops
-│   └── launch_ddp.py             # Multi-GPU DDP launcher
+│   └── launch_ddp.py              # Multi-GPU DDP launcher
 │
 ├── inference/
 │   └── pipeline.py                # Batched multi-stage inference + shapefile export
 │
 ├── utils/
-│   ├── hardware.py                # A4000 setup, AMP, EMA, channels_last, VRAM stats
+│   ├── hardware.py                # Multi-backend setup, AMP, EMA, VRAM stats
 │   ├── sam.py                     # Sharpness-Aware Minimisation optimiser
 │   ├── ddp.py                     # DistributedDataParallel utilities
 │   ├── metrics.py                 # mIoU, Dice, per-class IoU
@@ -185,45 +297,57 @@ geo-intel/
 │   ├── logger.py                  # Structured logging + crash recovery
 │   └── window.py                  # Cosine spline blending for tile stitching
 │
-├── tests/
-│   └── test_core_components.py    # Unit tests for core pipeline components
-│
-├── activate.bat                   # Quick venv activation (Windows)
-└── setup_venv.bat                 # Full environment setup (Windows)
+└── tests/
+    ├── test_config_values.py      # Config value assertions
+    └── test_core_components.py    # Unit tests for core pipeline components
 ```
+
+---
+
+## Key Accuracy Features
+
+| Feature | Stage | Impact |
+|---------|-------|--------|
+| UNet++ deep supervision | 1 | Sharper building boundaries |
+| Lovász-Softmax loss | 1 | Directly optimises mIoU |
+| Instance-touching separation loss | 1 | Prevents adjacent buildings merging |
+| Watershed instance separation | 1 | Clean split of touching footprints |
+| ArcFace angular-margin head | 2A | Better RCC vs Tiled discrimination |
+| SAHI sliced inference | 2B | 640px slices — detects small wells at tile boundaries |
+| CosineAnnealingWarmRestarts | 1 | Periodic LR re-exploration (works with SAM) |
+| Road class weight 4.5× | 1 | Forces thin path connectivity |
+| SAHI overlap 40% | 2B | Larger context for boundary objects |
 
 ---
 
 ## Configuration Reference
 
-All hyperparameters are in `config.py`. Key knobs:
+All hyperparameters live in `config.py`:
 
 | Parameter | Default | Notes |
-|---|---|---|
-| `STAGE1["encoder"]` | `mit_b5` | Auto-downgrades to `mit_b4` if VRAM < 14 GB |
-| `STAGE1["batch_size"]` | `4` | Auto-halved to `2` when SAM is enabled on ≤16 GB |
-| `STAGE1["patch_sizes"]` | `(256, 512, 768)` | Multi-scale crop sizes for scale invariance |
-| `STAGE1["class_weights"]` | `[0.30, 1.80, 3.50, 2.20]` | Roads weighted 3.5× to force thin path connectivity |
-| `STAGE2A["use_arcface"]` | `True` | ArcFace angular-margin head for tighter class separation |
-| `STAGE2A["crop_size"]` | `224` | Rooftop crop resolution (up from 160) |
-| `STAGE2B["use_sahi"]` | `True` | SAHI sliced inference for small object recall |
-| `STAGE2B["class_buffer_px"]` | per-class | Transformer=100px, tank=80px, well=40px bounding boxes |
-| `AMP_DTYPE` | `bfloat16` | No GradScaler needed on Ampere GPUs |
-| `NUM_WORKERS` | `10` | DataLoader workers, tuned for NVMe SSD |
+|-----------|---------|-------|
+| `DEVICE` | auto | cuda → mps → cpu, auto-detected |
+| `AMP_DTYPE` | auto | bf16 (CUDA) · fp16 (MPS) · fp32 (CPU) |
+| `STAGE1["encoder"]` | `mit_b5` | 84M params |
+| `STAGE1["batch_size"]` | `4` | Auto-halved when SAM + ≤16 GB VRAM |
+| `STAGE1["class_weights"]` | `[0.30,1.80,4.50,2.20]` | Road 4.5× |
+| `STAGE2A["arcface_m"]` | `0.55` | Angular margin |
+| `STAGE2B["sahi_overlap_ratio"]` | `0.40` | Slice overlap |
+| `STAGE2B["class_conf_thresh"]["well"]` | `0.03` | Low threshold for small objects |
+| `STAGE2B["agnostic_nms"]` | `True` | Suppress cross-class duplicates |
 
 ---
 
-## Hardware Requirements
+## Deliverables
 
-| Component | Minimum | Recommended |
-|---|---|---|
-| GPU | RTX 3060 (12 GB) | **RTX A4000 (16 GB)** |
-| CPU | 8 cores | i9-13900 (8 P-cores + 16 E-cores) |
-| RAM | 16 GB | 32 GB |
-| Storage | 100 GB SSD | NVMe SSD (for DataLoader throughput) |
+- **Building footprints** — Polygon shapefiles with watershed-separated instances
+- **Rooftop classification** — `roof_type` attribute (RCC / Tiled / Tin / Other)
+- **Road networks** — Contiguous polygon shapefiles
+- **Waterbodies** — Polygon shapefiles
+- **Infrastructure points** — Transformer / well / overhead tank point shapefiles
 
 ---
 
 ## License
 
-This project was built for the NIF Hackathon.
+Built for the NIF Hackathon.

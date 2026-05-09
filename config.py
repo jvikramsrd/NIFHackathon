@@ -48,17 +48,27 @@ for d in [
 ]:
     d.mkdir(parents=True, exist_ok=True)
 
-# ─── Hardware ────────────────────────────────────────────────────────────────
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# Reduce CUDA memory fragmentation on the 16 GB A4000.
-# max_split_size_mb prevents the allocator from creating huge free blocks
-# that can't be reused, which is the #1 cause of OOM on 16 GB cards.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:256")
-
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cudnn.benchmark = True
-AMP_DTYPE = torch.bfloat16
+# ─── Hardware — multi-backend (NVIDIA CUDA / AMD ROCm / Apple MPS / CPU) ─────
+if torch.cuda.is_available():
+    # Covers both NVIDIA (CUDA) and AMD (ROCm — reports as cuda in PyTorch).
+    DEVICE = torch.device("cuda")
+    # Reduce fragmentation on 16 GB cards; harmless on other VRAM sizes.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:256")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    # bf16 is native on Ampere (NVIDIA) and CDNA2+ (AMD MI200+).
+    # On older AMD cards PyTorch silently emulates it; fp16 is faster there,
+    # but bf16 is kept as default because it's lossless for this workload.
+    AMP_DTYPE = torch.bfloat16
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    # Apple Silicon (M1 / M2 / M3 / M4) — Metal Performance Shaders.
+    # MPS does not support bfloat16 in all ops; use float16 instead.
+    DEVICE = torch.device("mps")
+    AMP_DTYPE = torch.float16
+else:
+    DEVICE = torch.device("cpu")
+    AMP_DTYPE = torch.float32
 # torch.compile requires Triton which is not available on Windows.
 # Disable it here — all other optimisations (TF32, bf16, cudnn.benchmark) still apply.
 COMPILE_ENABLED = False

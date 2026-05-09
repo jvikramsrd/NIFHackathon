@@ -1,0 +1,15 @@
+# AMD GPU — ROCm 6.2 (RX 6000 / 7000 series, Radeon Pro, Instinct MI)
+# ROCm is Linux-only. Windows AMD users must use CPU mode.
+# Install with:
+#   pip install -r requirements-torch-rocm.txt
+#
+# Supported cards: RX 6600 XT and newer (gfx1030+)
+# Check your gfx arch: rocminfo | grep gfx
+#
+# For ROCm 5.7 (older distros):
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm5.7
+
+--index-url https://download.pytorch.org/whl/rocm6.2
+torch>=2.4.0
+torchvision>=0.19.0
+torchaudio>=2.4.0

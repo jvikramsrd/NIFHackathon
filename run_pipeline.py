@@ -248,7 +248,13 @@ def _header(title: str):
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def cli_main():
+    """Entry point for the `geo-intel-pipeline` console script (pyproject.toml)."""
+    import sys as _sys
+    _run_cli(_sys.argv[1:])
+
+
+def _run_cli(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--mode",
@@ -297,3 +303,7 @@ if __name__ == "__main__":
         preprocess(data_root)
         train_all()
         evaluate()
+
+
+if __name__ == "__main__":
+    _run_cli()

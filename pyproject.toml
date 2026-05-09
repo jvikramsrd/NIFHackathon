@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "geo-intel"
+version = "1.0.0"
+description = "AI-based feature extraction from drone orthophotos (SVAMITVA pipeline)"
+requires-python = ">=3.10"
+license = { text = "NIF Hackathon" }
+
+# Core deps — torch is NOT listed here; install separately with the right
+# backend (CUDA / ROCm / MPS-CPU) using requirements-torch-*.txt
+dependencies = [
+    "segmentation-models-pytorch>=0.3.3",
+    "timm>=0.9.12",
+    "ultralytics>=8.1.0",
+    "shapely>=2.0.3",
+    "pyproj>=3.6.1",
+    "albumentations>=1.4.0",
+    "opencv-python>=4.9.0",
+    "Pillow>=10.2.0",
+    "scikit-image>=0.22.0",
+    "sahi>=0.11.15",
+    "numpy>=1.26.0",
+    "pandas>=2.1.0",
+    "scipy>=1.12.0",
+    "scikit-learn>=1.4.0",
+    "tqdm>=4.66.1",
+    "pyyaml>=6.0.1",
+    "matplotlib>=3.8.0",
+    "lxml",
+    "psutil>=5.9.0",
+    "tensorboard>=2.16.0",
+    "PyQt6>=6.6.0",
+    "onnx>=1.16.0",
+]
+
+[project.optional-dependencies]
+crf  = ["pydensecrf2"]
+onnx = ["onnxruntime-gpu>=1.17.0"]
+dev  = ["pytest>=8.0.0", "pyinstaller>=6.0.0"]
+
+[project.scripts]
+geo-intel-gui      = "gui:main"
+geo-intel-pipeline = "run_pipeline:cli_main"
+
+[tool.setuptools.packages.find]
+where   = ["."]
+include = ["data*", "models*", "train*", "inference*", "utils*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml", "*.yml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

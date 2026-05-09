@@ -1,0 +1,15 @@
+# CPU / Apple Silicon (MPS) — standard PyPI wheel
+# Works on:
+#   - Apple Silicon (M1/M2/M3/M4) via Metal Performance Shaders (MPS)
+#   - Intel/AMD CPU-only machines
+#   - CI build environments
+#
+# MPS accelerates forward passes on Apple GPUs. bfloat16 falls back to float16
+# automatically (see config.py AMP_DTYPE logic).
+#
+# Install with:
+#   pip install -r requirements-torch-cpu.txt
+
+torch>=2.2.0
+torchvision>=0.17.0
+torchaudio>=2.2.0
