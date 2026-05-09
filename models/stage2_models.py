@@ -355,13 +355,15 @@ class InfrastructureDetector:
             if sahi_model is not None:
                 try:
                     from sahi.predict import get_sliced_prediction  # type: ignore
+                    overlap_ratio = float(self.cfg.get("sahi_overlap_ratio", 0.30))
+                    slice_size = int(self.cfg.get("sahi_slice_size", 640))
                     result = get_sliced_prediction(
                         img_path,
                         sahi_model,
-                        slice_height=640,
-                        slice_width=640,
-                        overlap_height_ratio=0.30,
-                        overlap_width_ratio=0.30,
+                        slice_height=slice_size,
+                        slice_width=slice_size,
+                        overlap_height_ratio=overlap_ratio,
+                        overlap_width_ratio=overlap_ratio,
                         perform_standard_pred=True,
                         postprocess_type="NMM",  # Non-Maximum Merging
                         postprocess_match_threshold=0.50,
@@ -394,6 +396,7 @@ class InfrastructureDetector:
                 iou=self.cfg["iou_thresh"],
                 max_det=self.cfg.get("max_det", 300),
                 augment=True,
+                agnostic_nms=bool(self.cfg.get("agnostic_nms", False)),
             )
             for r in results:
                 obb = getattr(r, "obb", None) if self.cfg.get("use_obb") else None

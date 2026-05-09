@@ -86,3 +86,10 @@ def test_clf_train_transforms_include_fog_and_sunflare():
 
     assert "RandomFog" in type_names, "RandomFog missing from clf train transforms"
     assert "RandomSunFlare" in type_names, "RandomSunFlare missing from clf train transforms"
+
+
+def test_sahi_overlap_reads_from_config():
+    import pathlib
+    src = pathlib.Path("models/stage2_models.py").read_text(encoding="utf-8")
+    assert "overlap_height_ratio=0.30" not in src, \
+        "overlap_height_ratio is hardcoded 0.30 — should read from cfg['sahi_overlap_ratio']"
