@@ -1,0 +1,55 @@
+stages:
+  preprocess:
+    cmd: python run_pipeline.py --mode preprocess --data_root dataset
+    deps:
+      - run_pipeline.py
+      - data/preprocessing.py
+      - config.py
+      - dataset
+    outs:
+      - dataset/patches
+      - dataset/patch_masks
+      - dataset/building_crops
+      - dataset/yolo_infra
+
+  train_stage1:
+    cmd: python train/train_stage1.py
+    deps:
+      - train/train_stage1.py
+      - models/stage1_segmentation.py
+      - data/dataset.py
+      - config.py
+      - dataset/patches
+      - dataset/patch_masks
+    params:
+      - params.yaml:
+          - stage1
+    outs:
+      - checkpoints/stage1_best.pth
+
+  train_stage2a:
+    cmd: python train/train_stage2.py --stage 2a
+    deps:
+      - train/train_stage2.py
+      - models/stage2_models.py
+      - data/dataset.py
+      - config.py
+      - dataset/building_crops
+    params:
+      - params.yaml:
+          - stage2a
+    outs:
+      - checkpoints/stage2a_best.pth
+
+  train_stage2b:
+    cmd: python train/train_stage2.py --stage 2b
+    deps:
+      - train/train_stage2.py
+      - models/stage2_models.py
+      - config.py
+      - dataset/yolo_infra
+    params:
+      - params.yaml:
+          - stage2b
+    outs:
+      - checkpoints/stage2b_yolov9e

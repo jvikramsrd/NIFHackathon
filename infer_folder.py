@@ -3,6 +3,10 @@ import os
 import sys
 import traceback
 from pathlib import Path
+from utils.logger import get_logger
+
+log = get_logger(__name__)
+
 
 # Ensure the root directory is in sys.path so internal imports work correctly
 sys.path.insert(0, str(Path(__file__).parent))
@@ -27,24 +31,24 @@ def infer_folder(test_folder: str, out_base_dir: str):
     ]
 
     if not tifs:
-        print(f"[WARN] No .tif or .tiff files found in {test_folder}")
+        log.info(f"[WARN] No .tif or .tiff files found in {test_folder}")
         return
 
-    print(f"\nFound {len(tifs)} image(s) to process in '{test_folder}'.")
+    log.info(f"\nFound {len(tifs)} image(s) to process in '{test_folder}'.")
 
     # 2. Load the models ONCE to save massive VRAM allocation overhead
-    print("Loading models into VRAM (this happens only once)...")
+    log.info("Loading models into VRAM (this happens only once)...")
     try:
         pipe = GeoIntelPipeline(
             str(CFG.CKPT_DIR / "stage1_best.pth"),
             str(CFG.CKPT_DIR / "stage2a_best.pth"),
-            str(CFG.CKPT_DIR / "stage2b_yolov8l" / "weights" / "best.pt"),
+            str(CFG.CKPT_DIR / f"stage2b_{CFG.STAGE2B['model_variant']}" / "weights" / "best.pt"),
         )
     except Exception as e:
-        print(
+        log.info(
             f"\n[FATAL ERROR] Failed to load models! Ensure training has finished and checkpoints exist."
         )
-        print(f"Error details: {e}")
+        log.info(f"Error details: {e}")
         return
 
     # 3. Process each image sequentially
@@ -52,9 +56,9 @@ def infer_folder(test_folder: str, out_base_dir: str):
     failed = 0
 
     for i, tif in enumerate(tifs, 1):
-        print(f"\n[{i}/{len(tifs)}] {'=' * 55}")
-        print(f"Processing Image : {tif.name}")
-        print(f"Source Path      : {tif}")
+        log.info(f"\n[{i}/{len(tifs)}] {'=' * 55}")
+        log.info(f"Processing Image : {tif.name}")
+        log.info(f"Source Path      : {tif}")
 
         # Create a unique output subfolder for this specific TIF
         out_dir = out_base_path / tif.stem
@@ -63,20 +67,20 @@ def infer_folder(test_folder: str, out_base_dir: str):
         try:
             # Run the 3-stage pipeline on the image
             pipe.run(str(tif), str(out_dir))
-            print(f"[*] Done! Results saved to: {out_dir}")
+            log.info(f"[*] Done! Results saved to: {out_dir}")
             successful += 1
         except Exception as e:
-            print(f"\n[ERROR] Failed to process {tif.name}!")
+            log.info(f"\n[ERROR] Failed to process {tif.name}!")
             traceback.print_exc()
             failed += 1
 
-    print(f"\n{'=' * 65}")
-    print("  BATCH INFERENCE COMPLETE")
-    print(f"{'=' * 65}")
-    print(f"  Successfully processed : {successful}")
-    print(f"  Failed to process      : {failed}")
-    print(f"  All outputs saved to   : {out_base_path.absolute()}")
-    print(f"{'=' * 65}\n")
+    log.info(f"\n{'=' * 65}")
+    log.info("  BATCH INFERENCE COMPLETE")
+    log.info(f"{'=' * 65}")
+    log.info(f"  Successfully processed : {successful}")
+    log.info(f"  Failed to process      : {failed}")
+    log.info(f"  All outputs saved to   : {out_base_path.absolute()}")
+    log.info(f"{'=' * 65}\n")
 
 
 if __name__ == "__main__":

@@ -14,8 +14,11 @@ from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
+from utils.logger import get_logger
 
 warnings.filterwarnings("ignore")
+
+log = get_logger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -24,15 +27,15 @@ warnings.filterwarnings("ignore")
 
 
 def _process_crf_tile(args):
-    print("  [DEBUG CRF] Entering _process_crf_tile")
+    log.debug("  [DEBUG CRF] Entering _process_crf_tile")
     try:
-        print("  [DEBUG CRF] Importing pydensecrf inside worker...")
+        log.debug("  [DEBUG CRF] Importing pydensecrf inside worker...")
         import pydensecrf.densecrf as dcrf
         from pydensecrf.utils import unary_from_softmax
 
-        print("  [DEBUG CRF] Import successful")
+        log.debug("  [DEBUG CRF] Import successful")
     except ImportError:
-        print("  [DEBUG CRF] Import failed")
+        log.debug("  [DEBUG CRF] Import failed")
         return args[1], args[-2], args[-1], args[1].shape[1], args[1].shape[2]
 
     (
@@ -48,21 +51,21 @@ def _process_crf_tile(args):
         c,
     ) = args
     C, H, W = prob_map.shape
-    print(f"  [DEBUG CRF] Creating DenseCRF2D({W}, {H}, {C})")
+    log.debug(f"  [DEBUG CRF] Creating DenseCRF2D({W}, {H}, {C})")
     d = dcrf.DenseCRF2D(W, H, C)
 
-    print("  [DEBUG CRF] Computing unary_from_softmax")
+    log.debug("  [DEBUG CRF] Computing unary_from_softmax")
     unary = unary_from_softmax(prob_map)
 
-    print("  [DEBUG CRF] setUnaryEnergy")
+    log.debug("  [DEBUG CRF] setUnaryEnergy")
     d.setUnaryEnergy(unary)
 
-    print("  [DEBUG CRF] addPairwiseGaussian")
+    log.debug("  [DEBUG CRF] addPairwiseGaussian")
     d.addPairwiseGaussian(sxy=pos_xy_std, compat=pos_w)
 
     # --- EXPERT ADDITION: Texture-Aware Pairwise Bilateral ---
     # Calculate local gradient variance (using Sobel filters on the RGB image)
-    print("  [DEBUG CRF] Calculating local texture variance for boundary weighting...")
+    log.debug("  [DEBUG CRF] Calculating local texture variance for boundary weighting...")
     # Simple L2 norm of the gradient across channels as a proxy for texture evidence
     sobel_r = cv2.Sobel(image_rgb, cv2.CV_64F, 1, 0, ksize=3)
     sobel_g = cv2.Sobel(image_rgb, cv2.CV_64F, 0, 1, ksize=3)
@@ -71,31 +74,28 @@ def _process_crf_tile(args):
     # Normalize texture evidence to scale it correctly for the pair-wise term
     texture_evidence = cv2.normalize(texture_evidence, None, 1.0, 0.0, cv2.NORM_MINMAX)
 
-    print("  [DEBUG CRF] Adding texture-weighted pairwise bilateral term...")
-    # The structure for incorporating texture evidence is complex; for simplicity here,
-    # we will modify the weight calculation or add a new parameter if the library allowed.
-    # For a direct implementation, we use texture_evidence as a modulating factor on the pair-wise term.
-    # Note: Real implementation requires detailed understanding of dcrf internal weighting.
+    log.debug("  [DEBUG CRF] Building per-class bilateral compat matrix...")
+    # Per-class compatibility matrix: heavier penalty for class confusions that
+    # are most damaging to downstream metrics:
+    #   building <-> waterbody: 3x   (catastrophic false positive)
+    #   building <-> road:      1.5x  (common confusion in dense settlements)
+    C_mat = np.ones((C, C), dtype=np.float32) * float(bi_w)
+    if C > 3:
+        C_mat[1, 3] = C_mat[3, 1] = float(bi_w) * 3.0  # building <-> waterbody
+        C_mat[1, 2] = C_mat[2, 1] = float(bi_w) * 1.5  # building <-> road
+    np.fill_diagonal(C_mat, 0.0)  # same-class: no penalty
+
     d.addPairwiseBilateral(
         sxy=bi_xy_std,
         srgb=bi_rgb_std,
         rgbim=np.ascontiguousarray(image_rgb),
-        compat=bi_w,
-        texture_weight=texture_evidence,  # Hypothetical advanced parameter
-    )
-    # FALLBACK: Since texture_weight might not be supported, we retain the original call but add a note:
-    # print("  [WARNING] Using original pairwise term; full texture weighting requires library update.")
-    d.addPairwiseBilateral(
-        sxy=bi_xy_std,
-        srgb=bi_rgb_std,
-        rgbim=np.ascontiguousarray(image_rgb),
-        compat=bi_w,
+        compat=C_mat,
     )
 
-    print(f"  [DEBUG CRF] Running inference({n_iter})")
+    log.debug(f"  [DEBUG CRF] Running inference({n_iter})")
     Q = d.inference(n_iter)
 
-    print("  [DEBUG CRF] Reshaping and returning")
+    log.debug("  [DEBUG CRF] Reshaping and returning")
     refined = np.array(Q).reshape((C, H, W))
     return refined, r, c, H, W
 
@@ -116,12 +116,12 @@ def apply_dense_crf(
     Falls back to identity if pydensecrf is not installed.
     Parallelizes over image tiles.
     """
-    print("[DEBUG CRF] Entering apply_dense_crf")
+    log.debug("[DEBUG CRF] Entering apply_dense_crf")
     try:
-        print("[DEBUG CRF] Trying to import pydensecrf...")
+        log.debug("[DEBUG CRF] Trying to import pydensecrf...")
         import pydensecrf.densecrf as dcrf
 
-        print("[DEBUG CRF] pydensecrf imported successfully")
+        log.debug("[DEBUG CRF] pydensecrf imported successfully")
     except ImportError:
         warnings.warn(
             "pydensecrf not installed; skipping CRF. "
@@ -129,23 +129,20 @@ def apply_dense_crf(
         )
         return prob_map
 
-    print("[DEBUG CRF] Importing tqdm...")
+    log.debug("[DEBUG CRF] Importing tqdm...")
     from tqdm import tqdm
 
-    print("[DEBUG CRF] tqdm imported. Preparing tasks...")
+    log.debug("[DEBUG CRF] tqdm imported. Preparing tasks...")
 
     C, H, W = prob_map.shape
     tile_size = 2048
     overlap = 256
     stride = tile_size - overlap
 
-    intersection = overlap
-    wind_outer = (np.cos(np.pi * np.arange(intersection) / intersection) + 1) / 2
-    wind = np.ones(tile_size)
-    wind[:intersection] = wind_outer[::-1]
-    wind[-intersection:] = wind_outer
-    wind = wind**2
-    window = np.outer(wind, wind)
+    # Use the shared cosine window utility for consistent blending
+    from utils.window import cosine_window
+
+    window = cosine_window(tile_size, overlap, power=2)
 
     tasks = []
     for r in range(0, H, stride):
@@ -169,25 +166,25 @@ def apply_dense_crf(
                 )
             )
 
-    print(f"[DEBUG CRF] Created {len(tasks)} tasks. Starting loop...")
+    log.info(f"[DEBUG CRF] Created {len(tasks)} tasks. Starting loop...")
     refined_map = np.zeros_like(prob_map)
     weight_map = np.zeros((H, W), dtype=np.float32)
 
     for i, t in enumerate(tqdm(tasks, desc="  CRF tiles")):
-        print(
+        log.info(
             f"  [DEBUG CRF] Submitting task {i + 1}/{len(tasks)} (r={t[-2]}, c={t[-1]})"
         )
         res, r, c, th, tw = _process_crf_tile(t)
-        print(f"  [DEBUG CRF] Task {i + 1} completed")
+        log.debug(f"  [DEBUG CRF] Task {i + 1} completed")
         r2 = r + th
         c2 = c + tw
         wind_slice = window[:th, :tw]
         refined_map[:, r:r2, c:c2] += res * wind_slice
         weight_map[r:r2, c:c2] += wind_slice
 
-    print("[DEBUG CRF] All tasks finished. Averaging map...")
+    log.debug("[DEBUG CRF] All tasks finished. Averaging map...")
     refined_map /= np.maximum(weight_map, 1e-6)
-    print("[DEBUG CRF] Exiting apply_dense_crf")
+    log.debug("[DEBUG CRF] Exiting apply_dense_crf")
     return refined_map
 
 
@@ -213,6 +210,8 @@ def clean_segmentation_mask(
     kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     bld = cv2.morphologyEx(bld, cv2.MORPH_CLOSE, kernel_close)
     bld = _remove_small_blobs(bld, min_bld)
+    # Watershed: separate touching building instances before vectorisation
+    bld = separate_touching_buildings(bld)
     cleaned[bld == 1] = 1
     cleaned[(mask == 1) & (bld == 0)] = 0
 
@@ -246,10 +245,49 @@ def _remove_small_blobs(binary: np.ndarray, min_area: int) -> np.ndarray:
     n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
         binary, connectivity=8
     )
-    # Fast vectorized lookup table
-    valid_mask = (stats[:, cv2.CC_STAT_AREA] >= min_area).astype(np.uint8)
+    # Use int32 LUT — uint8 would silently overflow for label indices > 255
+    valid_mask = np.zeros(n_labels, dtype=np.int32)
+    valid_mask[stats[:, cv2.CC_STAT_AREA] >= min_area] = 1
     valid_mask[0] = 0  # Background is always 0
-    return valid_mask[labels]
+    return valid_mask[labels].astype(np.uint8)
+
+
+def separate_touching_buildings(binary_mask: np.ndarray) -> np.ndarray:
+    """
+    Use marker-controlled watershed to separate touching building instances.
+
+    Steps:
+      1. Distance transform of the binary mask.
+      2. Find local maxima of the distance map as instance seeds.
+      3. Run watershed with the seeds as markers.
+
+    Returns a binary mask where touching buildings are separated by a 1-px gap.
+    Falls back to the input mask gracefully if scipy/skimage are unavailable.
+    """
+    try:
+        from scipy import ndimage as ndi
+        from skimage.feature import peak_local_max
+        from skimage.segmentation import watershed
+    except ImportError:
+        log.warning("scipy/skimage not found; skipping watershed separation. "
+                    "Install: pip install scipy scikit-image")
+        return binary_mask
+
+    if binary_mask.sum() == 0:
+        return binary_mask
+
+    dist = ndi.distance_transform_edt(binary_mask)
+    # Minimum distance between seeds = 10px (avoids over-segmentation)
+    min_dist = max(10, int(binary_mask.shape[0] * 0.01))
+    coords = peak_local_max(dist, min_distance=min_dist, labels=binary_mask)
+    if len(coords) == 0:
+        return binary_mask
+
+    markers = np.zeros_like(binary_mask, dtype=np.int32)
+    markers[tuple(coords.T)] = np.arange(1, len(coords) + 1)
+    markers = ndi.label(markers)[0]
+    labels = watershed(-dist, markers, mask=binary_mask)
+    return (labels > 0).astype(np.uint8)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -278,6 +316,15 @@ def mask_to_shapefile(
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    cfg = {}
+    try:
+        import config as CFG
+
+        cfg = dict(CFG.STAGE1)
+    except Exception:
+        cfg = {}
+    simplify_tol = float(cfg.get("polygon_simplify_tolerance", 0.5))
+    min_area_by_class = cfg.get("polygon_min_area_px", {})
 
     all_gdfs = []
 
@@ -307,11 +354,14 @@ def mask_to_shapefile(
             geometry=geoms_list,
             crs=crs,
         )
-        # Simplify polygons slightly to reduce vertex count
-        gdf["geometry"] = gdf["geometry"].simplify(
-            tolerance=0.5, preserve_topology=True
+        gdf = clean_vector_geometries(
+            gdf,
+            class_name=class_name,
+            min_area=float(min_area_by_class.get(class_name, 0)),
+            simplify_tolerance=simplify_tol,
         )
-        gdf = gdf[gdf.geometry.is_valid]
+        if len(gdf) == 0:
+            continue
 
         # Save per-class SHP
         cls_path = out_dir / f"{prefix}_{class_name}.shp"
@@ -325,9 +375,65 @@ def mask_to_shapefile(
         combined_gdf = gpd.GeoDataFrame(combined, crs=crs)
         combined_path = out_dir / f"{prefix}_all_features.gpkg"
         combined_gdf.to_file(str(combined_path), driver="GPKG")
-        print(f"  ✓ Combined vector saved: {combined_path}")
+        log.info(f"  ✓ Combined vector saved: {combined_path}")
 
     return out_dir
+
+
+def clean_vector_geometries(
+    gdf,
+    class_name: str = "",
+    min_area: float = 0.0,
+    simplify_tolerance: float = 0.5,
+):
+    """Fix topology, simplify polygons, explode multipart features, and filter area."""
+
+    from shapely.geometry import GeometryCollection, MultiPolygon, Polygon
+
+    try:
+        from shapely.validation import make_valid
+    except Exception:
+        make_valid = None
+
+    def _fix_geom(geom):
+        if geom is None or geom.is_empty:
+            return None
+        try:
+            fixed = make_valid(geom) if make_valid is not None else geom.buffer(0)
+        except Exception:
+            fixed = geom.buffer(0)
+        if fixed is None or fixed.is_empty:
+            return None
+        if isinstance(fixed, GeometryCollection):
+            polys = [g for g in fixed.geoms if isinstance(g, (Polygon, MultiPolygon))]
+            if not polys:
+                return None
+            fixed = MultiPolygon(
+                [p for geom_part in polys for p in (geom_part.geoms if isinstance(geom_part, MultiPolygon) else [geom_part])]
+            )
+        if simplify_tolerance > 0:
+            fixed = fixed.simplify(simplify_tolerance, preserve_topology=True)
+        try:
+            if not fixed.is_valid:
+                fixed = fixed.buffer(0)
+        except Exception:
+            return None
+        return fixed if fixed is not None and not fixed.is_empty else None
+
+    cleaned = gdf.copy()
+    cleaned["geometry"] = cleaned.geometry.map(_fix_geom)
+    cleaned = cleaned[cleaned.geometry.notna() & ~cleaned.geometry.is_empty]
+    if len(cleaned) == 0:
+        return cleaned
+    cleaned = cleaned.explode(index_parts=False, ignore_index=True)
+    if min_area > 0:
+        before = len(cleaned)
+        cleaned = cleaned[cleaned.geometry.area >= min_area]
+        dropped = before - len(cleaned)
+        if dropped:
+            log.debug("Dropped %s %s polygons below area %.2f", dropped, class_name, min_area)
+    cleaned = cleaned[cleaned.geometry.is_valid]
+    return cleaned
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -349,7 +455,7 @@ def merge_rooftop_labels(
     gdf = gpd.read_file(building_shp_path)
     gdf["roof_pred"] = gdf.index.map(lambda i: rooftop_predictions.get(i, "Unknown"))
     gdf.to_file(out_path)
-    print(f"  ✓ Building SHP with roof labels → {out_path}")
+    log.info(f"  ✓ Building SHP with roof labels → {out_path}")
     return gdf
 
 
@@ -365,22 +471,50 @@ def detections_to_shapefile(
     out_path: str,
 ):
     """
-    Convert bounding-box detections to point GeoDataFrame (centroid of bbox).
+    Convert bounding-box / OBB detections to a GeoDataFrame.
+
+    - OBB detections (``obb_xywhr`` present): stored as rotated rectangle polygons
+      in geo-coordinates so orientation is preserved for GIS users.
+    - Standard-box detections: stored as centroid points (legacy behaviour).
     """
+    import math
+
     import geopandas as gpd
-    from shapely.geometry import Point
+    from shapely.affinity import rotate, scale as shapely_scale
+    from shapely.geometry import Point, box as shapely_box
 
     rows = []
     for det in detections:
         x1, y1, x2, y2 = det["bbox_xyxy"]
-        cx_px = (x1 + x2) / 2
-        cy_px = (y1 + y2) / 2
+        cx_px = (x1 + x2) / 2.0
+        cy_px = (y1 + y2) / 2.0
+
         # Pixel → geo coords via affine transform
-        geo_x = transform.c + cx_px * transform.a
-        geo_y = transform.f + cy_px * transform.e
+        geo_cx = transform.c + cx_px * transform.a
+        geo_cy = transform.f + cy_px * transform.e
+
+        obb = det.get("obb_xywhr")  # [cx, cy, w, h, angle_rad] in pixel space
+        if obb is not None and len(obb) == 5:
+            px_cx, px_cy, pw, ph, angle_rad = obb
+            # Build axis-aligned box in pixel space, then rotate
+            half_w = pw / 2.0
+            half_h = ph / 2.0
+            # Convert pixel extents to geo units (assumes uniform pixel size)
+            geo_half_w = half_w * abs(transform.a)
+            geo_half_h = half_h * abs(transform.e)
+            rect = shapely_box(
+                geo_cx - geo_half_w, geo_cy - geo_half_h,
+                geo_cx + geo_half_w, geo_cy + geo_half_h,
+            )
+            # Rotate around centroid; YOLO angle is clockwise in image space
+            angle_deg = math.degrees(angle_rad)
+            geom = rotate(rect, -angle_deg, origin=(geo_cx, geo_cy), use_radians=False)
+        else:
+            geom = Point(geo_cx, geo_cy)
+
         rows.append(
             {
-                "geometry": Point(geo_x, geo_y),
+                "geometry": geom,
                 "class_id": det["class_id"],
                 "class_name": det["class_name"],
                 "confidence": round(det["conf"], 4),
@@ -389,5 +523,5 @@ def detections_to_shapefile(
 
     gdf = gpd.GeoDataFrame(rows, crs=crs)
     gdf.to_file(out_path)
-    print(f"  ✓ Infrastructure points → {out_path}")
+    log.info("  ✓ Infrastructure features → %s", out_path)
     return gdf

@@ -1,0 +1,55 @@
+# params.yaml — DVC-tracked hyperparameters
+# Must stay in sync with config.py. Any change triggers `dvc repro`.
+
+stage1:
+  arch: UnetPlusPlus
+  encoder: mit_b5
+  lr: 2.0e-4
+  batch_size: 4          # auto-halved to 2 when SAM is on + ≤16GB VRAM
+  grad_accum: 8
+  epochs: 150
+  patch_size: 512
+  patch_sizes: [256, 512, 768]
+  ms_training: true
+  ms_scales: [0.5, 1.0, 1.5]
+  use_sam: true
+  sam_rho: 0.05
+  sam_adaptive: true
+  dice_weight: 0.40
+  bce_weight: 0.15
+  focal_weight: 0.15
+  boundary_weight: 0.15
+  lovasz_weight: 0.15
+  touching_weight: 0.10
+  use_ema: true
+  ema_decay: 0.9998
+  use_swa: true
+
+stage2a:
+  arch: convnext_large
+  lr: 5.0e-5
+  batch_size: 32
+  epochs: 150
+  crop_size: 224
+  use_arcface: true
+  arcface_s: 30.0
+  arcface_m: 0.50
+  use_sam: true
+  sam_rho: 0.05
+  use_randaugment: true
+  randaugment_n: 2
+  randaugment_m: 7
+  use_ema: true
+  ema_decay: 0.9995
+
+stage2b:
+  model_variant: yolov9e
+  use_obb: true
+  obb_model_variant: yolov9e-obb
+  img_size: 1280
+  batch_size: 2
+  epochs: 200
+  lr0: 0.001
+  lrf: 0.01
+  use_sahi: true
+  sahi_slice_size: 640

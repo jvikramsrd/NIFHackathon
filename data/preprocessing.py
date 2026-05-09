@@ -41,6 +41,10 @@ import rasterio.transform
 import rasterio.warp
 import rasterio.windows
 from tqdm import tqdm
+from utils.logger import get_logger
+
+log = get_logger(__name__)
+
 
 warnings.filterwarnings("ignore")
 
@@ -155,17 +159,17 @@ def scan_folder(folder: str) -> Tuple[List[Path], List[Path]]:
                     continue
             rasters.append(f)
 
-    print(f"\n[Scan] {folder_path.name}/")
-    print(f"  Rasters : {len(rasters)}")
+    log.info(f"\n[Scan] {folder_path.name}/")
+    log.info(f"  Rasters : {len(rasters)}")
     for r in rasters:
-        print(f"    {r.name}  ({r.stat().st_size / 1e9:.1f} GB)")
-    print(f"  SHPs    : {len(shps)}")
+        log.info(f"    {r.name}  ({r.stat().st_size / 1e9:.1f} GB)")
+    log.info(f"  SHPs    : {len(shps)}")
     for s in shps:
-        print(f"    {s.name}")
+        log.info(f"    {s.name}")
     if skipped:
-        print(f"  Skipped : {len(skipped)}")
+        log.info(f"  Skipped : {len(skipped)}")
         for s in skipped:
-            print(f"    {s}")
+            log.info(f"    {s}")
 
     return rasters, shps
 
@@ -187,10 +191,10 @@ def safe_read_raster(
         with rasterio.open(str(raster_path)) as src:
             # Basic sanity checks
             if src.width == 0 or src.height == 0:
-                print(f"    [SKIP] {raster_path.name}: zero-size raster")
+                log.info(f"    [SKIP] {raster_path.name}: zero-size raster")
                 return None
             if src.count == 0:
-                print(f"    [SKIP] {raster_path.name}: no bands")
+                log.info(f"    [SKIP] {raster_path.name}: no bands")
                 return None
 
             meta = src.meta.copy()
@@ -206,7 +210,7 @@ def safe_read_raster(
                     band = src.read(1)
                     arr = np.stack([band] * 3, axis=-1)
             except Exception as e:
-                print(f"    [SKIP] {raster_path.name}: read error — {e}")
+                log.info(f"    [SKIP] {raster_path.name}: read error — {e}")
                 return None
 
         # Convert to uint8
@@ -215,19 +219,19 @@ def safe_read_raster(
 
         # Check for all-zero / all-NaN (corrupt file symptom)
         if arr.max() == 0:
-            print(
+            log.info(
                 f"    [WARN] {raster_path.name}: all-zero pixel values — file may be corrupt"
             )
             # Don't skip — might just be a very dark image
 
-        print(f"    [OK]  {raster_path.name}  {arr.shape[1]}×{arr.shape[0]} px")
+        log.info(f"    [OK]  {raster_path.name}  {arr.shape[1]}×{arr.shape[0]} px")
         return arr, meta, crs, transform
 
     except rasterio.errors.RasterioIOError as e:
-        print(f"    [SKIP] {raster_path.name}: RasterioIOError — {e}")
+        log.info(f"    [SKIP] {raster_path.name}: RasterioIOError — {e}")
         return None
     except Exception as e:
-        print(f"    [SKIP] {raster_path.name}: {type(e).__name__} — {e}")
+        log.info(f"    [SKIP] {raster_path.name}: {type(e).__name__} — {e}")
         return None
 
 
@@ -284,7 +288,7 @@ def build_svamitva_mask(
         try:
             gdf = gpd.read_file(str(shp_path))
         except Exception as e:
-            print(f"      [SKIP SHP] {shp_path.name}: {e}")
+            log.info(f"      [SKIP SHP] {shp_path.name}: {e}")
             continue
 
         if len(gdf) == 0:
@@ -295,8 +299,12 @@ def build_svamitva_mask(
             try:
                 gdf = gdf.to_crs(crs)
             except Exception as e:
-                print(f"      [WARN CRS] {shp_path.name}: {e}")
+                log.info(f"      [WARN CRS] {shp_path.name}: {e}")
 
+        # Batch all valid geometries for this layer into a single rasterize() call.
+        # The old per-geometry loop issued one rasterio C call per feature — on SHPs
+        # with 10,000+ buildings this was the single biggest preprocessing bottleneck.
+        shapes_for_layer = []
         layer_burned = 0
         for idx, row in gdf.iterrows():
             geom = row.geometry
@@ -304,13 +312,17 @@ def build_svamitva_mask(
                 continue
             if not geom.is_valid:
                 try:
-                    geom = geom.buffer(0)  # fix self-intersections
+                    geom = geom.buffer(0)
                 except Exception:
                     continue
+            if geom.is_valid:
+                shapes_for_layer.append((geom, class_id))
+                layer_burned += 1
 
+        if shapes_for_layer:
             try:
                 burned = rasterio.features.rasterize(
-                    [(geom, class_id)],
+                    shapes_for_layer,
                     out_shape=(H, W),
                     transform=transform,
                     fill=0,
@@ -319,20 +331,18 @@ def build_svamitva_mask(
                 )
                 if burned is not None:
                     mask = np.where(burned > 0, burned, mask)
-                layer_burned += 1
-            except Exception:
-                # Individual geometry failure — skip and continue
-                continue
+            except Exception as e:
+                log.warning("      [WARN rasterize] %s: %s", shp_path.name, e)
 
         total_burned += layer_burned
         if layer_burned > 0:
-            print(
+            log.info(
                 f"      {shp_path.name:<35} class={class_id}  features={layer_burned}"
             )
 
     fg = int((mask > 0).sum())
     tot = H * W
-    print(
+    log.info(
         f"      Total features burned: {total_burned}  |  "
         f"Coverage: {100 * fg / tot:.1f}%  ({fg:,}/{tot:,} px)"
     )
@@ -369,13 +379,13 @@ def extract_building_crops_svamitva(
     Returns number of crops saved.
     """
     if built_up_shp is None or not built_up_shp.exists():
-        print("      [SKIP crops] Built_Up_Area SHP not found")
+        log.info("      [SKIP crops] Built_Up_Area SHP not found")
         return 0
 
     try:
         gdf = gpd.read_file(str(built_up_shp))
     except Exception as e:
-        print(f"      [SKIP crops] Cannot read {built_up_shp.name}: {e}")
+        log.info(f"      [SKIP crops] Cannot read {built_up_shp.name}: {e}")
         return 0
 
     H, W = img_rgb.shape[:2]
@@ -388,7 +398,7 @@ def extract_building_crops_svamitva(
         if gdf.crs and gdf.crs != crs:
             gdf = gdf.to_crs(crs)
     except Exception as e:
-        print(f"      [WARN crops CRS] {e}")
+        log.info(f"      [WARN crops CRS] {e}")
         transform = None
 
     saved = 0
@@ -422,8 +432,9 @@ def extract_building_crops_svamitva(
             # rasterio ~transform converts geo → pixel
             if transform is None:
                 continue
-            row_min, col_min = ~transform * (minx, maxy)
-            row_max, col_max = ~transform * (maxx, miny)
+            # rasterio ~transform returns (col, row) i.e. (x_px, y_px)
+            col_min, row_min = ~transform * (minx, maxy)
+            col_max, row_max = ~transform * (maxx, miny)
             r1, r2 = int(min(row_min, row_max)), int(max(row_min, row_max))
             c1, c2 = int(min(col_min, col_max)), int(max(col_min, col_max))
 
@@ -445,7 +456,7 @@ def extract_building_crops_svamitva(
             skipped += 1
             continue
 
-    print(f"      Building crops: {saved} saved, {skipped} skipped")
+    log.info(f"      Building crops: {saved} saved, {skipped} skipped")
     return saved
 
 
@@ -465,6 +476,7 @@ def extract_infra_yolo(
     out_label_dir: str,
     tile_size: int = 1280,
     buffer_px: int = 20,
+    use_obb: bool = False,
 ) -> int:
     """
     Convert Utility point/polygon features → YOLO format label files.
@@ -482,7 +494,7 @@ def extract_infra_yolo(
             transform = src.transform
             crs = src.crs
     except Exception as e:
-        print(f"      [SKIP infra] Cannot open raster for CRS: {e}")
+        log.info(f"      [SKIP infra] Cannot open raster for CRS: {e}")
         return 0
 
     # Collect all infra points across both Utility and Utility_Poly
@@ -492,7 +504,7 @@ def extract_infra_yolo(
         try:
             gdf = gpd.read_file(str(shp_path))
         except Exception as e:
-            print(f"      [SKIP infra SHP] {shp_path.name}: {e}")
+            log.info(f"      [SKIP infra SHP] {shp_path.name}: {e}")
             continue
 
         if gdf.crs and gdf.crs != crs:
@@ -529,7 +541,7 @@ def extract_infra_yolo(
                 continue
 
     if not infra_pts:
-        print("      No infrastructure features found")
+        log.info("      No infrastructure features found")
         return 0
 
     # Tile the raster and write YOLO labels per tile
@@ -560,12 +572,39 @@ def extract_infra_yolo(
             bh = (buffer_px * 2) / ph
             cx, cy = max(0, min(1, cx)), max(0, min(1, cy))
             bw, bh = max(0.001, bw), max(0.001, bh)
-            lines.append(f"{cid} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+            lines.append(_format_yolo_label(cid, cx, cy, bw, bh, use_obb=use_obb))
 
         (Path(out_label_dir) / f"{name}.txt").write_text("\n".join(lines))
 
-    print(f"      Infrastructure objects: {total}")
+    log.info(f"      Infrastructure objects: {total}")
     return total
+
+
+def _format_yolo_label(
+    cid: int,
+    cx: float,
+    cy: float,
+    bw: float,
+    bh: float,
+    use_obb: bool = False,
+) -> str:
+    """Return regular YOLO or YOLO-OBB label text for an axis-aligned box."""
+
+    if not use_obb:
+        return f"{cid} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}"
+
+    x1 = max(0.0, min(1.0, cx - bw / 2.0))
+    y1 = max(0.0, min(1.0, cy - bh / 2.0))
+    x2 = max(0.0, min(1.0, cx + bw / 2.0))
+    y2 = y1
+    x3 = x2
+    y3 = max(0.0, min(1.0, cy + bh / 2.0))
+    x4 = x1
+    y4 = y3
+    return (
+        f"{cid} {x1:.6f} {y1:.6f} {x2:.6f} {y2:.6f} "
+        f"{x3:.6f} {y3:.6f} {x4:.6f} {y4:.6f}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -597,19 +636,21 @@ def tile_image_and_mask(
             pm = mask[r:r2, c:c2]
             ph, pw = pi.shape[:2]
 
+            # Filter BEFORE padding to avoid allocating memory for discarded tiles
+            fg_px = int(np.count_nonzero(pm))
+            if fg_px / (patch_size * patch_size) < min_fg:
+                continue
+
             if ph == patch_size and pw == patch_size:
                 pad_i = pi
                 pad_m = pm
             else:
                 pad_i = cv2.copyMakeBorder(
-                    pi, 0, patch_size - ph, 0, patch_size - pw, cv2.BORDER_REFLECT_101
+                    pi, 0, patch_size - ph, 0, patch_size - pw, cv2.BORDER_REFLECT
                 )
                 pad_m = cv2.copyMakeBorder(
-                    pm, 0, patch_size - ph, 0, patch_size - pw, cv2.BORDER_REFLECT_101
+                    pm, 0, patch_size - ph, 0, patch_size - pw, cv2.BORDER_REFLECT
                 )
-
-            if np.sum(pad_m > 0) / patch_size**2 < min_fg:
-                continue
 
             # Safe filename — replace spaces/special chars
             safe_prefix = re.sub(r"[^\w]", "_", prefix)[:40]
@@ -818,15 +859,15 @@ def _process_single_raster(raster_path, shps, built_up_shp, utility_shps):
     cfg2a = config.STAGE2A
     cfg2b = config.STAGE2B
 
-    print(f"\n  Processing {raster_path.name} on PID {os.getpid()}")
+    log.info(f"\n  Processing {raster_path.name} on PID {os.getpid()}")
     try:
         H, W, crs, transform, meta, dtype, n_bands = _raster_info(raster_path)
     except Exception as e:
-        print(f"    [SKIP] Cannot open {raster_path.name}: {e}")
+        log.info(f"    [SKIP] Cannot open {raster_path.name}: {e}")
         return 0, 0, 0, 1  # patches, crops, infra, failed
 
     ram_gb = H * W * 3 / 1e9
-    print(
+    log.info(
         f"    {raster_path.name} : {W:,} x {H:,} px  ({ram_gb:.1f} GB if loaded whole)"
     )
 
@@ -838,7 +879,7 @@ def _process_single_raster(raster_path, shps, built_up_shp, utility_shps):
     mask_meta.update(count=1, dtype=rasterio.uint8, compress="lzw")
 
     # --- PRELOAD SHAPEFILES FOR THIS RASTER ---
-    print(
+    log.info(
         f"    {raster_path.name}: Preloading and indexing SHP geometries into memory..."
     )
     preloaded_shps = []
@@ -901,7 +942,7 @@ def _process_single_raster(raster_path, shps, built_up_shp, utility_shps):
             try:
                 img_strip = _read_strip_rgb(raster_path, row_off, STRIP_ROWS)
             except Exception as e:
-                print(f"    [SKIP strip {strip_idx} on {raster_path.name}] {e}")
+                log.info(f"    [SKIP strip {strip_idx} on {raster_path.name}] {e}")
                 continue
 
             actual_h = img_strip.shape[0]
@@ -931,12 +972,12 @@ def _process_single_raster(raster_path, shps, built_up_shp, utility_shps):
                 str(config.PATCH_DIR),
                 str(config.MASK_DIR),
                 safe_prefix,
-                min_fg=0.003,
+                min_fg=cfg1.get("min_fg_ratio", 0.003),
             )
             raster_patches += n
 
             pct = min(100, int((row_off + actual_h) / H * 100))
-            print(
+            log.info(
                 f"    {raster_path.name} | Strip {strip_idx + 1:2d}/{n_strips} | patches={n} [{pct}%]"
             )
 
@@ -966,6 +1007,7 @@ def _process_single_raster(raster_path, shps, built_up_shp, utility_shps):
             cfg2b["img_size"],
             class_buffer_px=cfg2b.get("class_buffer_px"),
             neg_tile_ratio=cfg2b.get("neg_tile_ratio", 0.0),
+            use_obb=cfg2b.get("use_obb", False),
         )
 
     gc.collect()
@@ -996,7 +1038,7 @@ def preprocess_folder(folder: str, config) -> Dict:
 
     rasters, shps = scan_folder(folder)
     if not rasters:
-        print(f"  [WARN] No rasters found in {folder}")
+        log.info(f"  [WARN] No rasters found in {folder}")
         return {"rasters": 0, "patches": 0, "crops": 0, "infra": 0}
 
     shp_by_stem = {s.stem.lower().rstrip("_"): s for s in shps}
@@ -1020,7 +1062,7 @@ def preprocess_folder(folder: str, config) -> Dict:
 
     max_workers = max(1, multiprocessing.cpu_count() // 2)
     max_workers = min(max_workers, 5)  # 5 concurrent rasters is roughly 17GB RAM
-    print(f"  Spawning ProcessPoolExecutor with {max_workers} workers...")
+    log.info(f"  Spawning ProcessPoolExecutor with {max_workers} workers...")
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {
@@ -1041,7 +1083,7 @@ def preprocess_folder(folder: str, config) -> Dict:
                 if f == 0:
                     processed += 1
             except Exception as e:
-                print(
+                log.info(
                     f"    [CRASH] Raster {raster_path.name} failed with exception: {e}"
                 )
                 import traceback
@@ -1075,7 +1117,7 @@ def _extract_crops_streaming(
 
         gdf = gpd.read_file(str(built_up_shp))
     except Exception as e:
-        print(f"      [SKIP crops] {e}")
+        log.info(f"      [SKIP crops] {e}")
         return 0
 
     saved = 0
@@ -1144,10 +1186,9 @@ def _extract_crops_streaming(
                         crop = np.stack([band] * 3, axis=-1)
 
                     if crop.dtype != np.uint8:
-                        if crop.dtype == np.uint16:
-                            crop = (crop / 256).astype(np.uint8)
-                        else:
-                            crop = crop.astype(np.uint8)
+                        # Use percentile stretch (same as _to_uint8) for consistent
+                        # colour rendering across different sensor bit depths.
+                        crop = _to_uint8(crop)
 
                     # Better interpolation for downscaling/upscaling
                     crop = cv2.resize(
@@ -1160,7 +1201,7 @@ def _extract_crops_streaming(
                     pass
 
     except Exception as e:
-        print(f"      [SKIP crops] Cannot open raster: {e}")
+        log.info(f"      [SKIP crops] Cannot open raster: {e}")
 
     return saved
 
@@ -1177,6 +1218,7 @@ def _extract_infra_streaming(
     buffer_px: int = 20,
     class_buffer_px: Optional[Dict[str, int]] = None,
     neg_tile_ratio: float = 0.0,
+    use_obb: bool = False,
 ) -> int:
     """
     Generate YOLO labels for infrastructure by reading only the tiles that
@@ -1199,7 +1241,7 @@ def _extract_infra_streaming(
             crs = src.crs
             H, W = src.height, src.width
     except Exception as e:
-        print(f"      [SKIP infra] {e}")
+        log.info(f"      [SKIP infra] {e}")
         return 0
 
     from collections import defaultdict
@@ -1249,7 +1291,7 @@ def _extract_infra_streaming(
                 continue
 
     if not infra_objects:
-        print("      No infrastructure features found")
+        log.info("      No infrastructure features found")
         return 0
 
     # ── Group objects into CENTERED tiles ──────────────────────────────────
@@ -1318,7 +1360,7 @@ def _extract_infra_streaming(
                 bh = (buf * 2) / ph
                 cx = max(0.0, min(1.0, cx))
                 cy = max(0.0, min(1.0, cy))
-                lines.append(f"{cid} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+                lines.append(_format_yolo_label(cid, cx, cy, bw, bh, use_obb=use_obb))
             (Path(out_label_dir) / f"{name}.txt").write_text("\n".join(lines))
 
         # ── Negative tile sampling ────────────────────────────────────────
@@ -1378,9 +1420,9 @@ def _extract_infra_streaming(
                 neg_count += 1
 
             if neg_count > 0:
-                print(f"      Negative tiles: {neg_count} (no-infra background)")
+                log.info(f"      Negative tiles: {neg_count} (no-infra background)")
 
-    print(
+    log.info(
         f"      Infrastructure objects: {total}  |  Positive tiles: {len(tile_contents)}"
     )
     return total
@@ -1392,17 +1434,40 @@ def _extract_infra_streaming(
 
 
 def _to_uint8(arr: np.ndarray) -> np.ndarray:
-    out = np.zeros_like(arr, dtype=np.float32)
-    if arr.ndim == 3:
-        for i in range(arr.shape[2]):
-            ch = arr[:, :, i].astype(np.float32)
-            mn, mx = ch.min(), ch.max()
-            out[:, :, i] = 0 if mx == mn else (ch - mn) / (mx - mn) * 255
+    """
+    Convert any numeric raster array to uint8 with per-channel 2nd–98th percentile
+    stretch.
+
+    Using min-max stretch (the old approach) is distorted by sensor outliers and
+    dead pixels, causing colour channels to shift relative to each other.
+    Percentile stretch preserves natural colour ratios and is the industry standard
+    for drone orthomosaic display.
+    """
+    if arr.dtype == np.uint8:
+        return arr
+
+    arr_f = arr.astype(np.float32)
+    out = np.empty_like(arr_f)
+
+    if arr_f.ndim == 3:
+        for i in range(arr_f.shape[2]):
+            ch = arr_f[:, :, i]
+            p2, p98 = np.percentile(ch[ch > 0], [2, 98]) if ch.any() else (0.0, 1.0)
+            if p98 <= p2:
+                p2, p98 = float(ch.min()), float(ch.max())
+            if p98 == p2:
+                out[:, :, i] = 0
+            else:
+                out[:, :, i] = np.clip((ch - p2) / (p98 - p2) * 255.0, 0, 255)
     else:
-        mn, mx = float(arr.min()), float(arr.max())
-        out = (
-            np.zeros_like(arr, dtype=np.float32)
-            if mx == mn
-            else (arr.astype(np.float32) - mn) / (mx - mn) * 255
-        )
+        flat = arr_f[arr_f > 0]
+        p2, p98 = np.percentile(flat, [2, 98]) if flat.size > 0 else (0.0, 1.0)
+        if p98 <= p2:
+            p2, p98 = float(arr_f.min()), float(arr_f.max())
+        if p98 == p2:
+            out = np.zeros_like(arr_f)
+        else:
+            out = np.clip((arr_f - p2) / (p98 - p2) * 255.0, 0, 255)
+
     return out.astype(np.uint8)
+

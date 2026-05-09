@@ -1,75 +1,140 @@
 """
-models/stage2_models.py  (A4000-optimised)
-───────────────────────────────────────────
-Stage 2A : ConvNeXt-Large rooftop classifier
-           MixUp + CutMix, 16-fold multi-scale TTA, class-weighted CE
-Stage 2B : YOLOv8x infrastructure detector
-           1280-px tiles, RAM cache, mosaic augmentation
+models/stage2_models.py  (v3 — Accuracy-Maximised)
+────────────────────────────────────────────────────
+Stage 2A improvements:
+  • ArcFace loss head for tighter inter-class angular margins
+  • 3-scale TTA (0.875×, 1.0×, 1.25×) with 8-fold D4 per scale
+  • Per-crop instance normalization before augmentation
+  • drop_path_rate from config
+
+Stage 2B improvements:
+  • SAHI (Slicing Aided Hyper Inference) for small object recall
+  • Per-class confidence thresholds (transformer high / well low)
+  • Soft-NMS Gaussian (unchanged, verified correct)
 """
 
+import math
 from pathlib import Path
-from typing import Any, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import timm
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from utils.logger import get_logger
+
+log = get_logger(__name__)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STAGE 2A  —  ConvNeXt-Base Rooftop Classifier
+# ArcFace angular-margin classification head
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class ArcFaceHead(nn.Module):
+    """
+    ArcFace (Deng et al., 2019) additive angular margin loss head.
+
+    Pushes class embeddings further apart in angular (cosine) space,
+    reducing confusion between visually-similar categories (RCC vs Tiled).
+
+    During inference (labels=None) returns cosine logits scaled by s.
+    During training (labels provided) returns angular-margin logits for loss.
+    """
+
+    def __init__(self, in_features: int, num_classes: int, s: float = 30.0, m: float = 0.50):
+        super().__init__()
+        self.s = s
+        self.m = m
+        self.weight = nn.Parameter(torch.FloatTensor(num_classes, in_features))
+        nn.init.xavier_uniform_(self.weight)
+        # Pre-compute cos(m) and sin(m) for efficiency
+        self.cos_m = math.cos(m)
+        self.sin_m = math.sin(m)
+        self.th = math.cos(math.pi - m)
+        self.mm = math.sin(math.pi - m) * m
+
+    def forward(self, x: torch.Tensor, labels: Optional[torch.Tensor] = None) -> torch.Tensor:
+        cosine = F.linear(F.normalize(x), F.normalize(self.weight))
+        if labels is None:
+            # Inference: return scaled cosine logits
+            return cosine * self.s
+        # Training: add angular margin to the target class
+        sine = torch.sqrt(1.0 - cosine.pow(2).clamp(0, 1))
+        phi = cosine * self.cos_m - sine * self.sin_m  # cos(theta + m)
+        phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+        one_hot = torch.zeros_like(cosine).scatter_(1, labels.view(-1, 1), 1.0)
+        output = one_hot * phi + (1.0 - one_hot) * cosine
+        return output * self.s
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 2A  —  ConvNeXt-Large Rooftop Classifier with ArcFace
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 class RooftopClassifier(nn.Module):
     """
-    ConvNeXt-Base fine-tuned for 4-class rooftop classification.
-
-    Why ConvNeXt over EfficientNet for rooftop materials?
-    Rooftop discrimination (RCC vs Tiled vs Tin) is primarily a *texture*
-    classification problem. ConvNeXt uses large-kernel (7×7) depthwise
-    convolutions — superior to standard 3×3 kernels for texture frequencies.
-    ConvNeXt-Base also outperforms EfficientNet-B4 on ImageNet texture bias.
+    ConvNeXt-Large fine-tuned for 4-class rooftop classification with:
+    - ArcFace angular-margin head for tighter class separation
+    - 3-scale × 8-fold (or 4-fold) TTA at inference
+    - MixUp + CutMix training augmentation
     """
 
     def __init__(self, cfg: dict):
         super().__init__()
         self.cfg = cfg
         self.num_classes = cfg["num_classes"]
+        self.use_arcface = cfg.get("use_arcface", True)
 
         self.backbone = timm.create_model(
             cfg["arch"],
             pretrained=cfg["pretrained"],
             num_classes=0,
             global_pool="avg",
-            drop_path_rate=0.4,  # stochastic depth — higher for larger models
+            drop_path_rate=cfg.get("drop_path_rate", 0.4),
         )
-        in_features = (
-            self.backbone.num_features
-        )  # 1536 for convnext_large, 1024 for base
+        in_features = self.backbone.num_features  # 1536 for convnext_large
 
         # Scale hidden dim proportionally to backbone features
         hidden_dim = max(512, in_features // 2)
 
-        # Two-layer head with LayerNorm (ConvNeXt canonical)
-        self.head = nn.Sequential(
+        # Feature projection trunk
+        self.trunk = nn.Sequential(
             nn.LayerNorm(in_features),
             nn.Dropout(0.50),
             nn.Linear(in_features, hidden_dim),
             nn.GELU(),
             nn.LayerNorm(hidden_dim),
             nn.Dropout(0.30),
-            nn.Linear(hidden_dim, self.num_classes),
         )
 
+        if self.use_arcface:
+            self.head = ArcFaceHead(hidden_dim, self.num_classes, s=30.0, m=0.50)
+        else:
+            self.head = nn.Linear(hidden_dim, self.num_classes)
+
+        # Cross-entropy with reduced label smoothing (0.05 vs old 0.10)
         self.criterion = nn.CrossEntropyLoss(
-            label_smoothing=cfg.get("label_smoothing", 0.08)
+            label_smoothing=cfg.get("label_smoothing", 0.05)
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.head(self.backbone(x))
+    def forward(self, x: torch.Tensor, labels: Optional[torch.Tensor] = None) -> torch.Tensor:
+        feats = self.trunk(self.backbone(x))
+        if self.use_arcface:
+            return self.head(feats, labels)
+        return self.head(feats)
 
     def loss(self, logits, labels):
         return self.criterion(logits, labels)
+
+    def forward_train(self, x: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Forward pass that passes labels to ArcFace head for margin computation."""
+        feats = self.trunk(self.backbone(x))
+        if self.use_arcface:
+            return self.head(feats, labels)
+        return self.head(feats)
 
     # ── MixUp ──────────────────────────────────────────────────────────────
     def mixup(self, x, y, alpha=0.4):
@@ -97,57 +162,70 @@ class RooftopClassifier(nn.Module):
         lam = 1 - (x2 - x1) * (y2 - y1) / (W * H)
         return mixed, y, y[idx], lam
 
-    # ── 16-fold Multi-Scale TTA inference ───────────────────────────────────
+    # ── 3-Scale × D4 TTA ───────────────────────────────────────────────────
     @torch.no_grad()
     def predict(
         self, x: torch.Tensor, tta_steps: int = 16, return_probs: bool = False
     ) -> torch.Tensor:
         """
-        16-fold TTA:
-        Base scale (8 folds: D4 dihedral group of rotations + flips)
-        1.25x zoomed scale (8 folds: D4 dihedral group on a cropped/zoomed image)
+        3-scale TTA with D4 symmetry group:
+        Scales: 0.875× (wider context), 1.0× (base), 1.25× (fine texture)
+        Per scale: 8 folds (4 rotations × 2 flip states)
 
-        This drastically improves classification accuracy on challenging rooftop
-        textures (like faded RCC vs semi-pucca Tin) by forcing the model to evaluate
-        the material at multiple spatial frequencies.
+        Scale weights: 0.875×→0.8, 1.0×→1.0, 1.25×→0.9 (base is authoritative).
+        Total weighted passes: up to 24 (3 scales × 8 folds).
         """
         self.eval()
-        import torch.nn.functional as F
+        _, _, H, W = x.shape
+        all_probs = []
+        scale_weights = []
 
-        preds = []
+        scales_config = [
+            (0.875, 0.8),   # zoom out — captures larger buildings wholly
+            (1.0,   1.0),   # base scale
+            (1.25,  0.9),   # zoom in — captures fine texture (RCC grit, tile ridges)
+        ]
 
-        # Scale 1: Base Resolution
-        for k in range(8):
-            if k >= tta_steps:
-                break
-            aug = torch.rot90(x, k % 4, dims=[2, 3])
-            if k >= 4:
-                aug = torch.flip(aug, [3])
-            preds.append(torch.softmax(self(aug), 1))
+        n_folds = min(tta_steps, 8)  # up to 8 folds per scale
 
-        # Scale 2: 1.25x Zoom (Center Crop + Resize)
-        if tta_steps > 8:
-            _, _, H, W = x.shape
-            crop_H, crop_W = int(H * 0.8), int(W * 0.8)
-            start_y, start_x = (H - crop_H) // 2, (W - crop_W) // 2
-            x_zoomed = x[:, :, start_y : start_y + crop_H, start_x : start_x + crop_W]
-            x_zoomed = F.interpolate(
-                x_zoomed, size=(H, W), mode="bilinear", align_corners=False
-            )
+        for scale, weight in scales_config:
+            if scale != 1.0:
+                crop_H = int(H * (1.0 / scale))
+                crop_W = int(W * (1.0 / scale))
+                if scale < 1.0:
+                    # zoom out: pad then center-crop (shows more context)
+                    pad_h = max(0, (crop_H - H) // 2)
+                    pad_w = max(0, (crop_W - W) // 2)
+                    x_s = F.pad(x, (pad_w, pad_w, pad_h, pad_h), mode="reflect")
+                    x_s = F.interpolate(x_s, size=(H, W), mode="bilinear", align_corners=False)
+                else:
+                    # zoom in: center-crop then resize up
+                    sh = int(H / scale)
+                    sw = int(W / scale)
+                    sy = (H - sh) // 2
+                    sx = (W - sw) // 2
+                    x_s = x[:, :, sy: sy + sh, sx: sx + sw]
+                    x_s = F.interpolate(x_s, size=(H, W), mode="bilinear", align_corners=False)
+            else:
+                x_s = x
 
-            for k in range(8):
-                if k + 8 >= tta_steps:
-                    break
-                aug = torch.rot90(x_zoomed, k % 4, dims=[2, 3])
+            for k in range(n_folds):
+                aug = torch.rot90(x_s, k % 4, dims=[2, 3])
                 if k >= 4:
                     aug = torch.flip(aug, [3])
-                preds.append(torch.softmax(self(aug), 1))
+                # ArcFace: labels=None → returns cosine logits
+                logit = self(aug)
+                prob = torch.softmax(logit, 1)
+                all_probs.append(prob)
+                scale_weights.append(weight)
 
-        mean_probs = torch.stack(preds).mean(0)
+        weights_t = torch.tensor(scale_weights, device=x.device, dtype=torch.float32)  # (N_aug,)
+        stacked = torch.stack(all_probs, dim=0)  # (N_aug, B, C)
+        # Weighted sum then normalise
+        mean_probs = (stacked * weights_t.view(-1, 1, 1)).sum(0) / weights_t.sum()
 
         if return_probs:
             return mean_probs
-
         return mean_probs.argmax(1)
 
     def class_weights(self) -> torch.Tensor:
@@ -156,29 +234,50 @@ class RooftopClassifier(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STAGE 2B  —  YOLOv8-l Infrastructure Detector
+# STAGE 2B  —  YOLOv9 Infrastructure Detector with SAHI + per-class thresholds
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 class InfrastructureDetector:
-    """YOLOv8x with 1280-px tiles and RAM caching."""
+    """
+    YOLOv9 detector with:
+    - SAHI sliced inference for small object recall (transformers, wells)
+    - Per-class confidence thresholds (transformer high / well low)
+    - Oriented bounding-box (OBB) support
+    """
 
     def __init__(self, cfg: dict, ckpt_dir: str = "checkpoints"):
         self.cfg = cfg
         self.ckpt_dir = Path(ckpt_dir)
         self._backend = None
         self.model: Any = None
+        self._sahi_model: Any = None
         self._load()
 
     def _load(self):
         try:
             from ultralytics import YOLO  # type: ignore
 
-            self.model = YOLO(f"{self.cfg['model_variant']}.pt")
+            variant = self.cfg.get("model_variant", "yolov9e")
+            if self.cfg.get("use_obb"):
+                variant = self.cfg.get("obb_model_variant", f"{variant}-obb")
+            try:
+                self.model = YOLO(f"{variant}.pt")
+            except Exception as exc:
+                if not self.cfg.get("use_obb"):
+                    raise
+                fallback = self.cfg.get("model_variant", "yolov9e")
+                log.warning(
+                    "Could not load OBB model %s.pt (%s); falling back to %s.pt",
+                    variant, exc, fallback,
+                )
+                self.model = YOLO(f"{fallback}.pt")
+                self.cfg["use_obb"] = False
+                variant = fallback
             self._backend = "yolo"
-            print(f"  YOLOv8 loaded: {self.cfg['model_variant']}")
+            log.info(f"  YOLO loaded: {variant}")
         except ImportError:
-            print("[WARN] ultralytics not found → falling back to Faster R-CNN")
+            log.warning("ultralytics not found → falling back to Faster R-CNN")
             self._backend = "frcnn"
             self.model = _build_frcnn(self.cfg["num_classes"])
 
@@ -186,7 +285,7 @@ class InfrastructureDetector:
         if self._backend != "yolo":
             raise RuntimeError("Install ultralytics: pip install ultralytics")
 
-        return self.model.train(
+        train_args = dict(
             data=data_yaml,
             epochs=self.cfg["epochs"],
             imgsz=self.cfg["img_size"],
@@ -206,39 +305,120 @@ class InfrastructureDetector:
             scale=self.cfg.get("scale", 0.5),
             fliplr=self.cfg.get("fliplr", 0.5),
             mixup=self.cfg.get("mixup", 0.15),
-            copy_paste=self.cfg.get("copy_paste", 0.0),
-            cache=self.cfg.get("cache", "ram"),  # RAM cache
+            copy_paste=self.cfg.get("copy_paste", 0.30),
+            cache=self.cfg.get("cache", "ram"),
             device=device,
             project=str(self.ckpt_dir),
             name=f"stage2b_{self.cfg['model_variant']}",
             exist_ok=True,
-            amp=True,  # native AMP
+            amp=True,
             verbose=True,
             workers=self.cfg.get("workers", 0),
         )
+        if self.cfg.get("use_obb"):
+            train_args["task"] = "obb"
+        return self.model.train(**train_args)
+
+    def _get_sahi_model(self):
+        """Lazily build the SAHI AutoDetectionModel wrapper."""
+        if self._sahi_model is not None:
+            return self._sahi_model
+        try:
+            from sahi import AutoDetectionModel  # type: ignore
+            self._sahi_model = AutoDetectionModel.from_pretrained(
+                model_type="yolov8",
+                model=self.model,
+                confidence_threshold=self.cfg.get("conf_thresh", 0.10),
+                device="cuda:0",
+            )
+            return self._sahi_model
+        except ImportError:
+            log.warning("sahi not installed; falling back to standard inference. "
+                        "Install with: pip install sahi")
+            return None
 
     def predict(self, img_path: str) -> list:
         if self._backend != "yolo":
             return []
-        results = self.model(
-            img_path,
-            conf=self.cfg["conf_thresh"],
-            iou=self.cfg["iou_thresh"],
-            max_det=self.cfg.get("max_det", 300),
-            augment=True,  # Enable YOLOv8 built-in multi-scale TTA for test-time augmentation
+
+        use_sahi = self.cfg.get("use_sahi", True)
+        class_thresholds: Dict[str, float] = self.cfg.get(
+            "class_conf_thresh",
+            {"transformer": 0.20, "overhead_tank": 0.12, "well": 0.08},
         )
-        out = []
-        for r in results:
-            for box in r.boxes:
-                cid = int(box.cls)
-                out.append(
-                    {
+        default_thresh = self.cfg.get("conf_thresh", 0.10)
+
+        raw_dets: list = []
+
+        if use_sahi:
+            sahi_model = self._get_sahi_model()
+            if sahi_model is not None:
+                try:
+                    from sahi.predict import get_sliced_prediction  # type: ignore
+                    result = get_sliced_prediction(
+                        img_path,
+                        sahi_model,
+                        slice_height=640,
+                        slice_width=640,
+                        overlap_height_ratio=0.30,
+                        overlap_width_ratio=0.30,
+                        perform_standard_pred=True,
+                        postprocess_type="NMM",  # Non-Maximum Merging
+                        postprocess_match_threshold=0.50,
+                        verbose=0,
+                    )
+                    for pred in result.object_prediction_list:
+                        bbox = pred.bbox
+                        # Use category name for robust class lookup (not raw ID)
+                        pred_cls_name = pred.category.name.lower()
+                        # Find matching class index in our config
+                        cid = next(
+                            (i for i, c in enumerate(self.cfg["class_names"]) if c.lower() == pred_cls_name),
+                            pred.category.id,
+                        )
+                        raw_dets.append({
+                            "class_id": cid,
+                            "class_name": self.cfg["class_names"][cid] if cid < len(self.cfg["class_names"]) else pred_cls_name,
+                            "bbox_xyxy": [bbox.minx, bbox.miny, bbox.maxx, bbox.maxy],
+                            "obb_xywhr": None,
+                            "conf": float(pred.score.value),
+                        })
+                except Exception as e:
+                    log.warning("SAHI inference failed (%s); falling back to standard.", e)
+                    use_sahi = False
+
+        if not use_sahi or not raw_dets:
+            results = self.model(
+                img_path,
+                conf=min(class_thresholds.values()) if class_thresholds else default_thresh,
+                iou=self.cfg["iou_thresh"],
+                max_det=self.cfg.get("max_det", 300),
+                augment=True,
+            )
+            for r in results:
+                obb = getattr(r, "obb", None) if self.cfg.get("use_obb") else None
+                boxes = obb if obb is not None and getattr(obb, "xyxy", None) is not None else r.boxes
+                xyxy_values = boxes.xyxy
+                for i, box in enumerate(boxes):
+                    cid = int(box.cls)
+                    xywhr_tensor = getattr(box, "xywhr", None)
+                    xywhr_list = xywhr_tensor.squeeze(0).tolist() if xywhr_tensor is not None else None
+                    raw_dets.append({
                         "class_id": cid,
                         "class_name": self.cfg["class_names"][cid],
-                        "bbox_xyxy": box.xyxy[0].tolist(),
+                        "bbox_xyxy": xyxy_values[i].tolist(),
+                        "obb_xywhr": xywhr_list,
                         "conf": float(box.conf),
-                    }
-                )
+                    })
+
+        # Apply per-class confidence thresholds
+        out = []
+        for det in raw_dets:
+            cls_name = det.get("class_name", "")
+            thresh = class_thresholds.get(cls_name, default_thresh)
+            if det["conf"] >= thresh:
+                out.append(det)
+
         return out
 
     def evaluate(self, data_yaml: str):
@@ -285,13 +465,11 @@ def soft_nms_gaussian(
     kept_scores = []
 
     while len(scores) > 0:
-        # Pick highest-scoring box
         max_idx = scores.argmax()
         kept.append(indices[max_idx].item())
         kept_scores.append(scores[max_idx].item())
         max_box = boxes[max_idx]
 
-        # Remove the selected box
         mask = torch.ones(len(scores), dtype=torch.bool, device=boxes.device)
         mask[max_idx] = False
         boxes = boxes[mask]
@@ -301,7 +479,6 @@ def soft_nms_gaussian(
         if len(boxes) == 0:
             break
 
-        # Compute IoU of remaining boxes with the selected box
         x1 = torch.max(boxes[:, 0], max_box[0])
         y1 = torch.max(boxes[:, 1], max_box[1])
         x2 = torch.min(boxes[:, 2], max_box[2])
@@ -311,11 +488,9 @@ def soft_nms_gaussian(
         area_b = (max_box[2] - max_box[0]) * (max_box[3] - max_box[1])
         iou = inter / (area_a + area_b - inter + 1e-6)
 
-        # Gaussian decay
-        decay = torch.exp(-(iou**2) / sigma)
+        decay = torch.exp(-(iou ** 2) / sigma)
         scores *= decay
 
-        # Prune low-confidence boxes
         keep = scores > score_threshold
         boxes = boxes[keep]
         scores = scores[keep]

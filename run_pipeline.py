@@ -28,6 +28,29 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+from utils.logger import get_logger
+
+log = get_logger(__name__)
+
+import config as CFG
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PREPROCESS
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def preprocess(data_root: str):
+    from data.preprocessing import preprocess_folder
+
+    data_root_path = Path(data_root)
+
+    # Find all sub-folders that contain rasters (cg/, pb/, or more)
+    # Also handle the case where data_root itself contains rasters
+    candidates = [data_root_path] + [d for d in data_root_path.iterdir() if d.is_dir()]
+
+    RASTER_EXTS = {".tif", ".tiff", ".ecw", ".img"}
+    folders_with_rasters = []
+    for d in candidates:
 
 import config as CFG
 
@@ -55,13 +78,13 @@ def preprocess(data_root: str):
             folders_with_rasters.append(d)
 
     if not folders_with_rasters:
-        print(f"\n[ERROR] No raster files found under {data_root_path}")
-        print("  Expected structure:")
-        print("    dataset/cg/*.tif  +  *.shp")
-        print("    dataset/pb/*.tif  +  *.shp")
+        log.error("No raster files found under %s", data_root_path)
+        log.info("  Expected structure:")
+        log.info("    dataset/cg/*.tif  +  *.shp")
+        log.info("    dataset/pb/*.tif  +  *.shp")
         return
 
-    print(f"\nFolders to process: {[f.name for f in folders_with_rasters]}")
+    log.info(f"\nFolders to process: {[f.name for f in folders_with_rasters]}")
 
     all_summaries = []
     for folder in folders_with_rasters:
@@ -69,33 +92,33 @@ def preprocess(data_root: str):
         all_summaries.append(summary)
 
     # Print overall summary
-    print(f"\n{'=' * 60}")
-    print("  PREPROCESSING COMPLETE")
-    print(f"{'=' * 60}")
-    total_patches = sum(s["patches"] for s in all_summaries)
-    total_crops = sum(s["crops"] for s in all_summaries)
-    total_infra = sum(s["infra"] for s in all_summaries)
-    total_failed = sum(s["failed"] for s in all_summaries)
+    log.info(f"\n{'=' * 60}")
+    log.info("  PREPROCESSING COMPLETE")
+    log.info(f"{'=' * 60}")
+    total_patches = sum(int(s.get("patches", 0)) for s in all_summaries)
+    total_crops = sum(int(s.get("crops", 0)) for s in all_summaries)
+    total_infra = sum(int(s.get("infra", 0)) for s in all_summaries)
+    total_failed = sum(int(s.get("failed", 0)) for s in all_summaries)
 
     for s in all_summaries:
-        folder_name = Path(s["folder"]).name
-        print(f"\n  {folder_name}/")
-        print(f"    Rasters processed : {s['rasters']}")
-        print(f"    Rasters failed    : {s['failed']}")
-        print(f"    Patches           : {s['patches']}")
-        print(f"    Building crops    : {s['crops']}")
-        print(f"    Infra objects     : {s['infra']}")
+        folder_name = Path(str(s.get("folder", ""))).name
+        log.info(f"\n  {folder_name}/")
+        log.info(f"    Rasters processed : {s.get('rasters', 0)}")
+        log.info(f"    Rasters failed    : {s.get('failed', 0)}")
+        log.info(f"    Patches           : {s.get('patches', 0)}")
+        log.info(f"    Building crops    : {s.get('crops', 0)}")
+        log.info(f"    Infra objects     : {s.get('infra', 0)}")
 
-    print("\n  TOTALS:")
-    print(f"    Patches           : {total_patches}")
-    print(f"    Building crops    : {total_crops}")
-    print(f"    Infra objects     : {total_infra}")
-    print(f"    Failed rasters    : {total_failed}")
-    print("\n  Output dirs:")
-    print(f"    Patches    → {CFG.PATCH_DIR}")
-    print(f"    Crops      → {CFG.CROP_DIR}")
-    print(f"    YOLO       → {CFG.YOLO_DIR}")
-    print(f"{'=' * 60}\n")
+    log.info("\n  TOTALS:")
+    log.info(f"    Patches           : {total_patches}")
+    log.info(f"    Building crops    : {total_crops}")
+    log.info(f"    Infra objects     : {total_infra}")
+    log.info(f"    Failed rasters    : {total_failed}")
+    log.info("\n  Output dirs:")
+    log.info(f"    Patches    → {CFG.PATCH_DIR}")
+    log.info(f"    Crops      → {CFG.CROP_DIR}")
+    log.info(f"    YOLO       → {CFG.YOLO_DIR}")
+    log.info(f"{'=' * 60}\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -114,47 +137,22 @@ def train_all():
 
     _header("STAGE 2A — Rooftop Classifier  (ConvNeXt-Base)")
     train_stage2a()
-    clear_cuda_cache()  # free ConvNeXt weights before YOLOv8
+    clear_cuda_cache()  # free ConvNeXt weights before YOLO
 
-    _header("STAGE 2B — Infrastructure Detector  (YOLOv8-l)")
-    train_stage2b()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# EVALUATE
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def evaluate():
-    import torch
-    from torch.utils.data import DataLoader
-
-    from data.dataset import split_dataset
-    from models.stage1_segmentation import Stage1Module
-    from train.train_stage1 import _validate
-    from utils.hardware import get_amp_context, setup
-    from utils.metrics import SegmentationMetrics
-
-    device = setup()
-    amp_ctx, _ = get_amp_context(CFG.AMP_DTYPE)
-    cfg = CFG.STAGE1
-    ckpt_p = CFG.CKPT_DIR / "stage1_best.pth"
-
-    if not ckpt_p.exists():
-        print("[ERROR] No checkpoint found. Run --mode train_all first.")
-        return
-
-    ckpt = torch.load(ckpt_p, map_location=device, weights_only=False)
-    module = Stage1Module(cfg).to(device)
-    module.load_state_dict(ckpt["state_dict"], strict=False)
+    _header("STAGE 2B — Infrastructure Detector  (YOLOv9/OBB)")
+    num_classes = cast(int, cfg.get("num_classes", 4))
+    patch_size = cast(int, cfg.get("patch_size", 512))
+    val_fraction = cast(float, cfg.get("val_fraction", 0.15))
+    seed = cast(int, cfg.get("seed", 42))
+    class_names = cast(List[str], cfg.get("class_names", []))
 
     _, val_ds = split_dataset(
         str(CFG.PATCH_DIR),
         str(CFG.MASK_DIR),
-        float(cfg["val_fraction"]),  # type: ignore
-        int(cfg["seed"]),  # type: ignore
-        int(cfg["num_classes"]),  # type: ignore
-        int(cfg["patch_size"]),  # type: ignore
+        val_fraction,
+        seed,
+        num_classes,
+        patch_size,
     )
     loader = DataLoader(
         val_ds,
@@ -164,11 +162,11 @@ def evaluate():
         pin_memory=True,
         persistent_workers=(CFG.NUM_WORKERS > 0),
     )
-    metrics = SegmentationMetrics(int(cfg["num_classes"]), cfg["class_names"])  # type: ignore
+    metrics = SegmentationMetrics(num_classes, class_names)
     miou, _ = _validate(module, loader, device, metrics, amp_ctx)
-    print(metrics.summary())
-    print(f"\nCheckpoint mIoU : {ckpt['val_miou']:.4f}")
-    print(f"Re-eval mIoU    : {miou:.4f}")
+    log.info(metrics.summary())
+    log.info(f"\nCheckpoint mIoU : {ckpt.get('val_miou', 0.0):.4f}")
+    log.info(f"Re-eval mIoU    : {miou:.4f}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,7 +180,7 @@ def infer(tif_path: str, out_dir: str):
     pipe = GeoIntelPipeline(
         str(CFG.CKPT_DIR / "stage1_best.pth"),
         str(CFG.CKPT_DIR / "stage2a_best.pth"),
-        str(CFG.CKPT_DIR / "stage2b_yolov8l" / "weights" / "best.pt"),
+        str(CFG.CKPT_DIR / f"stage2b_{CFG.STAGE2B['model_variant']}" / "weights" / "best.pt"),
     )
     pipe.run(tif_path, out_dir)
 
@@ -190,8 +188,8 @@ def infer(tif_path: str, out_dir: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _header(title):
-    print(f"\n{'=' * 60}\n  {title}\n{'=' * 60}")
+def _header(title: str):
+    log.info(f"\n{'=' * 60}\n  {title}\n{'=' * 60}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -222,25 +220,28 @@ if __name__ == "__main__":
     ap.add_argument("--out", default="./outputs/test", help="Output dir for infer")
     args = ap.parse_args()
 
-    if args.mode == "preprocess":
-        preprocess(args.data_root)
-    elif args.mode == "train_stage1":
+    mode = str(args.mode)
+    data_root = str(args.data_root)
+
+    if mode == "preprocess":
+        preprocess(data_root)
+    elif mode == "train_stage1":
         from train.train_stage1 import train_stage1
 
         train_stage1()
-    elif args.mode == "train_stage2":
+    elif mode == "train_stage2":
         from train.train_stage2 import train_stage2a, train_stage2b
 
         train_stage2a()
         train_stage2b()
-    elif args.mode == "train_all":
+    elif mode == "train_all":
         train_all()
-    elif args.mode == "evaluate":
+    elif mode == "evaluate":
         evaluate()
-    elif args.mode == "infer":
+    elif mode == "infer":
         assert args.tif, "--tif is required for infer mode"
-        infer(args.tif, args.out)
-    elif args.mode == "all":
-        preprocess(args.data_root)
+        infer(str(args.tif), str(args.out))
+    elif mode == "all":
+        preprocess(data_root)
         train_all()
         evaluate()

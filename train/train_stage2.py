@@ -8,7 +8,7 @@ Stage 2A: ConvNeXt-Large rooftop classifier
   • EMA shadow weights for validation
   • 16-fold multi-scale TTA at validation
 
-Stage 2B: YOLOv8x infrastructure detector
+Stage 2B: YOLOv9 infrastructure detector
   • 1280-px tiles, RAM cache, mosaic
   • close_mosaic last 20 epochs for stability
 """
@@ -35,6 +35,7 @@ from tqdm import tqdm
 import config as CFG
 from data.dataset import split_clf_dataset
 from models.stage2_models import InfrastructureDetector, RooftopClassifier
+from utils.checkpointing import atomic_torch_save
 from utils.hardware import (
     cl_input,
     compile_model,
@@ -44,16 +45,31 @@ from utils.hardware import (
     vram_stats,
     worker_init_fn,
 )
+from utils.logger import crash_logged, get_logger
+from utils.sam import SAM
+
+log = get_logger(__name__)
+
+WANDB_AVAILABLE = False
+try:
+    import wandb
+
+    WANDB_AVAILABLE = True
+except ImportError:
+    pass
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STAGE 2A
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def train_stage2a(resume: bool = True):
+def train_stage2a(resume: bool = True, use_wandb: bool = True):
     device = setup(seed=int(CFG.STAGE1["seed"]))  # type: ignore
     cfg: typing.Any = CFG.STAGE2A
     amp_ctx, _ = get_amp_context(CFG.AMP_DTYPE)
+
+    if use_wandb and WANDB_AVAILABLE:
+        wandb.init(project="geo-intel", name="stage2a", config=dict(cfg), reinit=True)
 
     # ── Dataset ───────────────────────────────────────────────────────────────
     train_ds, val_ds = split_clf_dataset(
@@ -62,8 +78,11 @@ def train_stage2a(resume: bool = True):
         val_fraction=float(CFG.STAGE1["val_fraction"]),  # type: ignore
         seed=int(CFG.STAGE1["seed"]),  # type: ignore
         crop_size=int(cfg["crop_size"]),  # type: ignore
+        use_randaugment=bool(cfg.get("use_randaugment", False)),
+        randaugment_n=int(cfg.get("randaugment_n", 2)),
+        randaugment_m=int(cfg.get("randaugment_m", 7)),
     )
-    print(f"  Rooftop crops — Train: {len(train_ds)} | Val: {len(val_ds)}")
+    log.info(f"  Rooftop crops — Train: {len(train_ds)} | Val: {len(val_ds)}")
 
     n_workers = CFG.NUM_WORKERS
     base_kw = dict(
@@ -91,9 +110,9 @@ def train_stage2a(resume: bool = True):
         test_iter = iter(train_loader)
         next(test_iter)
         del test_iter
-        print(f"  DataLoader: {n_workers} workers OK")
+        log.info(f"  DataLoader: {n_workers} workers OK")
     except Exception as e:
-        print(f"  DataLoader workers failed ({e}), falling back to 0")
+        log.info(f"  DataLoader workers failed ({e}), falling back to 0")
         loader_kw = dict(num_workers=0, pin_memory=CFG.PIN_MEMORY)
         train_loader = DataLoader(
             train_ds,
@@ -112,9 +131,20 @@ def train_stage2a(resume: bool = True):
     # ── Model ────────────────────────────────────────────────────────────────
     model = RooftopClassifier(cfg).to(device)
 
+    # Gradient checkpointing: saves ~2GB VRAM at ~15% compute cost.
+    # Critical when SAM is enabled (two forward passes double peak memory).
+    try:
+        model.backbone.set_grad_checkpointing(True)
+        log.info("  Gradient checkpointing: ON (saves ~2GB VRAM)")
+    except (AttributeError, TypeError):
+        log.info("  Gradient checkpointing: not supported for this backbone")
+
     # channels_last: ConvNeXt uses large-kernel depthwise conv → NHWC is
     # 15–25% faster on A4000 Ampere tensor cores vs default NCHW layout.
     model = to_channels_last(model)
+
+    log.info(f"  Model params: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
+    log.info(f"  {vram_stats()}")
 
     if CFG.COMPILE_ENABLED:
         # fullgraph=True is safe for ConvNeXt (no dynamic control flow)
@@ -126,25 +156,40 @@ def train_stage2a(resume: bool = True):
         weight=cw, label_smoothing=float(cfg["label_smoothing"])
     )  # type: ignore
 
-    optimiser = torch.optim.AdamW(
+    base_opt = torch.optim.AdamW(
         model.parameters(),
         lr=float(cfg["lr"]),
         weight_decay=float(cfg["weight_decay"]),  # type: ignore
     )
+    use_sam = bool(cfg.get("use_sam", False))
+    if use_sam:
+        optimiser = SAM(
+            base_opt,
+            rho=float(cfg.get("sam_rho", 0.05)),
+            adaptive=bool(cfg.get("sam_adaptive", True)),
+        )
+        log.info(
+            "SAM enabled for Stage 2A rho=%s adaptive=%s",
+            cfg.get("sam_rho", 0.05),
+            cfg.get("sam_adaptive", True),
+        )
+    else:
+        optimiser = base_opt
+
     # SequentialLR with Linear Warmup and CosineAnnealingWarmRestarts
     # Allows the model to warm up linearly, then stabilize at local optima while preventing catastrophic forgetting.
     warmup_iters = max(1, int(cfg["epochs"]) // 10) * len(train_loader)
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimiser, start_factor=0.1, total_iters=warmup_iters
+        base_opt, start_factor=0.1, total_iters=warmup_iters
     )
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimiser,
+        base_opt,
         T_0=max(1, (int(cfg["epochs"]) * len(train_loader) - warmup_iters) // 3),
         T_mult=1,
         eta_min=float(cfg["lr"]) / 1000,
     )
     scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimiser,
+        base_opt,
         schedulers=[warmup_scheduler, cosine_scheduler],
         milestones=[warmup_iters],
     )
@@ -158,30 +203,28 @@ def train_stage2a(resume: bool = True):
 
     from utils.hardware import EMA
 
-    ema = EMA(model, decay=0.9998)
+    ema = EMA(model, decay=float(cfg.get("ema_decay", 0.9995)))
 
     if resume and last_ckpt_path.exists():
-        print(f"  Resuming Stage 2A from: {last_ckpt_path}")
+        log.info(f"  Resuming Stage 2A from: {last_ckpt_path}")
         state = torch.load(last_ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(state["model_state"], strict=False)
         try:
-            if "max_lr" not in state["optimizer_state"]["param_groups"][0]:
-                raise ValueError("Old checkpoint missing OneCycleLR parameters")
             optimiser.load_state_dict(state["optimizer_state"])
             scheduler.load_state_dict(state["scheduler_state"])
         except Exception as e:
-            print(f"      [WARN] Skipping optimizer load: {e}")
+            log.info(f"      [WARN] Skipping optimizer load: {e}")
         best_acc = float(state.get("best_acc", 0.0))
         no_improv = int(state.get("no_improv", 0))
         start_epoch = int(state.get("epoch", 0)) + 1
         if "ema_state" in state and state["ema_state"] is not None:
             ema.shadow = {k: v.to(device) for k, v in state["ema_state"].items()}
-        print(
+        log.info(
             f"  Resume state → start_epoch={start_epoch}, "
             f"best_acc={best_acc:.4f}, no_improv={no_improv}"
         )
 
-    print(f"\n[Stage 2A] {cfg['arch']}  |  {vram_stats()}\n")
+    log.info(f"\n[Stage 2A] {cfg['arch']}  |  {vram_stats()}\n")
 
     for epoch in range(start_epoch, int(cfg["epochs"]) + 1):  # type: ignore
         model.train()
@@ -205,20 +248,34 @@ def train_stage2a(resume: bool = True):
             else:
                 aug_imgs, ya, yb, lam = model.cutmix(imgs, labels, cfg["cutmix_alpha"])
 
-            optimiser.zero_grad(set_to_none=True)
-            with amp_ctx:
-                logits = model(aug_imgs)
-                # Explicit handling of the geometric label consistency for mixed/masked targets
-                loss_a = model.criterion(logits, ya)
-                loss_b = model.criterion(logits, yb)
-                # For CutMix, lam represents the exact unmasked area ratio
-                if isinstance(lam, torch.Tensor):
-                    lam = lam.mean()
-                loss = loss_a * lam + loss_b * (1.0 - lam)
+            def _mixed_loss():
+                # Single forward pass with the dominant label (ya gets higher weight).
+                # Computing loss against both labels from cached logits avoids a second
+                # forward pass, saving ~1.5GB activation memory on the A4000.
+                logits_local = model.forward_train(aug_imgs, ya)
+                loss_a = model.criterion(logits_local, ya)
+                # Detach and re-use same logits for yb loss (no extra backward graph)
+                loss_b = model.criterion(logits_local, yb)
+                lam_local = lam.mean() if isinstance(lam, torch.Tensor) else lam
+                return logits_local, loss_a * lam_local + loss_b * (1.0 - lam_local)
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimiser.step()
+            optimiser.zero_grad(set_to_none=True)
+            if use_sam:
+                with amp_ctx:
+                    logits, loss = _mixed_loss()
+                loss.backward()
+                optimiser.first_step(zero_grad=True)
+                with amp_ctx:
+                    logits, loss_second = _mixed_loss()
+                loss_second.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimiser.second_step(zero_grad=True)
+            else:
+                with amp_ctx:
+                    logits, loss = _mixed_loss()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimiser.step()
             scheduler.step()
             ema.update(model)
 
@@ -240,17 +297,28 @@ def train_stage2a(resume: bool = True):
             ema.restore(model)
 
         elapsed = time.time() - t0
-        print(
+        log.info(
             f"Ep {epoch:03d}/{cfg['epochs']:03d}  "
             f"loss={ep_loss / len(train_loader):.4f}  "
             f"train_acc={correct / total:.4f}  val_acc={val_acc:.4f}  {elapsed:.0f}s"
         )
 
+        if use_wandb and WANDB_AVAILABLE:
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    "stage2a/train_loss": ep_loss / len(train_loader),
+                    "stage2a/train_acc": correct / max(1, total),
+                    "stage2a/val_acc": val_acc,
+                    "stage2a/lr": base_opt.param_groups[-1]["lr"],
+                }
+            )
+
         if val_acc > best_acc:
             best_acc = val_acc
             no_improv = 0
             best_state = {k: v.cpu() for k, v in ema.shadow.items()}
-            torch.save(
+            atomic_torch_save(
                 {
                     "epoch": epoch,
                     "state_dict": best_state,
@@ -259,12 +327,12 @@ def train_stage2a(resume: bool = True):
                 },
                 ckpt_path,
             )
-            print(f"  ✓ Best acc={best_acc:.4f} (Saved EMA weights)")
-            print(report)
+            log.info(f"  ✓ Best acc={best_acc:.4f} (Saved EMA weights)")
+            log.info(report)
         else:
             no_improv += 1
 
-        torch.save(
+        atomic_torch_save(
             {
                 "epoch": epoch,
                 "model_state": {k: v.cpu() for k, v in model.state_dict().items()},
@@ -279,10 +347,12 @@ def train_stage2a(resume: bool = True):
         )
 
         if no_improv >= patience:
-            print("  Early stop.")
+            log.info("  Early stop.")
             break
 
-    print(f"\nStage 2A done. Best acc: {best_acc:.4f}")
+    log.info(f"\nStage 2A done. Best acc: {best_acc:.4f}")
+    if use_wandb and WANDB_AVAILABLE:
+        wandb.finish()
     return ckpt_path
 
 
@@ -331,11 +401,11 @@ def _val_clf(model, loader, device, cfg: typing.Any, amp_ctx, epoch=None):
 def train_stage2b(resume: bool = True):
     cfg: typing.Any = CFG.STAGE2B
     variant = cfg["model_variant"]
-    print(f"\n[Stage 2B] {variant} infrastructure detector")
-    print(f"  Image size: {cfg['img_size']} px  |  batch: {cfg['batch_size']}")
-    print(f"  Cache: {cfg.get('cache', 'disk')}  |  {vram_stats()}")
-    print("  Progress: YOLO shows live training metrics in the console during .train()")
-    print(f"  Watch folder: {CFG.CKPT_DIR / f'stage2b_{variant}'}")
+    log.info(f"\n[Stage 2B] {variant} infrastructure detector")
+    log.info(f"  Image size: {cfg['img_size']} px  |  batch: {cfg['batch_size']}")
+    log.info(f"  Cache: {cfg.get('cache', 'disk')}  |  {vram_stats()}")
+    log.info("  Progress: YOLO shows live training metrics in the console during .train()")
+    log.info(f"  Watch folder: {CFG.CKPT_DIR / f'stage2b_{variant}'}")
 
     data_yaml = _write_yolo_yaml()
     if not data_yaml:
@@ -355,11 +425,11 @@ def train_stage2b(resume: bool = True):
     if finetune_from:
         # Do NOT use YOLO's resume — it reloads old config (data=coco.yaml).
         # Instead load weights and train fresh on our data.
-        print(f"  Fine-tuning from: {finetune_from}")
+        log.info(f"  Fine-tuning from: {finetune_from}")
         from ultralytics import YOLO
 
         model = YOLO(finetune_from)
-        _ = model.train(
+        train_args = dict(
             data=data_yaml,
             epochs=cfg["epochs"],
             imgsz=cfg["img_size"],
@@ -377,10 +447,17 @@ def train_stage2b(resume: bool = True):
             copy_paste=float(cfg.get("copy_paste", 0)),
             cache=cfg.get("cache", "disk"),
         )
+        if cfg.get("use_obb"):
+            train_args["task"] = "obb"
+        _ = model.train(**train_args)
+        # Wrap in InfrastructureDetector for a consistent return type
+        detector = InfrastructureDetector(cfg, str(CFG.CKPT_DIR))
+        detector.model = model
+        detector._backend = "yolo"
     else:
         detector = InfrastructureDetector(cfg, str(CFG.CKPT_DIR))
         _ = detector.train(data_yaml, device="0")  # type: ignore
-    print("\nStage 2B done.")
+    log.info("\nStage 2B done.")
     return detector
 
 
@@ -390,9 +467,7 @@ def _write_yolo_yaml() -> str:
     imgs_dir = yolo_dir / "images"
     all_imgs = sorted(imgs_dir.glob("*.png"))
     if len(all_imgs) < 2:
-        print(
-            f"  [WARN] Not enough YOLO images found in {imgs_dir} (found {len(all_imgs)})."
-        )
+        log.warning("Not enough YOLO images found in %s (found %d).", imgs_dir, len(all_imgs))
         return ""
 
     n_val = max(1, int(len(all_imgs) * float(CFG.STAGE1["val_fraction"])))  # type: ignore
@@ -424,7 +499,7 @@ def _write_yolo_yaml() -> str:
     import geopandas as gpd
 
     canonical_classes = set()
-    print("  [DEBUG] Scanning dataset for dynamic YOLO classes...")
+    log.info("  [DEBUG] Scanning dataset for dynamic YOLO classes...")
     try:
         for shp_path in CFG.DATA_ROOT.rglob("*.shp"):
             if shp_path.name.startswith(
@@ -447,10 +522,10 @@ def _write_yolo_yaml() -> str:
 
     if canonical_classes:
         final_names = sorted(list(canonical_classes))
-        print(f"  [INFO] Dynamically detected classes: {final_names}")
+        log.info(f"  [INFO] Dynamically detected classes: {final_names}")
     else:
         final_names = cfg["class_names"]
-        print(f"  [INFO] Using fallback classes from config: {final_names}")
+        log.info(f"  [INFO] Using fallback classes from config: {final_names}")
 
     data = {
         "path": str(yolo_dir.resolve()),
@@ -478,7 +553,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", choices=["2a", "2b", "both"], default="both")
     args = ap.parse_args()
-    if args.stage in ("2a", "both"):
-        train_stage2a()
-    if args.stage in ("2b", "both"):
-        train_stage2b()
+    with crash_logged(log, f"Stage {args.stage} training"):
+        if args.stage in ("2a", "both"):
+            train_stage2a()
+        if args.stage in ("2b", "both"):
+            train_stage2b()

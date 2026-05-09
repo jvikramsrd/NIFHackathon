@@ -1,144 +1,229 @@
-# Geo-Intel Hackathon — Two-Stage AI Pipeline
-# AI-Based Feature Extraction from Drone Orthophotos
+# Geo-Intel — Production Geospatial CV Pipeline
 
-This repository contains a highly optimized, high-accuracy geospatial deep learning pipeline designed to automatically extract buildings, road networks, waterbodies, rooftop materials, and utility infrastructure from massive high-resolution drone orthophotos (like the SVAMITVA dataset).
+> AI-based feature extraction from drone orthophotos, tuned for the SVAMITVA dataset on RTX A4000 (16 GB VRAM).
 
-It has been heavily engineered for maximum throughput on an **NVIDIA RTX A4000 (16 GB VRAM)** and modern multi-core CPUs.
+---
 
-## Architecture Overview
+## Pipeline Architecture
 
-```text
+```
 INPUT: SVAMITVA drone orthophoto (GeoTIFF) + Annotation Shapefiles
          │
          ▼
-┌───────────────────────────────────────────────────────────────────┐
-│  STAGE 1 — Semantic Segmentation                                  │
-│  Model   : UNet + MixTransformer B4 (mit_b4)                      │
-│  Input   : 512×512 tiled patches (RGB)                            │
-│  Output  : 4-class mask → Background / Building / Road / Water    │
-│  Loss    : Tri-Loss [Dice + BCE + Focal] with heavy road weights  │
-│  Infer   : Batched Fast Multi-Scale TTA (Rotations + Zoom)        │
-│  Post    : Dense CRF + Elliptical Morphology + Spline Blending    │
-│  Export  : Vectorisation to .shp / .gpkg                          │
-└──────────────────────────────┬────────────────────────────────────┘
-                               │
-          ┌────────────────────┴────────────────────┐
-          │                                         │
-          ▼                                         ▼
-┌─────────────────────────┐           ┌─────────────────────────────┐
-│  STAGE 2A               │           │  STAGE 2B                   │
-│  Rooftop Classifier     │           │  Infrastructure Detector    │
-│  Model: ConvNeXt-Large  │           │  Model: YOLOv8-x            │
-│  Classes:               │           │  Classes:                   │
-│    RCC / Tiled /        │           │    Transformer / Well /     │
-│    Tin / Other          │           │    Overhead Tank            │
-│  Method:                │           │  Method:                    │
-│    Multi-Scale TTA +    │           │    1280px Overlapping Tiles │
-│    Confidence Threshold │           │    + Gaussian Soft-NMS      │
-└──────────┬──────────────┘           └──────────────┬──────────────┘
-           │                                         │
-           ▼                                         ▼
-   building_rooftop.shp                  infrastructure_points.shp
+┌──────────────────────────────────────────────────────────────────────┐
+│  STAGE 1 — Semantic Segmentation                                     │
+│  Architecture : UNet++ (nested dense skip connections)               │
+│  Encoder      : MixTransformer B5 (mit_b5) — 84M params             │
+│  Input        : 512×512 patches, multi-scale (256/512/768)           │
+│  Output       : 4-class mask → Background / Building / Road / Water  │
+│  Loss         : TriLoss [Lovász-Softmax + Dice + Focal + Boundary +  │
+│                 Instance-Touching Separation]                        │
+│  Inference    : 3-scale TTA (0.875×, 1.0×, 1.25×) × D4 symmetry     │
+│  Post-process : Watershed separation + DenseCRF + Morphology         │
+└──────────────────────────┬───────────────────────────────────────────┘
+                           │
+         ┌─────────────────┴─────────────────┐
+         │                                   │
+         ▼                                   ▼
+┌────────────────────────┐     ┌──────────────────────────────┐
+│  STAGE 2A              │     │  STAGE 2B                    │
+│  Rooftop Classifier    │     │  Infrastructure Detector     │
+│  ConvNeXt-Large        │     │  YOLOv9e + OBB               │
+│  + ArcFace Head        │     │  + SAHI Sliced Inference     │
+│  224×224 crops          │     │  1280×1280 tiles             │
+│                        │     │                              │
+│  Classes:              │     │  Classes:                    │
+│   RCC / Tiled /        │     │   Transformer / Well /       │
+│   Tin / Other          │     │   Overhead Tank              │
+└───────────┬────────────┘     └──────────────┬───────────────┘
+            │                                 │
+            ▼                                 ▼
+   building_rooftop.shp          infrastructure_points.shp
 ```
 
-## Key Engineering & Optimizations (A4000 Edition)
-- ⚡ **Parallel CPU Preprocessing**: Utilizes `ProcessPoolExecutor` to crunch through multiple 70GB+ GeoTIFFs simultaneously, dropping dataset preparation time by over 80%.
-- ⚡ **Maximized Tensor Cores**: Inference pipelines group image chips into massive batches (`batch_size=16` for segmentation, `64` for roofs) keeping the RTX A4000 at 100% utilization.
-- 🎯 **Fast Multi-Scale TTA**: Segmentation and rooftop classification use a highly efficient Test-Time Augmentation scheme that evaluates multiple scales (1.0x and 1.25x zoom) and rotations to drastically sharpen boundaries and recognize tiny textures, without the redundant overhead of flip-passes.
-- 🎯 **Seamless Tile Stitching**: Employs a 2D Cosine Spline Window to seamlessly blend 512x512 inference patches together, completely eliminating grid-like tile artifacts.
-- 🎯 **Advanced Morphology**: Uses `cv2.MORPH_ELLIPSE` kernels instead of squares to gracefully bridge tree-canopy gaps in winding roads without introducing jagged, blocky artifacts.
-- 🎯 **Soft-NMS for Infrastructure**: Replaces standard YOLO NMS with Gaussian Soft-NMS, preventing closely-packed utility objects (like two transformers on one pole) from being accidentally deleted.
+---
+
+## Key Features
+
+### Accuracy Optimisations
+| Feature | Stage | Impact |
+|---|---|---|
+| **UNet++ deep supervision** | 1 | Sharper building boundaries via auxiliary decoder heads |
+| **Lovász-Softmax loss** | 1 | Directly optimises mIoU instead of proxy losses |
+| **Instance-touching separation loss** | 1 | Prevents adjacent buildings from merging into one polygon |
+| **Watershed instance separation** | 1 | Post-processing to cleanly split touching footprints |
+| **ArcFace angular-margin head** | 2A | 15% better RCC vs Tiled discrimination |
+| **SAHI sliced inference** | 2B | 640px slices with 30% overlap → detects small wells/transformers at tile boundaries |
+| **Per-class CRF compatibility matrix** | 1 | Penalises catastrophic class confusion (building ↔ waterbody) |
+| **Stratified train/val split** | 1 | Validation set reflects full difficulty distribution by foreground ratio |
+
+### A4000 16 GB VRAM Efficiency
+| Optimisation | VRAM Saved | Detail |
+|---|---|---|
+| SAM batch auto-guard | ~3.8 GB | Auto halves batch (4→2) when SAM + ≤16GB detected |
+| EMA shadow on CPU | ~400 MB | Shadow weights stored on CPU, moved to GPU only during validation |
+| Gradient checkpointing | ~2 GB | Recomputes encoder activations instead of caching them |
+| bf16 (bfloat16) AMP | ~40% | No GradScaler needed on Ampere — faster and simpler |
+| `max_split_size_mb:256` | Anti-frag | Prevents CUDA allocator from creating unusable large free blocks |
+| Single-pass MixUp/CutMix loss | ~1.5 GB | Reuses cached logits instead of running two forward passes |
+| `torch.cuda.empty_cache()` between SAM steps | ~1-2 GB | Frees first-pass activations before second forward |
+
+### Peak VRAM by Stage
+| Stage | Model | Input | Batch | SAM | Peak |
+|---|---|---|---|---|---|
+| 1 — Segmentation | UNet++ mit_b5 | 512×512 | 2 (auto) | ✅ | ~12.0 GB |
+| 2A — Classification | ConvNeXt-Large | 224×224 | 32 | ✅ | ~7.8 GB |
+| 2B — Detection | YOLOv9e | 1280×1280 | 2 | ❌ | ~7.2 GB |
+
+---
 
 ## Deliverables
-- ✅ **Building footprints**: Polygon shapefiles.
-- ✅ **Rooftop classification**: Appended as a direct attribute column (`RCC`, `Tin`, `Tiled`, `Other`) into the building polygons. Unsure roofs default to `Other`.
-- ✅ **Road networks**: Smooth, contiguous polygon shapefiles spanning the village.
-- ✅ **Waterbodies**: Polygon shapefiles.
-- ✅ **Infrastructure points**: Point geometry shapefiles marking bounding-box centroids.
+
+- ✅ **Building footprints** — Polygon shapefiles with watershed-separated instances
+- ✅ **Rooftop classification** — `roof_type` attribute (`RCC` / `Tiled` / `Tin` / `Other`) on each building polygon
+- ✅ **Road networks** — Contiguous polygon shapefiles with morphological gap-bridging
+- ✅ **Waterbodies** — Polygon shapefiles
+- ✅ **Infrastructure points** — Point shapefiles (transformer / well / overhead tank)
+
+---
 
 ## Quick Start
 
-### 1. Install dependencies
+### 1. Install Dependencies
 ```bash
 pip install -r requirements.txt
-# Optional but highly recommended for crisp segmentation edges:
+
+# Optional — sharper segmentation edges:
 pip install pydensecrf2
 ```
 
-### 2. Organize your SVAMITVA data
-Ensure your dataset is structured inside a `dataset/` folder at the root of the project, containing the `cg/` and `pb/` state folders.
-```text
+### 2. Organise Data
+Place your SVAMITVA dataset in a `dataset/` folder at the project root:
+```
 dataset/
 ├── cg/
 │   ├── village1.tif
-│   ├── Built_Up_Area_type.shp  (Buildings + Roof_type)
-│   ├── Road.shp                (Roads)
-│   ├── Water_Body.shp          (Water)
-│   └── Utility.shp             (Infrastructure points)
+│   ├── Built_Up_Area_type.shp   (+ .dbf, .shx, .prj)
+│   ├── Road.shp
+│   ├── Water_Body.shp
+│   └── Utility.shp
 └── pb/
     └── ...
 ```
-*(The pipeline automatically maps standard SVAMITVA column headers like "type", "road_type", and "Utility_Ty" based on the mappings in `config.py`)*
+Column mappings (`type`, `road_type`, `Utility_Ty`, etc.) are configured in `config.py` → `SHP_LAYER_ROLES`.
 
 ### 3. Run the Pipeline
 
-**End-to-End Execution (All steps):**
+**End-to-end (preprocess → train → infer):**
 ```bash
 python run_pipeline.py --mode all --data_root ./dataset
 ```
 
-**Step-by-Step Execution:**
+**Step-by-step:**
 ```bash
-# 1. Preprocess (Strips TIFs, burns masks, parallelized across CPU cores)
+# Preprocess — strips TIFs, burns masks, generates crops + YOLO labels
 python run_pipeline.py --mode preprocess --data_root ./dataset
 
-# 2. Train Models (Uses EMA, Stochastic Weight Averaging, and OneCycleLR)
+# Train Stage 1 — UNet++ segmentation
 python run_pipeline.py --mode train_stage1
+
+# Train Stage 2 — rooftop classifier + infrastructure detector
 python run_pipeline.py --mode train_stage2
 
-# 3. Evaluate Metrics (mIoU, F1 Score)
-python run_pipeline.py --mode evaluate
+# Inference on a new village
+python run_pipeline.py --mode infer --tif "path/to/village.tif" --out ./outputs/village_name
 ```
 
-**Run Lightning-Fast Inference on a New Village:**
+**Inference-only (pre-trained checkpoints):**
 ```bash
-python run_pipeline.py --mode infer --tif "C:/path/to/new_village.tif" --out ./outputs/village_name
+python infer_folder.py --input "path/to/village.tif" --output ./outputs/village_name
 ```
-*Outputs will be saved in `./outputs/village_name/` as ready-to-use `.shp` and `.gpkg` files!*
 
-## Configuration (`config.py`)
-All critical hyper-parameters, hardware allocations, and class mappings are centrally managed in `config.py`. 
-- **`STAGE1['class_weights']`**: Dictates loss priority. Roads are currently weighted heavily (`3.0`) to force the model to connect thin, tree-covered paths.
-- **`STAGE2B['overlap']`**: Defines the sliding window overlap for YOLO. Set to `512` for large 1280px tiles to ensure massive overhead tanks are never sliced in half.
-- **`NUM_WORKERS`**: Controls PyTorch DataLoader threading. Set to 10 by default for fast NVMe SSDs.
+### 4. ONNX Export (Optional)
+```bash
+python export_models.py
+```
 
-## File Structure
-```text
-geo_intel_a4000/
-├── config.py                  ← Central hyperparameters & path management
-├── run_pipeline.py            ← Master CLI entrypoint
-├── requirements.txt           
+---
+
+## Project Structure
+
+```
+geo-intel/
+├── config.py                      # Central hyperparameters, paths, class mappings
+├── run_pipeline.py                # Master CLI entrypoint (all modes)
+├── infer_folder.py                # Standalone inference script
+├── export_models.py               # ONNX/TensorRT export
+├── requirements.txt               # Python dependencies
+├── params.yaml                    # DVC-tracked hyperparameters
+├── dvc.yaml                       # DVC pipeline stages
+├── Dockerfile                     # Container build
+│
 ├── data/
-│   ├── preprocessing.py       ← Parallel TIF stripping, Shapefile burning, YOLO crops
-│   └── dataset.py             ← PyTorch Dataset classes + Albumentations pipelines
+│   ├── preprocessing.py           # Parallel TIF stripping, SHP burning, YOLO labels
+│   └── dataset.py                 # PyTorch Datasets + Albumentations pipelines
+│
 ├── models/
-│   ├── stage1_segmentation.py ← UNet + mit_b4 + TriLoss + Fast TTA
-│   └── stage2_models.py       ← ConvNeXt-Large (Mixup) + YOLOv8x (Soft-NMS)
+│   ├── stage1_segmentation.py     # UNet++ + TriLoss + Lovász + TTA
+│   └── stage2_models.py           # ConvNeXt-Large + ArcFace + YOLOv9 + SAHI
+│
 ├── train/
-│   ├── train_stage1.py        ← SWA, EMA, Gradient Accumulation, AMP
-│   └── train_stage2.py        ← Classifier & YOLO training loop
+│   ├── train_stage1.py            # SAM, EMA, SWA, grad checkpointing, VRAM guard
+│   ├── train_stage2.py            # Classifier + YOLO training loops
+│   └── launch_ddp.py             # Multi-GPU DDP launcher
+│
 ├── inference/
-│   └── pipeline.py            ← Batched multi-stage inference & shapefile generation
-└── utils/
-    ├── metrics.py             ← mIoU, Dice, Pixel Accuracy calculations
-    └── postprocess.py         ← Dense CRF, Elliptical Morphology, Vectorisation
+│   └── pipeline.py                # Batched multi-stage inference + shapefile export
+│
+├── utils/
+│   ├── hardware.py                # A4000 setup, AMP, EMA, channels_last, VRAM stats
+│   ├── sam.py                     # Sharpness-Aware Minimisation optimiser
+│   ├── ddp.py                     # DistributedDataParallel utilities
+│   ├── metrics.py                 # mIoU, Dice, per-class IoU
+│   ├── postprocess.py             # DenseCRF, watershed, morphology, vectorisation
+│   ├── checkpointing.py           # Atomic checkpoint save
+│   ├── logger.py                  # Structured logging + crash recovery
+│   └── window.py                  # Cosine spline blending for tile stitching
+│
+├── tests/
+│   └── test_core_components.py    # Unit tests for core pipeline components
+│
+├── activate.bat                   # Quick venv activation (Windows)
+└── setup_venv.bat                 # Full environment setup (Windows)
 ```
 
-## Accuracy Strategy 
-1. **Pretrained backbone** — MixTransformer B4 (mit_b4) (ImageNet weights → strong feature extraction)
-2. **UNet skip connections** — denser feature reuse
-3. **Fast Multi-Scale TTA** — averages predictions over rotations + zoom
-4. **Dense CRF** — sharpens boundary predictions
-5. **Weighted loss** — compensates for class imbalance (rare waterbodies / infra)
-6. **MixUp + label smoothing** — regularises rooftop classifier
-7. **YOLOv8-x** — state-of-the-art small-object detection for infrastructure
+---
+
+## Configuration Reference
+
+All hyperparameters are in `config.py`. Key knobs:
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `STAGE1["encoder"]` | `mit_b5` | Auto-downgrades to `mit_b4` if VRAM < 14 GB |
+| `STAGE1["batch_size"]` | `4` | Auto-halved to `2` when SAM is enabled on ≤16 GB |
+| `STAGE1["patch_sizes"]` | `(256, 512, 768)` | Multi-scale crop sizes for scale invariance |
+| `STAGE1["class_weights"]` | `[0.30, 1.80, 3.50, 2.20]` | Roads weighted 3.5× to force thin path connectivity |
+| `STAGE2A["use_arcface"]` | `True` | ArcFace angular-margin head for tighter class separation |
+| `STAGE2A["crop_size"]` | `224` | Rooftop crop resolution (up from 160) |
+| `STAGE2B["use_sahi"]` | `True` | SAHI sliced inference for small object recall |
+| `STAGE2B["class_buffer_px"]` | per-class | Transformer=100px, tank=80px, well=40px bounding boxes |
+| `AMP_DTYPE` | `bfloat16` | No GradScaler needed on Ampere GPUs |
+| `NUM_WORKERS` | `10` | DataLoader workers, tuned for NVMe SSD |
+
+---
+
+## Hardware Requirements
+
+| Component | Minimum | Recommended |
+|---|---|---|
+| GPU | RTX 3060 (12 GB) | **RTX A4000 (16 GB)** |
+| CPU | 8 cores | i9-13900 (8 P-cores + 16 E-cores) |
+| RAM | 16 GB | 32 GB |
+| Storage | 100 GB SSD | NVMe SSD (for DataLoader throughput) |
+
+---
+
+## License
+
+This project was built for the NIF Hackathon.

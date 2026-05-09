@@ -2,7 +2,7 @@
 run_stage2b.py  —  Standalone Stage 2B: Infrastructure Detection
 ═══════════════════════════════════════════════════════════════════
 Extracts infrastructure data from shapefiles → YOLO format,
-then trains YOLOv8x with all the accuracy improvements:
+then trains YOLOv9 with all the accuracy improvements:
 
   • Class-specific bounding box sizes (transformer=60px, tank=50px, well=25px)
   • Object-centered tiles (no edge cropping)
@@ -23,6 +23,10 @@ import os
 import shutil
 import sys
 from pathlib import Path
+from utils.logger import get_logger
+
+log = get_logger(__name__)
+
 
 # Ensure project root is on path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -51,16 +55,16 @@ def extract_infra_data(data_dirs: list):
     for folder in data_dirs:
         folder = Path(folder)
         if not folder.exists():
-            print(f"  [SKIP] Folder not found: {folder}")
+            log.info(f"  [SKIP] Folder not found: {folder}")
             continue
 
-        print(f"\n{'='*60}")
-        print(f"  Scanning: {folder}")
-        print(f"{'='*60}")
+        log.info(f"\n{'='*60}")
+        log.info(f"  Scanning: {folder}")
+        log.info(f"{'='*60}")
 
         rasters, shps = scan_folder(str(folder))
         if not rasters:
-            print(f"  No rasters found in {folder}")
+            log.info(f"  No rasters found in {folder}")
             continue
 
         # Find utility shapefiles
@@ -68,13 +72,13 @@ def extract_infra_data(data_dirs: list):
         utility_shps = [s for k, s in shp_by_stem.items() if k.startswith("utility")]
 
         if not utility_shps:
-            print(f"  No Utility shapefiles found in {folder}")
+            log.info(f"  No Utility shapefiles found in {folder}")
             continue
 
-        print(f"  Utility SHPs: {[s.name for s in utility_shps]}")
+        log.info(f"  Utility SHPs: {[s.name for s in utility_shps]}")
 
         for raster_path in rasters:
-            print(f"\n  Processing: {raster_path.name}")
+            log.info(f"\n  Processing: {raster_path.name}")
             try:
                 n = _extract_infra_streaming(
                     raster_path,
@@ -87,11 +91,12 @@ def extract_infra_data(data_dirs: list):
                     cfg2b["img_size"],
                     class_buffer_px=cfg2b.get("class_buffer_px"),
                     neg_tile_ratio=cfg2b.get("neg_tile_ratio", 0.0),
+                    use_obb=cfg2b.get("use_obb", False),
                 )
                 total_infra += n
-                print(f"    → {n} infrastructure objects extracted")
+                log.info(f"    → {n} infrastructure objects extracted")
             except Exception as e:
-                print(f"    [ERROR] {e}")
+                log.info(f"    [ERROR] {e}")
                 continue
 
             gc.collect()
@@ -101,13 +106,13 @@ def extract_infra_data(data_dirs: list):
     lbl_count = len(list((CFG.YOLO_DIR / "labels").glob("*.txt")))
     neg_count = len(list((CFG.YOLO_DIR / "images").glob("infra_neg_*.png")))
 
-    print(f"\n{'='*60}")
-    print(f"  EXTRACTION COMPLETE")
-    print(f"  Total infrastructure objects: {total_infra}")
-    print(f"  Tile images: {img_count}  ({neg_count} negative)")
-    print(f"  Label files: {lbl_count}")
-    print(f"  Output: {CFG.YOLO_DIR}")
-    print(f"{'='*60}")
+    log.info(f"\n{'='*60}")
+    log.info(f"  EXTRACTION COMPLETE")
+    log.info(f"  Total infrastructure objects: {total_infra}")
+    log.info(f"  Tile images: {img_count}  ({neg_count} negative)")
+    log.info(f"  Label files: {lbl_count}")
+    log.info(f"  Output: {CFG.YOLO_DIR}")
+    log.info(f"{'='*60}")
 
     return total_infra
 
@@ -128,7 +133,7 @@ def prepare_yolo_dataset():
 
     all_imgs = sorted(imgs_dir.glob("*.png"))
     if len(all_imgs) < 2:
-        print(f"  [ERROR] Need at least 2 images, found {len(all_imgs)} in {imgs_dir}")
+        log.info(f"  [ERROR] Need at least 2 images, found {len(all_imgs)} in {imgs_dir}")
         return ""
 
     # 15% validation split
@@ -140,7 +145,7 @@ def prepare_yolo_dataset():
     train_imgs = all_imgs[n_val:]
     val_imgs = all_imgs[:n_val]
 
-    print(f"  Train: {len(train_imgs)} tiles  |  Val: {len(val_imgs)} tiles")
+    log.info(f"  Train: {len(train_imgs)} tiles  |  Val: {len(val_imgs)} tiles")
 
     # Create train/val directory structure
     for split, imgs in [("train", train_imgs), ("val", val_imgs)]:
@@ -178,7 +183,7 @@ def prepare_yolo_dataset():
     yaml_path = yolo_dir / "data.yaml"
     yaml_path.write_text(yaml.dump(data, default_flow_style=False))
 
-    print(f"  YOLO config: {yaml_path}")
+    log.info(f"  YOLO config: {yaml_path}")
     return str(yaml_path)
 
 
@@ -188,21 +193,21 @@ def prepare_yolo_dataset():
 
 def train_stage2b(data_yaml: str, resume: bool = True):
     """
-    Train YOLOv8x infrastructure detector with tuned hyperparams.
+    Train YOLOv9 infrastructure detector with tuned hyperparams.
     """
     from models.stage2_models import InfrastructureDetector
 
     cfg2b = CFG.STAGE2B
     variant = cfg2b["model_variant"]
 
-    print(f"\n{'='*60}")
-    print(f"  STAGE 2B TRAINING: {variant}")
-    print(f"  Image size: {cfg2b['img_size']}px  |  Batch: {cfg2b['batch_size']}")
-    print(f"  LR: {cfg2b['lr0']} → {cfg2b['lrf']}  |  Epochs: {cfg2b['epochs']}")
-    print(f"  Warmup: {cfg2b.get('warmup_epochs', 3)} epochs  |  Patience: {cfg2b.get('patience', 20)}")
-    print(f"  Cosine LR: {cfg2b.get('cos_lr', True)}  |  Copy-paste: {cfg2b.get('copy_paste', 0)}")
-    print(f"  {vram_stats()}")
-    print(f"{'='*60}")
+    log.info(f"\n{'='*60}")
+    log.info(f"  STAGE 2B TRAINING: {variant}")
+    log.info(f"  Image size: {cfg2b['img_size']}px  |  Batch: {cfg2b['batch_size']}")
+    log.info(f"  LR: {cfg2b['lr0']} → {cfg2b['lrf']}  |  Epochs: {cfg2b['epochs']}")
+    log.info(f"  Warmup: {cfg2b.get('warmup_epochs', 3)} epochs  |  Patience: {cfg2b.get('patience', 20)}")
+    log.info(f"  Cosine LR: {cfg2b.get('cos_lr', True)}  |  Copy-paste: {cfg2b.get('copy_paste', 0)}")
+    log.info(f"  {vram_stats()}")
+    log.info(f"{'='*60}")
 
     run_dir = CFG.CKPT_DIR / f"stage2b_{variant}"
     best_ckpt = run_dir / "weights" / "best.pt"
@@ -221,10 +226,10 @@ def train_stage2b(data_yaml: str, resume: bool = True):
         # training config (including data=coco.yaml) and tries to download COCO.
         # Instead, load the checkpoint weights into a fresh model and train
         # on OUR data.yaml with OUR hyperparams.
-        print(f"  Fine-tuning from: {finetune_from}")
+        log.info(f"  Fine-tuning from: {finetune_from}")
         from ultralytics import YOLO
         model = YOLO(finetune_from)
-        model.train(
+        train_args = dict(
             data=data_yaml,
             epochs=cfg2b["epochs"],
             imgsz=cfg2b["img_size"],
@@ -242,20 +247,23 @@ def train_stage2b(data_yaml: str, resume: bool = True):
             copy_paste=float(cfg2b.get("copy_paste", 0)),
             cache=cfg2b.get("cache", "disk"),
         )
+        if cfg2b.get("use_obb"):
+            train_args["task"] = "obb"
+        model.train(**train_args)
         detector = InfrastructureDetector(cfg2b, str(CFG.CKPT_DIR))
     else:
         if last_ckpt.exists() or best_ckpt.exists():
-            print(f"  [INFO] Previous checkpoint found but --no-resume specified, training from scratch")
+            log.info(f"  [INFO] Previous checkpoint found but --no-resume specified, training from scratch")
         detector = InfrastructureDetector(cfg2b, str(CFG.CKPT_DIR))
         detector.train(data_yaml, device="0")
 
     # Show results
     best_pt = run_dir / "weights" / "best.pt"
     if best_pt.exists():
-        print(f"\n  Best model saved: {best_pt}")
-        print(f"  Model size: {best_pt.stat().st_size / 1e6:.1f} MB")
+        log.info(f"\n  Best model saved: {best_pt}")
+        log.info(f"  Model size: {best_pt.stat().st_size / 1e6:.1f} MB")
 
-    print(f"\nStage 2B training complete.")
+    log.info(f"\nStage 2B training complete.")
     return detector
 
 
@@ -303,7 +311,7 @@ Examples:
 
     # Setup hardware
     device = setup(verbose=True)
-    print(f"\n  Device: {device}")
+    log.info(f"\n  Device: {device}")
 
     # Determine data directories
     if args.data_dir:
@@ -323,11 +331,11 @@ Examples:
             data_dirs = []
 
         if not data_dirs:
-            print(f"\n  [ERROR] No dataset folders found in {data_root}")
-            print(f"  Use --data-dir to specify the path to your data folder")
+            log.info(f"\n  [ERROR] No dataset folders found in {data_root}")
+            log.info(f"  Use --data-dir to specify the path to your data folder")
             sys.exit(1)
 
-    print(f"\n  Data folders: {data_dirs}")
+    log.info(f"\n  Data folders: {data_dirs}")
 
     # Clean if requested
     if args.clean:
@@ -337,41 +345,41 @@ Examples:
             if d.exists():
                 shutil.rmtree(d, ignore_errors=True)
                 d.mkdir(parents=True, exist_ok=True)
-        print("  Cleaned existing YOLO data")
+        log.info("  Cleaned existing YOLO data")
 
     # ── Extract ──────────────────────────────────────────────────────────
     if not args.train_only:
-        print("\n" + "─" * 60)
-        print("  PHASE 1: Data Extraction")
-        print("─" * 60)
+        log.info("\n" + "─" * 60)
+        log.info("  PHASE 1: Data Extraction")
+        log.info("─" * 60)
         n = extract_infra_data(data_dirs)
         if n == 0:
-            print("\n  [ERROR] No infrastructure objects found. Check your Utility shapefiles.")
+            log.info("\n  [ERROR] No infrastructure objects found. Check your Utility shapefiles.")
             if not args.extract_only:
-                print("  Skipping training.")
+                log.info("  Skipping training.")
             sys.exit(1)
 
     if args.extract_only:
-        print("\n  Done (extract-only mode).")
+        log.info("\n  Done (extract-only mode).")
         return
 
     # ── Prepare YOLO dataset ─────────────────────────────────────────────
-    print("\n" + "─" * 60)
-    print("  PHASE 2: Preparing YOLO Dataset")
-    print("─" * 60)
+    log.info("\n" + "─" * 60)
+    log.info("  PHASE 2: Preparing YOLO Dataset")
+    log.info("─" * 60)
     clear_cuda_cache()
     data_yaml = prepare_yolo_dataset()
     if not data_yaml:
-        print("  [ERROR] Failed to create YOLO dataset")
+        log.info("  [ERROR] Failed to create YOLO dataset")
         sys.exit(1)
 
     # ── Train ────────────────────────────────────────────────────────────
-    print("\n" + "─" * 60)
-    print("  PHASE 3: Training YOLOv8x")
-    print("─" * 60)
+    log.info("\n" + "─" * 60)
+    log.info("  PHASE 3: Training YOLOv9")
+    log.info("─" * 60)
     train_stage2b(data_yaml, resume=not args.no_resume)
 
-    print("\n  All done! ✓")
+    log.info("\n  All done! ✓")
 
 
 if __name__ == "__main__":

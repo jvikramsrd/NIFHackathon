@@ -19,7 +19,7 @@
 #     pip install pydensecrf2
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Deep Learning ─────────────────────────────────────────────────────────────
+# ── Deep Learning ─────────────────────────────────────════════════════════════
 segmentation-models-pytorch>=0.3.3
 timm>=0.9.12
 ultralytics>=8.1.0
@@ -34,6 +34,12 @@ albumentations>=1.4.0
 opencv-python>=4.9.0
 Pillow>=10.2.0
 
+# ── Instance Separation (Watershed) ──────────────────────────────────────────
+scikit-image>=0.22.0
+
+# ── Small Object Detection ────────────────────────────────────────────────────
+sahi>=0.11.15           # Slicing Aided Hyper Inference for transformers/wells
+
 # ── Data / ML Utilities ───────────────────────────────────────────────────────
 numpy>=1.26.0
 pandas>=2.1.0
@@ -43,13 +49,20 @@ tqdm>=4.66.1
 pyyaml>=6.0.1
 matplotlib>=3.8.0
 lxml
+pytest>=8.0.0
 
 # ── Hardware / System ─────────────────────────────────────────────────────────
 psutil>=5.9.0        # P-core affinity pinning for i9-13900K DataLoader workers
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 tensorboard>=2.16.0
-# wandb>=0.16.0      # uncomment if using Weights & Biases
+wandb>=0.16.0  # experiment tracking & hyperparameter sweeps
 
 # ── Optional (significant accuracy improvement) ───────────────────────────────
 # pydensecrf2        # Dense CRF boundary refinement — install after VS Build Tools
+
+# ── ONNX Export / Deployment ────────────────────────────────────────────────
+onnx>=1.16.0
+onnxruntime-gpu>=1.17.0
+# TensorRT — install via NVIDIA package index:
+# pip install nvidia-tensorrt --index-url https://pypi.ngc.nvidia.com

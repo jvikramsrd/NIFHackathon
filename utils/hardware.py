@@ -11,6 +11,10 @@ import sys
 
 import torch
 import torch.nn as nn
+from utils.logger import get_logger
+
+log = get_logger(__name__)
+
 
 _SETUP_DONE = False
 
@@ -55,7 +59,7 @@ def setup(seed: int = 42, verbose: bool = True) -> torch.device:
 
     # ── CUDA + Ampere flags ──────────────────────────────────────────────────
     if not torch.cuda.is_available():
-        print("[HW] WARNING: CUDA not available — running on CPU")
+        log.info("[HW] WARNING: CUDA not available — running on CPU")
         return torch.device("cpu")
 
     device = torch.device("cuda:0")
@@ -93,18 +97,18 @@ def setup(seed: int = 42, verbose: bool = True) -> torch.device:
         gpu = torch.cuda.get_device_properties(device)
         vram_gb = gpu.total_memory / 1024**3
         cc = f"{gpu.major}.{gpu.minor}"
-        print("=" * 60)
-        print(f"  GPU              : {gpu.name}")
-        print(f"  VRAM             : {vram_gb:.1f} GB")
-        print(f"  SM count         : {gpu.multi_processor_count}  (CC {cc})")
-        print(f"  CUDA             : {torch.version.cuda}")
-        print(f"  PyTorch          : {torch.__version__}")
-        print(f"  bf16 native      : {gpu.major >= 8}")
-        print(f"  TF32             : {torch.backends.cudnn.allow_tf32}")
-        print(f"  matmul precision : {torch.get_float32_matmul_precision()}")
-        print(f"  intra threads    : {torch.get_num_threads()}")
-        print(f"  interop threads  : {torch.get_num_interop_threads()}")
-        print("=" * 60)
+        log.info("=" * 60)
+        log.info(f"  GPU              : {gpu.name}")
+        log.info(f"  VRAM             : {vram_gb:.1f} GB")
+        log.info(f"  SM count         : {gpu.multi_processor_count}  (CC {cc})")
+        log.info(f"  CUDA             : {torch.version.cuda}")
+        log.info(f"  PyTorch          : {torch.__version__}")
+        log.info(f"  bf16 native      : {gpu.major >= 8}")
+        log.info(f"  TF32             : {torch.backends.cudnn.allow_tf32}")
+        log.info(f"  matmul precision : {torch.get_float32_matmul_precision()}")
+        log.info(f"  intra threads    : {torch.get_num_threads()}")
+        log.info(f"  interop threads  : {torch.get_num_interop_threads()}")
+        log.info("=" * 60)
 
     return device
 
@@ -152,10 +156,10 @@ def compile_model(
     """
     try:
         compiled = torch.compile(model, mode=mode, fullgraph=fullgraph)
-        print(f"  torch.compile() applied (mode={mode}, fullgraph={fullgraph})")
+        log.info(f"  torch.compile() applied (mode={mode}, fullgraph={fullgraph})")
         return compiled
     except Exception as e:
-        print(f"  torch.compile() skipped: {e}")
+        log.info(f"  torch.compile() skipped: {e}")
         return model
 
 
@@ -171,9 +175,9 @@ def to_channels_last(model: nn.Module) -> nn.Module:
     """
     try:
         model = model.to(memory_format=torch.channels_last)
-        print("  channels_last (NHWC) applied")
+        log.info("  channels_last (NHWC) applied")
     except Exception as e:
-        print(f"  channels_last skipped: {e}")
+        log.info(f"  channels_last skipped: {e}")
     return model
 
 
@@ -211,38 +215,45 @@ def get_amp_context(dtype: torch.dtype = torch.bfloat16):
 class EMA:
     """
     Exponential Moving Average of model weights.
-    Keeps a shadow copy that is updated after every optimizer step.
-    Use shadow weights for validation / inference.
+
+    Shadow weights are stored on **CPU** to save ~400–500 MB VRAM on the A4000.
+    They are moved to GPU only during validation (apply_shadow) and back to CPU
+    afterward (restore). The CPU↔GPU transfer costs ~50ms on PCIe 4.0 x16,
+    which is negligible compared to a validation epoch.
     """
 
     def __init__(self, model: nn.Module, decay: float = 0.9998):
         self.decay = decay
         self.shadow: dict = {}
+        self._backup: dict = {}
         self._register(model)
 
     def _register(self, model: nn.Module):
         for name, param in model.named_parameters():
             if param.requires_grad:
-                self.shadow[name] = param.data.clone().detach()
+                # Store shadow on CPU to free VRAM
+                self.shadow[name] = param.data.clone().detach().cpu()
 
     @torch.no_grad()
     def update(self, model: nn.Module):
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.shadow:
+                # EMA on CPU: pull param to CPU, blend, store result on CPU
                 self.shadow[name] = (
-                    self.decay * self.shadow[name] + (1.0 - self.decay) * param.data
+                    self.decay * self.shadow[name]
+                    + (1.0 - self.decay) * param.data.cpu()
                 )
 
     def apply_shadow(self, model: nn.Module):
-        """Temporarily load EMA weights into model (for val/inference)."""
+        """Move EMA weights to GPU and load into model for validation."""
         self._backup = {}
         for name, param in model.named_parameters():
             if name in self.shadow:
                 self._backup[name] = param.data.clone()
-                param.data.copy_(self.shadow[name])
+                param.data.copy_(self.shadow[name].to(param.device))
 
     def restore(self, model: nn.Module):
-        """Restore training weights after val/inference."""
+        """Restore training weights after validation."""
         for name, param in model.named_parameters():
             if name in self._backup:
                 param.data.copy_(self._backup[name])
@@ -291,4 +302,4 @@ def clear_cuda_cache():
         import gc
 
         gc.collect()
-        print(f"  Cache cleared. {vram_stats()}")
+        log.info(f"  Cache cleared. {vram_stats()}")

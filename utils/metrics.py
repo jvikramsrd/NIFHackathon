@@ -121,59 +121,13 @@ class ClassificationMetrics:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def compute_map(
-    pred_boxes: List[List],  # [[x1,y1,x2,y2,conf,cls], ...]
-    gt_boxes: List[List],  # [[x1,y1,x2,y2,cls], ...]
-    num_classes: int,
-    iou_thresh: float = 0.5,
-) -> Dict:
-    """Simple mAP@0.5 implementation for infrastructure detection evaluation."""
-
-    ap_per_class = []
-
-    for cls_id in range(num_classes):
-        preds_c = sorted(
-            [p for p in pred_boxes if int(p[5]) == cls_id],
-            key=lambda x: -x[4],  # descending confidence
-        )
-        gts_c = [g for g in gt_boxes if int(g[4]) == cls_id]
-
-        if len(gts_c) == 0:
-            ap_per_class.append(0.0)
-            continue
-
-        tp = np.zeros(len(preds_c))
-        fp = np.zeros(len(preds_c))
-        matched = set()
-
-        for i, pred in enumerate(preds_c):
-            best_iou, best_j = 0.0, -1
-            for j, gt in enumerate(gts_c):
-                if j in matched:
-                    continue
-                iou = _box_iou(pred[:4], gt[:4])
-                if iou > best_iou:
-                    best_iou, best_j = iou, j
-
-            if best_iou >= iou_thresh:
-                tp[i] = 1
-                matched.add(best_j)
-            else:
-                fp[i] = 1
-
-        cum_tp = np.cumsum(tp)
-        cum_fp = np.cumsum(fp)
-        rec = cum_tp / max(len(gts_c), 1)
-        prec = cum_tp / np.maximum(cum_tp + cum_fp, 1e-6)
-        ap_per_class.append(_voc_ap(rec, prec))
-
-    return {
-        "mAP_50": float(np.mean(ap_per_class)),
-        "class_ap": ap_per_class,
-    }
+# The original simple ``compute_map`` implementation was removed because a more
+# feature‑rich version (supporting multiple IoU thresholds) is provided later in
+# this file. Keeping only the advanced implementation avoids name clashes and
+# ensures a single source of truth for mAP calculations.
 
 
-def _box_iou(b1, b2):
+def _box_iou(b1, b2, threshold: float = None):
     ix1 = max(b1[0], b2[0])
     iy1 = max(b1[1], b2[1])
     ix2 = min(b1[2], b2[2])
@@ -256,14 +210,40 @@ def compute_map(
     # Mean Average Precision (mAP) across all classes
     mean_ap = np.mean(ap_per_class)
 
+    # mAP@50: re-run with iou_threshold=0.5 only, then average across classes
+    ap50_per_class = []
+    for cls_id in range(num_classes):
+        preds_c = sorted(
+            [p for p in pred_boxes if int(p[5]) == cls_id],
+            key=lambda x: -x[4],
+        )
+        gts_c = [g for g in gt_boxes if int(g[4]) == cls_id]
+        if len(gts_c) == 0:
+            ap50_per_class.append(0.0)
+            continue
+        tp50 = np.zeros(len(preds_c))
+        fp50 = np.zeros(len(preds_c))
+        matched50: set = set()
+        for i, pred in enumerate(preds_c):
+            best_iou, best_j = 0.0, -1
+            for j, gt in enumerate(gts_c):
+                if j in matched50:
+                    continue
+                iou = _box_iou(pred[:4], gt[:4])
+                if iou > best_iou:
+                    best_iou, best_j = iou, j
+            if best_iou >= 0.5:
+                tp50[i] = 1
+                matched50.add(best_j)
+            else:
+                fp50[i] = 1
+        rec50 = np.cumsum(tp50) / max(len(gts_c), 1)
+        prec50 = np.cumsum(tp50) / np.maximum(np.cumsum(tp50) + np.cumsum(fp50), 1e-6)
+        ap50_per_class.append(_voc_ap(rec50, prec50))
+
     return {
-        "mAP_50": float(
-            np.mean(
-                np.array(
-                    [_voc_ap(np.cumsum(tp), np.cumsum(fp)) for _ in range(len(gts_c))]
-                )
-            )
-        ),  # Placeholder: Needs proper full mAP calculation structure if not using class_ap list
+        "mAP_50": float(np.mean(ap50_per_class)),
         "mAP": float(mean_ap),
         "class_ap": ap_per_class,
+        "class_ap_50": ap50_per_class,
     }

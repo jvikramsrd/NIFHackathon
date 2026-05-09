@@ -50,9 +50,10 @@ for d in [
 
 # ─── Hardware ────────────────────────────────────────────────────────────────
 DEVICE = "cuda"
-# Prevent CUDA memory fragmentation (recommended when OOM errors occur)
-# Note: expandable_segments is not supported on Windows.
-# os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# Reduce CUDA memory fragmentation on the 16 GB A4000.
+# max_split_size_mb prevents the allocator from creating huge free blocks
+# that can't be reused, which is the #1 cause of OOM on 16 GB cards.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:256")
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -133,93 +134,104 @@ INFRA_TYPE_MAP = {
     "14": "well",
 }
 
-# ─── Stage 1: Semantic Segmentation ─────────────────────────────────────────
+# --- Stage 1: Semantic Segmentation ---
 STAGE1 = dict(
     num_classes=4,
-    class_names=["background", "building", "road", "waterbody"],
+    class_names=['background', 'building', 'road', 'waterbody'],
     class_colors=[(0, 0, 0), (255, 0, 0), (128, 128, 128), (0, 0, 255)],
-    # The SHP roles and class ids are driven by SHP_LAYER_ROLES above.
-    # These two fields are kept for legacy compatibility:
-    shp_class_col="type",
-    shp_class_map={"building": 1, "road": 2, "waterbody": 3},
-    # Model
-    # UNet with mit_b4 (MixTransformer B4) gives excellent segmentation quality
-    # and stays under the 15GB VRAM limit on the A4000 (batch 4, grad_accum 8).
-    arch="Unet",
-    encoder="mit_b4",
-    encoder_weights="imagenet",
+    shp_class_col='type',
+    shp_class_map={'building': 1, 'road': 2, 'waterbody': 3},
+    arch='UnetPlusPlus',
+    encoder='mit_b5',
+    encoder_weights='imagenet',
     in_channels=3,
-    # Training
-    # patch 512, batch 4, grad_accum 8 → effective batch 32
-    # safely fits in 15 GB with margin for optimizer states + SCSE attention
+    decoder_attention_type='scse',
     patch_size=512,
-    overlap=128,
+    patch_sizes=(256, 512, 768),
+    overlap=192,
     batch_size=4,
-    grad_accum=8,  # effective batch = 32
+    grad_accum=8,
     lr=2e-4,
     encoder_lr_mult=0.1,
     weight_decay=1e-4,
     epochs=150,
     warmup_epochs=5,
-    scheduler="cosine",
-    # Loss
-    dice_weight=0.6,
-    bce_weight=0.2,
-    focal_weight=0.2,
+    scheduler='cosine',
+    use_sam=True,
+    sam_rho=0.05,
+    sam_adaptive=True,
+    ms_training=True,
+    ms_scales=(0.5, 1.0, 1.5),
+    dice_weight=0.40,
+    bce_weight=0.15,
+    focal_weight=0.15,
+    boundary_weight=0.15,
+    lovasz_weight=0.15,
+    touching_weight=0.10,
     focal_gamma=2.0,
-    class_weights=[0.05, 1.6, 3.0, 2.0],
-    # Regularisation
+    class_weights=[0.30, 1.80, 3.50, 2.20],
+    label_smoothing=0.05,
     use_swa=True,
     swa_lr=2e-5,
     swa_start_frac=0.75,
     use_ema=True,
     ema_decay=0.9998,
     cutmix_alpha=1.0,
-    # Val
+    drop_path_rate=0.2,
     val_fraction=0.15,
     seed=42,
-    # Post-processing
     min_building_area_px=80,
     min_road_width_px=3,
+    polygon_min_area_px={'building': 80, 'road': 120, 'waterbody': 160},
+    polygon_simplify_tolerance=0.5,
     crf_inference=True,
-    crf_iter=3,  # Reduced for further speedup
-    # Preprocessing
-    neg_tile_ratio=0.05,  # Keep 5% of background tiles for Negative Hard Mining
+    crf_iter=5,
+    neg_tile_ratio=0.15,
+    min_fg_ratio=0.003,   # minimum foreground fraction to keep a patch
 )
-
-# ─── Stage 2A: Rooftop Classification ───────────────────────────────────────
+# --- Stage 2A: Rooftop Classification ---
 STAGE2A = dict(
     num_classes=4,
-    class_names=["RCC", "Tiled", "Tin", "Other"],
-    # Column in Built_Up_Area_type.dbf representing roof material
-    shp_roof_col="Roof_type",
-    # Map raw DBF values → class names (use ROOF_TYPE_MAP above)
+    class_names=['RCC', 'Tiled', 'Tin', 'Other'],
+    shp_roof_col='Roof_type',
     roof_type_map=ROOF_TYPE_MAP,
-    arch="convnext_large",
+    arch='convnext_large',
     pretrained=True,
-    crop_size=160,
-    min_crop_px=24,
-    batch_size=48,
+    crop_size=224,
+    min_crop_px=40,
+    batch_size=32,
     lr=5e-5,
     epochs=150,
-    label_smoothing=0.1,
+    label_smoothing=0.05,
     mixup_alpha=0.4,
     cutmix_alpha=1.0,
     weight_decay=1e-1,
     grad_accum=1,
-    tta_steps=16,
+    tta_steps=24,
+    use_arcface=True,
+    arcface_s=30.0,
+    arcface_m=0.50,
+    use_sam=True,
+    sam_rho=0.05,
+    sam_adaptive=True,
+    use_randaugment=True,
+    randaugment_n=2,
+    randaugment_m=7,
+    drop_path_rate=0.4,
+    use_ema=True,
+    ema_decay=0.9995,
 )
-
-# ─── Stage 2B: Infrastructure Detection ─────────────────────────────────────
+# --- Stage 2B: Infrastructure Detection ---
 STAGE2B = dict(
-    class_names=["transformer", "overhead_tank", "well"],
+    class_names=['transformer', 'overhead_tank', 'well'],
     num_classes=3,
-    # Column in Utility.dbf / Utility_Poly.dbf
-    shp_infra_col="Utility_Ty",
+    shp_infra_col='Utility_Ty',
     infra_type_map=INFRA_TYPE_MAP,
-    model_variant="yolov8x",
+    model_variant='yolov9e',
+    use_obb=True,
+    obb_model_variant='yolov9e-obb',
     img_size=1280,
-    cache="ram",
+    cache='ram',
     batch_size=2,
     workers=0,
     epochs=200,
@@ -238,16 +250,20 @@ STAGE2B = dict(
     scale=0.5,
     fliplr=0.5,
     mixup=0.15,
-    copy_paste=0.15,
+    copy_paste=0.30,
     conf_thresh=0.10,
     iou_thresh=0.60,
     max_det=1000,
     overlap=512,
-    # Per-class bounding box radius (pixels) — replaces fixed buffer_px=20
-    # Sized to match actual object footprints in SVAMITVA drone imagery
-    class_buffer_px={"transformer": 60, "overhead_tank": 50, "well": 25},
-    # Fraction of negative tiles (no infra) to add for reducing false positives
+    class_buffer_px={'transformer': 100, 'overhead_tank': 80, 'well': 40},
     neg_tile_ratio=0.3,
-    # Soft-NMS sigma for Gaussian confidence decay on overlapping detections
     soft_nms_sigma=0.9,
+    use_sahi=True,
+    sahi_slice_size=640,
+    sahi_overlap_ratio=0.30,
+    class_conf_thresh={
+        'transformer': 0.20,
+        'overhead_tank': 0.12,
+        'well': 0.08,
+    },
 )

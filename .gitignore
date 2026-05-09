@@ -70,7 +70,8 @@ results/
 
 # Temporary logs and scripts
 *preprocessing.txt
-test_*.py
+# Root-level temp test scripts (not tests/ directory)
+/test_*.py
 
 # Archives and large files
 *.zip
