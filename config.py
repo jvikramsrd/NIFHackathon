@@ -73,6 +73,7 @@ else:
 # Disable it here — all other optimisations (TF32, bf16, cudnn.benchmark) still apply.
 COMPILE_ENABLED = False
 COMPILE_MODE = "reduce-overhead"
+FAST_TTA = False  # True = 2-scale×4-fold (8 passes); False = 3-scale×8-fold (24 passes, more accurate)
 NUM_WORKERS = 10
 PIN_MEMORY = True
 PREFETCH_FACTOR = 3
@@ -195,9 +196,9 @@ STAGE1 = dict(
     polygon_min_area_px={'building': 80, 'road': 120, 'waterbody': 160},
     polygon_simplify_tolerance=0.5,
     crf_inference=True,
-    crf_iter=5,
+    crf_iter=10,
     neg_tile_ratio=0.15,
-    min_fg_ratio=0.003,   # minimum foreground fraction to keep a patch
+    min_fg_ratio=0.01,    # minimum foreground fraction to keep a patch
 )
 # --- Stage 2A: Rooftop Classification ---
 STAGE2A = dict(
@@ -215,9 +216,10 @@ STAGE2A = dict(
     label_smoothing=0.05,
     mixup_alpha=0.4,
     cutmix_alpha=1.0,
-    weight_decay=1e-1,
+    weight_decay=1e-4,
     grad_accum=1,
     tta_steps=24,
+    stage2a_conf_thresh={'RCC': 0.45, 'Tiled': 0.55, 'Tin': 0.50, 'Other': 0.40},
     use_arcface=True,
     arcface_s=30.0,
     arcface_m=0.55,
@@ -267,7 +269,7 @@ STAGE2B = dict(
     overlap=512,
     class_buffer_px={'transformer': 100, 'overhead_tank': 80, 'well': 40},
     neg_tile_ratio=0.3,
-    soft_nms_sigma=0.9,
+    soft_nms_sigma=0.5,
     agnostic_nms=True,
     use_sahi=True,
     sahi_slice_size=640,
@@ -275,6 +277,6 @@ STAGE2B = dict(
     class_conf_thresh={
         'transformer': 0.20,
         'overhead_tank': 0.12,
-        'well': 0.03,
+        'well': 0.10,
     },
 )
