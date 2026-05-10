@@ -280,8 +280,7 @@ def train_stage1(resume: bool = True, use_wandb: bool = True):
                 if ema:
                     ema.update(module)
             else:
-                with amp_ctx:
-                    loss = _forward()
+                loss = _forward()
                 loss.backward()
 
                 if (step + 1) % grad_accum == 0:
@@ -354,7 +353,14 @@ def train_stage1(resume: bool = True, use_wandb: bool = True):
             _save_last(module=module, ema=ema, optimiser=optimiser, scheduler=scheduler,
                        epoch=epoch, best_miou=best_miou, no_improv=no_improv, cfg=cfg, path=last_ckpt_path)
 
-        if no_improv >= patience:
+        # Broadcast early-stop decision from rank-0 so worker ranks don't hang
+        do_early_stop = is_main_process(ddp) and (no_improv >= patience)
+        if ddp.enabled:
+            import torch.distributed as dist
+            stop_tensor = torch.tensor(int(do_early_stop), device=device)
+            dist.broadcast(stop_tensor, src=0)
+            do_early_stop = bool(stop_tensor.item())
+        if do_early_stop:
             log.info(f"  Early stop at epoch {epoch}")
             break
 

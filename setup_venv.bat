@@ -1,124 +1,239 @@
 @echo off
 REM ═══════════════════════════════════════════════════════════════════════════
-REM  Geo-Intel A4000 Pipeline — Virtual Environment Setup
-REM  Run ONCE from inside the geo_intel_a4000 folder:
-REM      cd geo_intel_a4000
-REM      setup_venv.bat
+REM  Geo-Intel Pipeline — Setup (Windows)
+REM
+REM  Auto-detects and selects the correct PyTorch requirements file:
+REM    NVIDIA CUDA 12.x  →  requirements-torch-cuda.txt   (cu121)
+REM    NVIDIA CUDA 11.x  →  requirements-torch-cuda11.txt  (cu118)
+REM    CPU / no GPU      →  requirements-torch-cpu.txt
+REM
+REM  Options:
+REM    setup_venv.bat [--cpu] [--cuda VER]
+REM    --cpu        Force CPU-only install
+REM    --cuda VER   Force CUDA version  (e.g. --cuda 12.1  or  --cuda 11.8)
 REM ═══════════════════════════════════════════════════════════════════════════
 setlocal enabledelayedexpansion
 
+set FORCE_CPU=0
+set "FORCE_CUDA="
+
+:parse_args
+if "%~1"=="" goto args_done
+if /i "%~1"=="--cpu"  (set FORCE_CPU=1 & shift & goto parse_args)
+if /i "%~1"=="--cuda" (set "FORCE_CUDA=%~2" & shift & shift & goto parse_args)
+echo [warn] Unknown flag: %~1
+shift
+goto parse_args
+:args_done
+
 echo.
-echo ╔══════════════════════════════════════════════════════════╗
-echo ║      Geo-Intel A4000 — Environment Setup                ║
-echo ╚══════════════════════════════════════════════════════════╝
+echo   ========================================
+echo     Geo-Intel Pipeline - Setup (Windows)
+echo   ========================================
 echo.
 
+REM ── 1/6  Check Python ──────────────────────────────────────────────────────
+echo [1/6] Checking Python...
 python --version >nul 2>&1
-if errorlevel 1 ( echo [ERROR] Python not found. Install 3.10/3.11 from python.org & pause & exit /b 1 )
-for /f "tokens=2" %%v in ('python --version 2^>^&1') do set PYVER=%%v
-echo [OK] Python %PYVER%
+if errorlevel 1 (
+    echo [ERROR] Python 3.10+ not found.  https://python.org
+    pause & exit /b 1
+)
+for /f "tokens=2" %%v in ('python --version 2^>^&1') do set "PYVER=%%v"
+echo   Python %PYVER%
 
+REM ── 2/6  Virtual environment ────────────────────────────────────────────────
 echo.
-echo [1/7] Creating venv ...
-if exist venv ( echo       Already exists. ) else (
+echo [2/6] Setting up virtual environment...
+if exist venv\ (
+    echo   Using existing venv
+) else (
     python -m venv venv
-    if errorlevel 1 ( echo [ERROR] venv failed & pause & exit /b 1 )
-    echo [OK] Created.
+    if errorlevel 1 ( echo [ERROR] venv creation failed & pause & exit /b 1 )
+    echo   Created venv
+)
+call venv\Scripts\activate.bat
+python -m pip install --upgrade pip setuptools wheel --quiet
+echo   pip upgraded
+
+REM ── 3/6  Detect accelerator — select the right torch requirements file ──────
+echo.
+echo [3/6] Detecting accelerator...
+
+set "TORCH_FILE=requirements-torch-cpu.txt"
+set "TORCH_URL="
+set "TORCH_LABEL=CPU (no GPU detected)"
+
+REM ── Forced CPU ──────────────────────────────────────────────────────────────
+if %FORCE_CPU%==1 (
+    set "TORCH_LABEL=CPU (forced)"
+    goto torch_selected
 )
 
-echo.
-echo [2/7] Activating ...
-call venv\Scripts\activate.bat
-echo [OK] Active.
+REM ── Forced CUDA ─────────────────────────────────────────────────────────────
+if not "!FORCE_CUDA!"=="" (
+    for /f "tokens=1 delims=." %%m in ("!FORCE_CUDA!") do set "CUDA_MAJ=%%m"
+    if !CUDA_MAJ! GEQ 12 (
+        set "TORCH_FILE=requirements-torch-cuda.txt"
+    ) else (
+        set "TORCH_FILE=requirements-torch-cuda11.txt"
+    )
+    set "TORCH_LABEL=NVIDIA CUDA !FORCE_CUDA! (forced)"
+    goto torch_selected
+)
 
-echo.
-echo [3/7] Upgrading pip ...
-python -m pip install --upgrade pip setuptools wheel --quiet
-echo [OK] Done.
+REM ── Auto-detect NVIDIA GPU ──────────────────────────────────────────────────
+nvidia-smi >nul 2>&1
+if not errorlevel 1 (
+    python -c "import subprocess,re;r=subprocess.run(['nvidia-smi'],capture_output=True,text=True);m=re.search(r'CUDA Version: (\d+)',r.stdout);print(m.group(1) if m else '0')" >"%TEMP%\geo_cuda.txt" 2>nul
+    set /p CUDA_MAJ=<"%TEMP%\geo_cuda.txt"
+    del "%TEMP%\geo_cuda.txt" 2>nul
 
-echo.
-echo [4/7] Installing PyTorch 2.x + CUDA 12.1 (~2.5 GB) ...
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-if errorlevel 1 ( echo [ERROR] PyTorch failed. & pause & exit /b 1 )
-python -c "import torch; ok=torch.cuda.is_available(); print('  CUDA:', ok, '|', torch.cuda.get_device_name(0) if ok else 'N/A')"
+    if "!CUDA_MAJ!"=="" set "CUDA_MAJ=0"
+    if !CUDA_MAJ! GEQ 12 (
+        set "TORCH_FILE=requirements-torch-cuda.txt"
+        set "TORCH_LABEL=NVIDIA CUDA !CUDA_MAJ!.x (detected)"
+    ) else if !CUDA_MAJ! GEQ 11 (
+        set "TORCH_FILE=requirements-torch-cuda11.txt"
+        set "TORCH_LABEL=NVIDIA CUDA !CUDA_MAJ!.x (detected → cu118)"
+    ) else (
+        set "TORCH_LABEL=NVIDIA GPU (CUDA detection failed — using CPU)"
+    )
+)
 
+:torch_selected
+echo   !TORCH_LABEL!
+if not "!TORCH_FILE!"==""   echo   Using: !TORCH_FILE!
+if not "!TORCH_URL!"==""    echo   Using: !TORCH_URL!
+
+REM ── 4/6  Install PyTorch ────────────────────────────────────────────────────
 echo.
-echo [5/7] Installing geospatial stack ...
-echo       Checking for conda (needed for ECW support) ...
+echo [4/6] Installing PyTorch...
+if not "!TORCH_URL!"=="" (
+    pip install torch torchvision torchaudio --index-url "!TORCH_URL!" --quiet
+) else (
+    pip install -r "!TORCH_FILE!" --quiet
+)
+if errorlevel 1 ( echo [ERROR] PyTorch installation failed & pause & exit /b 1 )
+
+python -c "
+import torch
+d = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f'  torch {torch.__version__}  device={d}')
+if d == 'cuda':
+    print(f'  GPU:  {torch.cuda.get_device_name(0)}')
+    print(f'  VRAM: {torch.cuda.get_device_properties(0).total_memory/1024**3:.1f} GB')
+"
+echo   PyTorch ready
+
+REM ── 5/6  Geospatial stack ───────────────────────────────────────────────────
+echo.
+echo [5/6] Installing geospatial stack...
 conda --version >nul 2>&1
-if errorlevel 1 (
-    echo       Conda not found — using pip.
-    pip install rasterio fiona geopandas --quiet 2>nul
+if not errorlevel 1 (
+    echo   conda found - installing with ECW support
+    conda install -c conda-forge libgdal-ecw rasterio fiona geopandas --yes --quiet 2>nul
+    if errorlevel 1 conda install -c conda-forge rasterio fiona geopandas --yes --quiet
+    echo   Installed via conda
+) else (
+    echo   conda not found - using pip
+    pip install rasterio fiona geopandas --quiet
     if errorlevel 1 (
-        echo       Trying pre-built wheels ...
-        pip install rasterio --find-links https://github.com/cgohlke/geospatial-wheels/releases --quiet
-        pip install fiona     --find-links https://github.com/cgohlke/geospatial-wheels/releases --quiet
+        echo   Retrying with pre-built wheels...
+        pip install rasterio fiona --find-links https://github.com/cgohlke/geospatial-wheels/releases --quiet
         pip install geopandas --quiet
     )
-) else (
-    echo       Conda found — installing with ECW support ...
-    conda install -c conda-forge libgdal-ecw rasterio fiona geopandas --yes --quiet
-    echo [OK] Geospatial + ECW installed.
+    echo   Installed via pip
 )
 
+REM ── 6/6  Pipeline dependencies + CRF + verify ───────────────────────────────
 echo.
-echo [6/7] Installing ML packages ...
-pip install ^
-    segmentation-models-pytorch>=0.3.3 ^
-    timm>=0.9.12 ^
-    ultralytics>=8.1.0 ^
-    shapely>=2.0.3 pyproj>=3.6.1 ^
-    albumentations>=1.4.0 opencv-python>=4.9.0 Pillow>=10.2.0 ^
-    numpy>=1.26.0 pandas>=2.1.0 scipy>=1.12.0 scikit-learn>=1.4.0 ^
-    tqdm>=4.66.1 pyyaml>=6.0.1 matplotlib>=3.8.0 tensorboard>=2.16.0 ^
-    dbfread lxml --quiet
-if errorlevel 1 ( echo [ERROR] Some packages failed. & pause & exit /b 1 )
-echo [OK] Done.
+echo [6/6] Installing pipeline dependencies (requirements.txt)...
+pip install -r requirements.txt --quiet
+if errorlevel 1 (
+    echo   onnxruntime-gpu unavailable - retrying with CPU onnxruntime
+    findstr /v "onnxruntime" requirements.txt > "%TEMP%\geo_reqs.txt"
+    pip install -r "%TEMP%\geo_reqs.txt" --quiet
+    pip install onnxruntime --quiet 2>nul
+    del "%TEMP%\geo_reqs.txt" 2>nul
+)
+echo   Dependencies installed
 
 echo.
-echo [7/7] pydensecrf2 (optional) ...
+echo   pydensecrf2 (optional CRF)...
 pip install pydensecrf2 --quiet 2>nul
-if errorlevel 1 ( echo       Not available — CRF skipped automatically. ) else ( echo [OK] Installed. )
+if errorlevel 1 ( echo   Skipped - CRF will be disabled ) else ( echo   Installed )
 
+REM ── Verify ──────────────────────────────────────────────────────────────────
 echo.
-echo       Checking ECW driver ...
+echo   Checking ECW...
 python -c "
 try:
     from osgeo import gdal
-    d=[gdal.GetDriver(i).ShortName for i in range(gdal.GetDriverCount())]
-    print('  ECW driver:', 'YES' if 'ECW' in d else 'NO — run: conda install -c conda-forge libgdal-ecw')
-except: print('  ECW: cannot check')
+    n = [gdal.GetDriver(i).ShortName for i in range(gdal.GetDriverCount())]
+    print('  ECW driver:', 'YES' if 'ECW' in n else 'NO (conda install -c conda-forge libgdal-ecw)')
+except Exception as e:
+    print('  ECW: cannot check -', e)
 "
 
 echo.
-echo ════════════════════════════════════════════════════════════
-echo  Summary
-echo ════════════════════════════════════════════════════════════
+echo   ========================================
+echo     Verification
+echo   ========================================
 python -c "
-import torch, cv2, numpy, albumentations, segmentation_models_pytorch, timm, rasterio, geopandas, ultralytics
-p = torch.cuda.get_device_properties(0) if torch.cuda.is_available() else None
-items = [
-    ('torch',    torch.__version__),
-    ('CUDA',     str(torch.cuda.is_available())),
-    ('GPU',      p.name if p else 'N/A'),
-    ('VRAM',     f'{p.total_memory/1024**3:.1f} GB' if p else 'N/A'),
-    ('rasterio', rasterio.__version__),
-    ('geopandas',geopandas.__version__),
-    ('timm',     timm.__version__),
-    ('ultralytics', ultralytics.__version__),
-]
-[print(f'  {k:<20} {v}') for k,v in items]
+import importlib, torch
+ok, fail = [], []
+
+try:
+    import torch; ok.append(('torch', torch.__version__))
+    d = 'cuda' if torch.cuda.is_available() else 'cpu'
+    ok.append(('device', d))
+    if d == 'cuda':
+        ok.append(('GPU', torch.cuda.get_device_name(0)))
+        p = torch.cuda.get_device_properties(0)
+        ok.append(('VRAM', f'{p.total_memory/1024**3:.1f} GB'))
+except Exception as e: fail.append(('torch', str(e)))
+
+for pkg, attr in [('timm','__version__'),('ultralytics','__version__'),
+                   ('segmentation_models_pytorch','__version__'),
+                   ('cv2','__version__'),('albumentations','__version__')]:
+    try:
+        m = importlib.import_module(pkg); ok.append((pkg, getattr(m, attr)))
+    except Exception as e: fail.append((pkg, str(e)))
+
+for pkg in ['rasterio','geopandas','shapely','pyproj']:
+    try:
+        m = importlib.import_module(pkg); ok.append((pkg, m.__version__))
+    except Exception as e: fail.append((pkg, str(e)))
+
+for pkg, attr in [('numpy','__version__'),('pandas','__version__'),
+                   ('PyQt6','QtCore.PYQT_VERSION_STR'),('matplotlib','__version__'),
+                   ('tensorboard','__version__'),('onnx','__version__')]:
+    try:
+        m = importlib.import_module(pkg)
+        v = getattr(m, attr, None)
+        if callable(v): v = v()
+        ok.append((pkg, v or getattr(m, '__version__', '?')))
+    except Exception as e: fail.append((pkg, str(e)))
+
+try:
+    import wandb; ok.append(('wandb', wandb.__version__))
+except: pass
+
+print()
+for k, v in ok:   print(f'  {k:<30} {v}')
+for k, v in fail: print(f'  {k:<30} MISSING ({v})')
+if fail: import sys; sys.exit(1)
 "
+
 echo.
-echo ════════════════════════════════════════════════════════════
-echo  Setup complete!
+echo   ========================================
+echo     Setup complete!
 echo.
-echo  Next steps:
-echo    1. Activate next time: activate.bat
-echo    2. Preprocess your data:
-echo       python run_pipeline.py --mode preprocess --data_root C:\Users\Vikram\Downloads\dataset
-echo    3. Train:
-echo       python run_pipeline.py --mode train_all
-echo ════════════════════════════════════════════════════════════
+echo     Activate venv :  venv\Scripts\activate.bat
+echo     Launch GUI    :  python gui.py
+echo     Preprocess    :  python run_pipeline.py --mode preprocess --data_root .\dataset
+echo     Train         :  python run_pipeline.py --mode train_all
+echo   ========================================
 echo.
 pause

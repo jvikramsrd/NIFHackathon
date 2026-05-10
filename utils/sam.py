@@ -44,23 +44,23 @@ class SAM(torch.optim.Optimizer):
         defaults = dict(rho=rho, adaptive=adaptive)
         super().__init__(base_optimizer.param_groups, defaults)
         self._base = base_optimizer
-        self._param_groups = self._base.param_groups
         self.defaults.update(self._base.defaults)
 
     @torch.no_grad()
     def first_step(self, zero_grad: bool = False) -> None:
         """Ascent step: add rho-scaled worst-case gradient perturbation."""
-        grad_norm = _grad_norm(self._param_groups)
+        grad_norm = _grad_norm(self.param_groups)
         # Clamp scale so the perturbation cannot explode when grad_norm ≈ 0
         # (e.g. first step of a frozen backbone or after gradient zeroing).
         scale = (self.defaults["rho"] / (grad_norm + 1e-12)).clamp(max=0.2)
 
-        for group in self._param_groups:
+        for group in self.param_groups:
             for p in group["params"]:
                 if p.grad is None:
                     continue
                 p_state = self.state[p]
                 p_state["old_p"] = p.data.clone()
+                # group["adaptive"] is merged from SAM defaults via super().__init__
                 e_w = (torch.pow(p, 2) if group["adaptive"] else 1.0) * p.grad * scale
                 p.add_(e_w)  # w + epsilon
 
@@ -70,7 +70,7 @@ class SAM(torch.optim.Optimizer):
     @torch.no_grad()
     def second_step(self, zero_grad: bool = False) -> None:
         """Descent step: restore original weights and take the real gradient step."""
-        for group in self._param_groups:
+        for group in self.param_groups:
             for p in group["params"]:
                 if p.grad is None:
                     continue

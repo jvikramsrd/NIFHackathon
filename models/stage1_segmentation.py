@@ -328,6 +328,7 @@ def tta_predict(
     Scales: 0.875× (see larger buildings), 1.0× (base), 1.25× (see fine texture).
     Returns (B, C, H, W) softmax probabilities.
     """
+    was_training = model.training
     model.eval()
     B, C_in, H, W = image.shape
     probs_sum = torch.zeros((B, num_classes, H, W), device=image.device, dtype=torch.float32)
@@ -340,7 +341,7 @@ def tta_predict(
             aug = torch.rot90(img, k % 4, dims=[2, 3])
             if k >= 4:
                 aug = torch.flip(aug, [3])
-            with torch.amp.autocast("cuda", dtype=amp_dtype):
+            with torch.amp.autocast(image.device.type, dtype=amp_dtype):
                 raw = model(aug)
                 # Handle deep supervision list from UNet++
                 if isinstance(raw, (list, tuple)):
@@ -366,6 +367,8 @@ def tta_predict(
             img_s = image
         _run_scale(img_s, weight, n_augs_per_scale)
 
+    if was_training:
+        model.train()
     return probs_sum / max(total_weight, 1e-6)
 
 
@@ -403,16 +406,21 @@ class Stage1Module(nn.Module):
 
     @torch.no_grad()
     def predict(self, images, use_tta=False, amp_dtype=torch.bfloat16, fast_tta=True):
+        was_training = self.training
         self.eval()
         if use_tta:
-            return tta_predict(
+            result = tta_predict(
                 self.model,
                 images,
                 self.cfg["num_classes"],
                 amp_dtype,
                 fast_tta=fast_tta,
             ).argmax(1)
-        raw = self.model(images)
-        if isinstance(raw, (list, tuple)):
-            raw = raw[0]
-        return raw.argmax(1)
+        else:
+            raw = self.model(images)
+            if isinstance(raw, (list, tuple)):
+                raw = raw[0]
+            result = raw.argmax(1)
+        if was_training:
+            self.train()
+        return result

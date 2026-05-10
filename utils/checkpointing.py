@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,9 @@ def atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-    torch.save(payload, tmp_path)
+    with open(tmp_path, "wb") as f:
+        torch.save(payload, f)
+        f.flush()
+        os.fsync(f.fileno())
     tmp_path.replace(path)
     log.debug("Checkpoint saved: %s", path)

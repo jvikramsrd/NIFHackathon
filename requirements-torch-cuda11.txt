@@ -1,0 +1,10 @@
+# NVIDIA GPU — CUDA 11.8 (GTX 10xx / 20xx series, older Quadro / Tesla)
+# Install with:
+#   pip install -r requirements-torch-cuda11.txt
+#
+# For CUDA 12.x or newer GPUs, use requirements-torch-cuda.txt instead.
+
+--index-url https://download.pytorch.org/whl/cu118
+torch>=2.2.0
+torchvision>=0.17.0
+torchaudio>=2.2.0

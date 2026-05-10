@@ -66,13 +66,12 @@ def _process_crf_tile(args):
     # --- EXPERT ADDITION: Texture-Aware Pairwise Bilateral ---
     # Calculate local gradient variance (using Sobel filters on the RGB image)
     log.debug("  [DEBUG CRF] Calculating local texture variance for boundary weighting...")
-    # Simple L2 norm of the gradient across channels as a proxy for texture evidence
-    sobel_r = cv2.Sobel(image_rgb, cv2.CV_64F, 1, 0, ksize=3)
-    sobel_g = cv2.Sobel(image_rgb, cv2.CV_64F, 0, 1, ksize=3)
-    sobel_b = cv2.Sobel(image_rgb, cv2.CV_64F, 0, 0, ksize=3)
-    texture_evidence = np.sqrt(sobel_r**2 + sobel_g**2 + sobel_b**2)
-    # Normalize texture evidence to scale it correctly for the pair-wise term
-    texture_evidence = cv2.normalize(texture_evidence, None, 1.0, 0.0, cv2.NORM_MINMAX)
+    # Gradient magnitude across channels as a proxy for texture evidence
+    sobel_x = cv2.Sobel(image_rgb, cv2.CV_64F, 1, 0, ksize=3)
+    sobel_y = cv2.Sobel(image_rgb, cv2.CV_64F, 0, 1, ksize=3)
+    texture_evidence = np.sqrt(sobel_x**2 + sobel_y**2)
+    # Normalize: min→0, max→1 so stronger edges get higher bilateral weight
+    texture_evidence = cv2.normalize(texture_evidence, None, 0.0, 1.0, cv2.NORM_MINMAX)
 
     log.debug("  [DEBUG CRF] Building per-class bilateral compat matrix...")
     # Per-class compatibility matrix: heavier penalty for class confusions that
