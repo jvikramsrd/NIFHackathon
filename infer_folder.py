@@ -1,27 +1,39 @@
 import argparse
 import os
 import sys
-import traceback
 from pathlib import Path
+
+# Must be first so all project-relative imports below resolve correctly
+sys.path.insert(0, str(Path(__file__).parent))
+
+import tempfile
+
 from utils.logger import get_logger
 
 log = get_logger(__name__)
 
-
-# Ensure the root directory is in sys.path so internal imports work correctly
-sys.path.insert(0, str(Path(__file__).parent))
 import config as CFG
 from inference.pipeline import GeoIntelPipeline
+from utils.ecw_compat import ecw_to_tif, is_ecw
 
 
 def infer_folder(test_folder: str, out_base_dir: str):
     test_folder_path = Path(test_folder)
     out_base_path = Path(out_base_dir)
 
-    # 1. Find all TIF files in the folder (including subdirectories)
-    tifs = list(test_folder_path.rglob("*.tif")) + list(
-        test_folder_path.rglob("*.tiff")
-    )
+    # 1. Find all raster files in the folder (including subdirectories)
+    RASTER_GLOBS = ("*.tif", "*.tiff", "*.ecw", "*.TIF", "*.TIFF", "*.ECW")
+    rasters = []
+    for pattern in RASTER_GLOBS:
+        rasters.extend(test_folder_path.rglob(pattern))
+    # Deduplicate (case-insensitive globs on Windows can overlap)
+    seen = set()
+    tifs = []
+    for r in rasters:
+        key = str(r).lower()
+        if key not in seen:
+            seen.add(key)
+            tifs.append(r)
 
     # Filter out common non-image spatial files (like ArcGIS overviews)
     tifs = [
@@ -31,7 +43,7 @@ def infer_folder(test_folder: str, out_base_dir: str):
     ]
 
     if not tifs:
-        log.info(f"[WARN] No .tif or .tiff files found in {test_folder}")
+        log.warning("No raster files (.tif, .tiff, .ecw) found in %s", test_folder)
         return
 
     log.info(f"\nFound {len(tifs)} image(s) to process in '{test_folder}'.")
@@ -45,34 +57,51 @@ def infer_folder(test_folder: str, out_base_dir: str):
             str(CFG.CKPT_DIR / f"stage2b_{CFG.STAGE2B['model_variant']}" / "weights" / "best.pt"),
         )
     except Exception as e:
-        log.info(
-            f"\n[FATAL ERROR] Failed to load models! Ensure training has finished and checkpoints exist."
+        log.error(
+            "Failed to load models — ensure training has finished and checkpoints exist.\n"
+            "Error: %s", e, exc_info=True
         )
-        log.info(f"Error details: {e}")
         return
 
     # 3. Process each image sequentially
     successful = 0
     failed = 0
 
-    for i, tif in enumerate(tifs, 1):
-        log.info(f"\n[{i}/{len(tifs)}] {'=' * 55}")
-        log.info(f"Processing Image : {tif.name}")
-        log.info(f"Source Path      : {tif}")
+    with tempfile.TemporaryDirectory(prefix="geointel_ecw_") as _tmp:
+        tmp_dir = Path(_tmp)
 
-        # Create a unique output subfolder for this specific TIF
-        out_dir = out_base_path / tif.stem
-        os.makedirs(out_dir, exist_ok=True)
+        for i, raster in enumerate(tifs, 1):
+            log.info(f"\n[{i}/{len(tifs)}] {'=' * 55}")
+            log.info(f"Processing Image : {raster.name}")
+            log.info(f"Source Path      : {raster}")
 
-        try:
-            # Run the 3-stage pipeline on the image
-            pipe.run(str(tif), str(out_dir))
-            log.info(f"[*] Done! Results saved to: {out_dir}")
-            successful += 1
-        except Exception as e:
-            log.info(f"\n[ERROR] Failed to process {tif.name}!")
-            traceback.print_exc()
-            failed += 1
+            # Create a unique output subfolder for this specific file
+            out_dir = out_base_path / raster.stem
+            os.makedirs(out_dir, exist_ok=True)
+
+            # Convert ECW → TIF if needed (deleted after this image is done)
+            process_path = raster
+            converted_tif = None
+            if is_ecw(raster):
+                try:
+                    converted_tif = ecw_to_tif(raster, tmp_dir)
+                    process_path = converted_tif
+                except RuntimeError as ecw_err:
+                    log.error("ECW conversion failed for %s: %s", raster.name, ecw_err)
+                    failed += 1
+                    continue
+
+            try:
+                pipe.run(str(process_path), str(out_dir))
+                log.info(f"[*] Done! Results saved to: {out_dir}")
+                successful += 1
+            except Exception as e:
+                log.error("Failed to process %s: %s", raster.name, e, exc_info=True)
+                failed += 1
+            finally:
+                # Clean up converted TIF immediately to free disk space
+                if converted_tif and converted_tif.exists():
+                    converted_tif.unlink(missing_ok=True)
 
     log.info(f"\n{'=' * 65}")
     log.info("  BATCH INFERENCE COMPLETE")
@@ -85,12 +114,12 @@ def infer_folder(test_folder: str, out_base_dir: str):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
-        description="Run full GeoIntel inference on a directory of TIF images."
+        description="Run full GeoIntel inference on a directory of raster images (.tif, .tiff, .ecw)."
     )
     ap.add_argument(
         "--test_folder",
         required=True,
-        help="Path to the folder containing testing TIFs (e.g., 'C:/Users/Dell/Downloads/test_images')",
+        help="Path to the folder containing raster files (.tif, .tiff, .ecw) (e.g., 'C:/Users/Dell/Downloads/test_images')",
     )
     ap.add_argument(
         "--out_folder",

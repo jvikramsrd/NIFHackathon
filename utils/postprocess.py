@@ -165,13 +165,13 @@ def apply_dense_crf(
                 )
             )
 
-    log.info(f"[DEBUG CRF] Created {len(tasks)} tasks. Starting loop...")
+    log.debug("[DEBUG CRF] Created %d tasks. Starting loop...", len(tasks))
     refined_map = np.zeros_like(prob_map)
     weight_map = np.zeros((H, W), dtype=np.float32)
 
     for i, t in enumerate(tqdm(tasks, desc="  CRF tiles")):
-        log.info(
-            f"  [DEBUG CRF] Submitting task {i + 1}/{len(tasks)} (r={t[-2]}, c={t[-1]})"
+        log.debug(
+            "  [DEBUG CRF] Submitting task %d/%d (r=%s, c=%s)", i + 1, len(tasks), t[-2], t[-1]
         )
         res, r, c, th, tw = _process_crf_tile(t)
         log.debug(f"  [DEBUG CRF] Task {i + 1} completed")

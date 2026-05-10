@@ -213,7 +213,7 @@ def train_stage2a(resume: bool = True, use_wandb: bool = True):
             optimiser.load_state_dict(state["optimizer_state"])
             scheduler.load_state_dict(state["scheduler_state"])
         except Exception as e:
-            log.info(f"      [WARN] Skipping optimizer load: {e}")
+            log.warning("Skipping optimizer load: %s", e)
         best_acc = float(state.get("best_acc", 0.0))
         no_improv = int(state.get("no_improv", 0))
         start_epoch = int(state.get("epoch", 0)) + 1
@@ -499,7 +499,7 @@ def _write_yolo_yaml() -> str:
     import geopandas as gpd
 
     canonical_classes = set()
-    log.info("  [DEBUG] Scanning dataset for dynamic YOLO classes...")
+    log.debug("Scanning dataset for dynamic YOLO classes...")
     try:
         for shp_path in CFG.DATA_ROOT.rglob("*.shp"):
             if shp_path.name.startswith(

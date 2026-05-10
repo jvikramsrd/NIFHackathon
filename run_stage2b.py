@@ -96,7 +96,7 @@ def extract_infra_data(data_dirs: list):
                 total_infra += n
                 log.info(f"    → {n} infrastructure objects extracted")
             except Exception as e:
-                log.info(f"    [ERROR] {e}")
+                log.error("Extraction failed: %s", e, exc_info=True)
                 continue
 
             gc.collect()
@@ -133,7 +133,7 @@ def prepare_yolo_dataset():
 
     all_imgs = sorted(imgs_dir.glob("*.png"))
     if len(all_imgs) < 2:
-        log.info(f"  [ERROR] Need at least 2 images, found {len(all_imgs)} in {imgs_dir}")
+        log.error("Need at least 2 images for train/val split, found %d in %s", len(all_imgs), imgs_dir)
         return ""
 
     # 15% validation split
@@ -331,8 +331,7 @@ Examples:
             data_dirs = []
 
         if not data_dirs:
-            log.info(f"\n  [ERROR] No dataset folders found in {data_root}")
-            log.info(f"  Use --data-dir to specify the path to your data folder")
+            log.error("No dataset folders found in %s — use --data-dir to specify the path", data_root)
             sys.exit(1)
 
     log.info(f"\n  Data folders: {data_dirs}")
@@ -354,9 +353,7 @@ Examples:
         log.info("─" * 60)
         n = extract_infra_data(data_dirs)
         if n == 0:
-            log.info("\n  [ERROR] No infrastructure objects found. Check your Utility shapefiles.")
-            if not args.extract_only:
-                log.info("  Skipping training.")
+            log.error("No infrastructure objects found — check your Utility shapefiles")
             sys.exit(1)
 
     if args.extract_only:
@@ -370,7 +367,7 @@ Examples:
     clear_cuda_cache()
     data_yaml = prepare_yolo_dataset()
     if not data_yaml:
-        log.info("  [ERROR] Failed to create YOLO dataset")
+        log.error("Failed to create YOLO dataset")
         sys.exit(1)
 
     # ── Train ────────────────────────────────────────────────────────────

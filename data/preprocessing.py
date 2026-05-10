@@ -5,7 +5,7 @@ Handles the exact layout found in cg/ and pb/:
 
   dataset/cg/  or  dataset/pb/
     ├── VILLAGE_NAME_ORTHO.tif     ← one or more ortho rasters
-    ├── VILLAGE_NAME_3857.ecw      ← compressed duplicate → SKIPPED
+    ├── VILLAGE_NAME_3857.ecw      ← auto-converted to GeoTIFF at runtime
     ├── VILLAGE_NAME.tif.pyrx      ← pyramid overview    → SKIPPED
     ├── Built_Up_Area_type.shp     ← buildings (shared across all TIFs)
     ├── Road.shp                   ← roads
@@ -92,7 +92,7 @@ def scan_folder(folder: str) -> Tuple[List[Path], List[Path]]:
 
     Rules applied:
       • Skip .pyrx, .aux, .lock and all lock-pattern files
-      • Skip ECW if a same-stem TIF exists (prefer TIF — larger, uncompressed)
+      • Skip ECW if a same-stem TIF exists (prefer TIF; ECW-only folders are fully supported via auto-conversion)
       • Skip any file whose stem ends with .shp (sidecar XML)
       • Handle spaces and special chars correctly via pathlib
     """
@@ -534,7 +534,7 @@ def extract_infra_yolo(
 
             try:
                 pt = geom.centroid
-                px_row, px_col = ~transform * (pt.x, pt.y)
+                px_col, px_row = ~transform * (pt.x, pt.y)  # ~transform yields (col, row)
                 infra_pts.append((cid, int(px_col), int(px_row)))
                 total += 1
             except Exception:
@@ -860,10 +860,26 @@ def _process_single_raster(raster_path, shps, built_up_shp, utility_shps):
     cfg2b = config.STAGE2B
 
     log.info(f"\n  Processing {raster_path.name} on PID {os.getpid()}")
+
+    # Convert ECW → TIF in-process before opening (rasterio lacks ECW driver by default)
+    import tempfile as _tempfile
+    _ecw_tmp = None
+    if raster_path.suffix.lower() == ".ecw":
+        from utils.ecw_compat import ecw_to_tif
+        try:
+            _ecw_tmp = _tempfile.TemporaryDirectory(prefix="geointel_ecw_preproc_")
+            raster_path = ecw_to_tif(raster_path, Path(_ecw_tmp.name))
+        except RuntimeError as ecw_err:
+            log.info(str(ecw_err))
+            _ecw_tmp.cleanup()
+            return 0, 0, 0, 1
+
     try:
         H, W, crs, transform, meta, dtype, n_bands = _raster_info(raster_path)
     except Exception as e:
         log.info(f"    [SKIP] Cannot open {raster_path.name}: {e}")
+        if _ecw_tmp is not None:
+            _ecw_tmp.cleanup()
         return 0, 0, 0, 1  # patches, crops, infra, failed
 
     ram_gb = H * W * 3 / 1e9
@@ -1011,6 +1027,8 @@ def _process_single_raster(raster_path, shps, built_up_shp, utility_shps):
         )
 
     gc.collect()
+    if _ecw_tmp is not None:
+        _ecw_tmp.cleanup()
     return raster_patches, n_crops, n_infra, 0
 
 
@@ -1038,7 +1056,7 @@ def preprocess_folder(folder: str, config) -> Dict:
 
     rasters, shps = scan_folder(folder)
     if not rasters:
-        log.info(f"  [WARN] No rasters found in {folder}")
+        log.warning("No rasters found in %s", folder)
         return {"rasters": 0, "patches": 0, "crops": 0, "infra": 0}
 
     shp_by_stem = {s.stem.lower().rstrip("_"): s for s in shps}
@@ -1236,6 +1254,11 @@ def _extract_infra_streaming(
     id_to_name = {i: c.lower() for i, c in enumerate(class_names)}
     total = 0
 
+    # Per-raster prefix prevents label collisions when multiple TIFs share the
+    # same YOLO_DIR — without it, two rasters with an object at the same pixel
+    # offset would overwrite each other's tiles silently.
+    safe_prefix = re.sub(r"[^\w]", "_", raster_path.stem)[:40]
+
     try:
         with rasterio.open(str(raster_path)) as src:
             crs = src.crs
@@ -1340,7 +1363,7 @@ def _extract_infra_streaming(
             if tile is None or tile.size == 0 or 0 in tile.shape:
                 continue
 
-            name = f"infra_{tr:06d}_{tc:06d}"
+            name = f"{safe_prefix}_infra_{tr:06d}_{tc:06d}"
             cv2.imwrite(
                 str(Path(out_img_dir) / f"{name}.png"),
                 cv2.cvtColor(tile, cv2.COLOR_RGB2BGR),
@@ -1410,7 +1433,7 @@ def _extract_infra_streaming(
                 if tile.max() < 10:
                     continue
 
-                name = f"infra_neg_{rand_r:06d}_{rand_c:06d}"
+                name = f"{safe_prefix}_infra_neg_{rand_r:06d}_{rand_c:06d}"
                 cv2.imwrite(
                     str(Path(out_img_dir) / f"{name}.png"),
                     cv2.cvtColor(tile, cv2.COLOR_RGB2BGR),

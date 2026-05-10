@@ -8,7 +8,7 @@
 ## Pipeline Architecture
 
 ```
-INPUT: SVAMITVA drone orthophoto (GeoTIFF) + Annotation Shapefiles
+INPUT: SVAMITVA drone orthophoto (GeoTIFF / ECW) + Annotation Shapefiles
          │
          ▼
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -115,12 +115,24 @@ pip install -r requirements.txt
 
 **Geospatial stack** (rasterio / fiona / geopandas):
 ```bash
-# Recommended — handles ECW driver + correct GDAL binaries:
-conda install -c conda-forge libgdal-ecw rasterio fiona geopandas
-
-# Pip-only alternative (no ECW):
 pip install rasterio fiona geopandas
 ```
+
+**ECW support** (optional — needed only if your input imagery is `.ecw`):
+
+ECW is a proprietary Hexagon format that requires a special GDAL build. The pipeline auto-converts ECW → GeoTIFF at runtime using any of these backends (tried in order):
+
+1. **OSGeo4W** *(recommended on Windows, free)*
+   - Download: https://trac.osgeo.org/osgeo4w/ → Express Install → select **GDAL**
+   - The pipeline finds `C:\OSGeo4W\bin\gdal_translate.exe` automatically — no extra config needed
+
+2. **QGIS** — if already installed, its bundled `gdal_translate.exe` is used automatically
+
+3. **Native rasterio ECW driver** — works if your GDAL was compiled with the Hexagon SDK
+   (not available via standard pip/conda channels as of 2025 due to license restrictions)
+
+> `conda install -c conda-forge libgdal-ecw` will fail — this package was removed from conda-forge
+> because Hexagon's SDK cannot be freely redistributed. OSGeo4W is the easiest workaround.
 
 **Optional — dense CRF boundary refinement** (requires C++ build tools):
 ```bash
@@ -202,7 +214,7 @@ Tabs:
 ### CLI
 
 ```bash
-# Preprocess — strips TIFs, burns masks, generates crops + YOLO labels
+# Preprocess — strips rasters, burns masks, generates crops + YOLO labels
 python run_pipeline.py --mode preprocess --data_root ./dataset
 
 # Train all stages
@@ -211,10 +223,13 @@ python run_pipeline.py --mode train_all
 # Evaluate (writes outputs/results.json)
 python run_pipeline.py --mode evaluate
 
-# Inference on a new village
+# Inference on a single image (.tif, .tiff, or .ecw)
 python run_pipeline.py --mode infer \
   --tif "path/to/village.tif" \
   --out ./outputs/village_name
+
+# Batch inference on a folder (all .tif / .tiff / .ecw files)
+python infer_folder.py --test_folder "path/to/folder" --out_folder ./outputs/batch
 
 # End-to-end
 python run_pipeline.py --mode all --data_root ./dataset
@@ -222,8 +237,10 @@ python run_pipeline.py --mode all --data_root ./dataset
 
 On Windows, replace `python run_pipeline.py` with `run.bat`:
 ```
-run.bat --mode infer --tif "path\to\village.tif" --out .\outputs\village
+run.bat --mode infer --tif "path\to\village.ecw" --out .\outputs\village
 ```
+
+> ECW files are auto-converted to GeoTIFF at runtime (requires OSGeo4W or QGIS — see ECW support above).
 
 ### Build a binary locally
 
@@ -244,7 +261,8 @@ python build.py
 ```
 dataset/
 ├── cg/
-│   ├── village1.tif
+│   ├── village1.tif        ← GeoTIFF  ┐
+│   ├── village1.ecw        ← ECW      ┘ either format accepted
 │   ├── Built_Up_Area_type.shp   (+ .dbf, .shx, .prj)
 │   ├── Road.shp
 │   ├── Water_Body.shp
@@ -302,7 +320,8 @@ NIFHackathon/
 │   ├── postprocess.py             # DenseCRF, watershed, morphology, vectorisation
 │   ├── checkpointing.py           # Atomic checkpoint save/load
 │   ├── logger.py                  # Structured logging + crash recovery
-│   └── window.py                  # Cosine spline blending for tile stitching
+│   ├── window.py                  # Cosine spline blending for tile stitching
+│   └── ecw_compat.py              # ECW → GeoTIFF auto-conversion (rasterio / gdal_translate / osgeo)
 │
 └── tests/
     ├── test_config_values.py      # Config value assertions

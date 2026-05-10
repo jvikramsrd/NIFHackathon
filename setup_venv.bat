@@ -130,11 +130,24 @@ if not errorlevel 1 (
     echo   Installed via conda
 ) else (
     echo   conda not found - using pip
-    pip install rasterio fiona geopandas --quiet
+    pip install rasterio fiona geopandas --only-binary :all: --quiet
     if errorlevel 1 (
-        echo   Retrying with pre-built wheels...
-        pip install rasterio fiona --find-links https://github.com/cgohlke/geospatial-wheels/releases --quiet
+        echo   Binary install failed - trying GDAL wheel first...
+        for /f "tokens=1,2 delims=." %%a in ('python -c "import sys; print(sys.version_info.major, sys.version_info.minor)"') do set "PYVER_MAJ=%%a" & set "PYVER_MIN=%%b"
+        set "GDAL_WHL=GDAL-3.10.3-cp!PYVER_MAJ!!PYVER_MIN!-cp!PYVER_MAJ!!PYVER_MIN!-win_amd64.whl"
+        set "RASTERIO_WHL=rasterio-1.4.3-cp!PYVER_MAJ!!PYVER_MIN!-cp!PYVER_MAJ!!PYVER_MIN!-win_amd64.whl"
+        set "FIONA_WHL=Fiona-1.10.1-cp!PYVER_MAJ!!PYVER_MIN!-cp!PYVER_MAJ!!PYVER_MIN!-win_amd64.whl"
+        set "GOHLKE=https://github.com/cgohlke/geospatial-wheels/releases/download/v2025.1.25"
+        pip install "!GOHLKE!/!GDAL_WHL!" "!GOHLKE!/!RASTERIO_WHL!" "!GOHLKE!/!FIONA_WHL!" --quiet 2>nul
         pip install geopandas --quiet
+        if errorlevel 1 (
+            echo   [WARN] rasterio/fiona could not be installed automatically.
+            echo   Python !PYVER_MAJ!.!PYVER_MIN! may not have pre-built wheels yet.
+            echo   Options:
+            echo     1. Install via conda:  conda install -c conda-forge rasterio fiona
+            echo     2. Install OSGeo4W, then re-run this script
+            echo     3. Use Python 3.12: python3.12 -m venv venv
+        )
     )
     echo   Installed via pip
 )

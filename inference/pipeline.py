@@ -57,8 +57,7 @@ class GeoIntelPipeline:
         import config as CFG
         from data.dataset import get_clf_val_transforms, get_val_transforms
         from models.stage1_segmentation import Stage1Module
-        from models.stage2_models import RooftopClassifier
-        from train.train_stage2 import InfrastructureDetector
+        from models.stage2_models import InfrastructureDetector, RooftopClassifier
         from utils.hardware import (
             compile_model,
             get_amp_context,
@@ -112,12 +111,14 @@ class GeoIntelPipeline:
         log.info("✓ All models ready\n")
 
     def run(self, tif_path: str, out_dir: str):
+        import tempfile
         from pathlib import Path
 
         import numpy as np
         import rasterio
 
         import config as CFG
+        from utils.ecw_compat import ecw_to_tif, is_ecw
         from utils.hardware import clear_cuda_cache
         from utils.postprocess import (
             apply_dense_crf,
@@ -129,9 +130,17 @@ class GeoIntelPipeline:
 
         out_dir_p = Path(out_dir)
         out_dir_p.mkdir(parents=True, exist_ok=True)
-        prefix = Path(tif_path).stem
 
-        with rasterio.open(tif_path) as src:
+        # Convert ECW → TIF if the rasterio GDAL build lacks the ECW driver
+        _ecw_tmp_ctx = None
+        raster_path = Path(tif_path)
+        if is_ecw(raster_path):
+            _ecw_tmp_ctx = tempfile.TemporaryDirectory(prefix="geointel_ecw_")
+            raster_path = ecw_to_tif(raster_path, Path(_ecw_tmp_ctx.name))
+
+        prefix = raster_path.stem
+
+        with rasterio.open(str(raster_path)) as src:
             meta = src.meta.copy()
             crs = src.crs
             transform = src.transform
@@ -240,6 +249,9 @@ class GeoIntelPipeline:
             )
 
         log.info(f"\n✓ Done → {out_dir_p}")
+
+        if _ecw_tmp_ctx is not None:
+            _ecw_tmp_ctx.cleanup()
 
     # ── Stage 1 tiled inference ───────────────────────────────────────────────
 

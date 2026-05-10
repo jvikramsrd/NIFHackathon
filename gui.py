@@ -1027,7 +1027,7 @@ class PipelineTab(QWidget):
         iv.setSpacing(6)
 
         tif_row = QHBoxLayout()
-        lbl3 = QLabel("Input TIF")
+        lbl3 = QLabel("Input Raster")
         lbl3.setFixedWidth(72)
         self.tif_label = QLabel("(none selected)")
         self.tif_label.setObjectName("path_label")
@@ -1181,8 +1181,8 @@ class PipelineTab(QWidget):
 
     def _pick_tif(self):
         p, _ = QFileDialog.getOpenFileName(
-            self, "Select Input TIF", str(ROOT / "dataset"),
-            "GeoTIFF (*.tif *.tiff);;All files (*)",
+            self, "Select Input Raster", str(ROOT / "dataset"),
+            "Raster files (*.tif *.tiff *.ecw);;GeoTIFF (*.tif *.tiff);;ECW (*.ecw);;All files (*)",
         )
         if p:
             self.tif_label.setText(p)
@@ -1453,7 +1453,7 @@ class MapViewerTab(QWidget):
     def _open_tif(self):
         start = str(ROOT / "dataset")
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open GeoTIFF", start, "GeoTIFF (*.tif *.tiff);;All files (*)"
+            self, "Open Raster", start, "Raster files (*.tif *.tiff *.ecw);;GeoTIFF (*.tif *.tiff);;ECW (*.ecw);;All files (*)"
         )
         if not path:
             return
@@ -1783,14 +1783,30 @@ class RequirementsTab(QWidget):
     def _on_check_error(self, error):
         self._check_btn.setEnabled(True)
         self._set_pill("error", PAL["err"])
+        self._table.setRowCount(0)
+        err_row = QTableWidgetItem(self._proc.errorString())
+        err_row.setForeground(QColor(PAL["err"]))
+        self._table.insertRow(0)
+        self._table.setItem(0, 3, err_row)
 
     def _on_check_finished(self, exit_code: int, _status):
         self._check_btn.setEnabled(True)
         raw = self._proc.readAllStandardOutput().data().decode("utf-8", errors="replace").strip()
+        if exit_code != 0:
+            self._set_pill("check failed", PAL["err"])
+            self._table.setRowCount(1)
+            item = QTableWidgetItem(raw or f"Process exited with code {exit_code}")
+            item.setForeground(QColor(PAL["err"]))
+            self._table.setItem(0, 3, item)
+            return
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
             self._set_pill("parse error", PAL["err"])
+            self._table.setRowCount(1)
+            item = QTableWidgetItem(raw[:200] if raw else "Empty output from check script")
+            item.setForeground(QColor(PAL["err"]))
+            self._table.setItem(0, 3, item)
             return
 
         self._last_data = data
@@ -1936,7 +1952,10 @@ def _to_uint8(arr: np.ndarray) -> np.ndarray:
 
 def _set_pixmap(label: QLabel, rgb: np.ndarray):
     h, w = rgb.shape[:2]
-    img = QImage(rgb.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888)
+    # Keep _buf alive until QPixmap.fromImage() has copied the data.
+    # QImage wraps the buffer without copying, so the bytes object must not be GC'd first.
+    _buf = bytes(np.ascontiguousarray(rgb).data)
+    img = QImage(_buf, w, h, w * 3, QImage.Format.Format_RGB888)
     label.setPixmap(
         QPixmap.fromImage(img).scaled(
             label.size(),
