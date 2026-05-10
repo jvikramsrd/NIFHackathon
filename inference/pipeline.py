@@ -359,13 +359,19 @@ class GeoIntelPipeline:
                 )
 
             class_names_2a = [str(x) for x in CFG.STAGE2A["class_names"]]
+            per_class_thresh = CFG.STAGE2A.get(
+                "stage2a_conf_thresh",
+                {n: 0.55 for n in class_names_2a},
+            )
             max_probs, pids = torch.max(probs, dim=1)
 
             for i, i_idx in enumerate(indices):
-                if max_probs[i].item() < 0.55:
+                pred_name = class_names_2a[pids[i].item()]
+                thresh = per_class_thresh.get(pred_name, 0.55)
+                if max_probs[i].item() < thresh:
                     preds[i_idx] = "Other"
                 else:
-                    preds[i_idx] = class_names_2a[pids[i].item()]
+                    preds[i_idx] = pred_name
 
         for idx, row in tqdm(gdf.iterrows(), total=len(gdf), desc="  roofs"):
             geom = row.geometry
