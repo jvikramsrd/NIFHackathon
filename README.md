@@ -21,11 +21,11 @@ INPUT: SVAMITVA drone orthophoto (GeoTIFF) + Annotation Shapefiles
 │                 Instance-Touching Separation]                        │
 │  Inference    : 3-scale TTA (0.875×, 1.0×, 1.25×) × D4 symmetry     │
 │  Post-process : Watershed separation + DenseCRF + Morphology         │
-└──────────────────────────┬───────────────────────────────────────────┘
-                           │
-         ┌─────────────────┴─────────────────┐
-         │                                   │
-         ▼                                   ▼
+└──────────────────────┬───────────────────────────────────────────────┘
+                       │
+         ┌─────────────┴─────────────┐
+         │                           │
+         ▼                           ▼
 ┌────────────────────────┐     ┌──────────────────────────────┐
 │  STAGE 2A              │     │  STAGE 2B                    │
 │  Rooftop Classifier    │     │  Infrastructure Detector     │
@@ -53,18 +53,12 @@ Download the binary for your platform from the [GitHub Releases](../../releases)
 | Platform | File |
 |----------|------|
 | Windows 10/11 (x64) | `GeoIntel-windows-x64.zip` |
-| macOS 13+ Intel | `GeoIntel-macos-intel.zip` |
-| macOS 14+ Apple Silicon (M1/M2/M3/M4) | `GeoIntel-macos-arm64.zip` |
-| Linux x64 (Ubuntu 22.04+) | `GeoIntel-linux-x64.zip` |
 
 **The binary is only the GUI shell.** You still need a Python environment with PyTorch + pipeline deps installed (see Option B below) for training and inference. The GUI auto-detects your active Python.
 
 ```
 # After unzipping:
-
 Windows:    GeoIntel\GeoIntel.exe
-macOS:      open GeoIntel.app            (or GeoIntel/GeoIntel from terminal)
-Linux:      ./GeoIntel/GeoIntel
 ```
 
 ---
@@ -79,8 +73,8 @@ Linux:      ./GeoIntel/GeoIntel
 #### 1. Clone
 
 ```bash
-git clone https://github.com/your-org/geo-intel.git
-cd geo-intel
+git clone https://github.com/jvikramsrd/NIFHackathon.git
+cd NIFHackathon
 ```
 
 #### 2. Install PyTorch for your hardware
@@ -141,8 +135,8 @@ chmod +x install.sh
 ./install.sh
 ```
 
-**Windows** — auto-detects NVIDIA, prompts for manual ROCm install:
-```bash
+**Windows** — auto-detects NVIDIA CUDA 11/12, prompts for manual ROCm:
+```
 setup_venv.bat
 ```
 
@@ -186,9 +180,18 @@ This installs two console commands:
 
 ## Quick Start
 
+### Windows launchers (double-click)
+
+| File | Action |
+|------|--------|
+| `launch_gui.bat` | Open the Operator Console GUI |
+| `run.bat --mode ...` | CLI pipeline runner |
+
 ### Desktop GUI
 ```bash
 python gui.py
+# or on Windows:
+launch_gui.bat
 ```
 
 Tabs:
@@ -215,6 +218,11 @@ python run_pipeline.py --mode infer \
 
 # End-to-end
 python run_pipeline.py --mode all --data_root ./dataset
+```
+
+On Windows, replace `python run_pipeline.py` with `run.bat`:
+```
+run.bat --mode infer --tif "path\to\village.tif" --out .\outputs\village
 ```
 
 ### Build a binary locally
@@ -252,24 +260,25 @@ Column mappings (`type`, `road_type`, `Utility_Ty`, etc.) are in `config.py` →
 ## Project Structure
 
 ```
-geo-intel/
+NIFHackathon/
 ├── config.py                      # Hardware, paths, hyperparameters, class maps
 ├── run_pipeline.py                # Master CLI (preprocess/train/evaluate/infer)
 ├── gui.py                         # Desktop operator console (PyQt6)
-├── infer_folder.py                # Standalone inference script
-├── export_models.py               # ONNX export
+├── infer_folder.py                # Standalone batch inference script
+├── export_models.py               # ONNX export utility
 ├── build.py                       # Binary build script (PyInstaller)
 ├── geo_intel.spec                 # PyInstaller spec
 ├── pyproject.toml                 # pip-installable package definition
 ├── requirements.txt               # Base deps (no torch — platform-specific)
-├── requirements-torch-cuda.txt    # NVIDIA CUDA torch
+├── requirements-torch-cuda.txt    # NVIDIA CUDA 12.x torch
+├── requirements-torch-cuda11.txt  # NVIDIA CUDA 11.x torch
 ├── requirements-torch-rocm.txt    # AMD ROCm torch
 ├── requirements-torch-cpu.txt     # CPU / Apple MPS torch
 ├── install.sh                     # macOS + Linux one-shot installer
-├── setup_venv.bat                 # Windows one-shot installer
-│
-├── .github/workflows/
-│   └── release.yml                # CI: builds binaries for all 4 platforms on tag push
+├── setup_venv.bat                 # Windows one-shot setup
+├── launch_gui.bat                 # Windows — double-click to launch GUI
+├── run.bat                        # Windows — CLI wrapper for run_pipeline.py
+├── PROJECT_REFERENCE.md           # Full technical reference (all components)
 │
 ├── data/
 │   ├── preprocessing.py           # TIF slicing, SHP burning, YOLO label gen
@@ -281,8 +290,7 @@ geo-intel/
 │
 ├── train/
 │   ├── train_stage1.py            # SAM, EMA, SWA, grad checkpointing
-│   ├── train_stage2.py            # Classifier + YOLO training loops
-│   └── launch_ddp.py              # Multi-GPU DDP launcher
+│   └── train_stage2.py            # Classifier + YOLO training loops
 │
 ├── inference/
 │   └── pipeline.py                # Batched multi-stage inference + shapefile export
@@ -290,10 +298,9 @@ geo-intel/
 ├── utils/
 │   ├── hardware.py                # Multi-backend setup, AMP, EMA, VRAM stats
 │   ├── sam.py                     # Sharpness-Aware Minimisation optimiser
-│   ├── ddp.py                     # DistributedDataParallel utilities
 │   ├── metrics.py                 # mIoU, Dice, per-class IoU
 │   ├── postprocess.py             # DenseCRF, watershed, morphology, vectorisation
-│   ├── checkpointing.py           # Atomic checkpoint save
+│   ├── checkpointing.py           # Atomic checkpoint save/load
 │   ├── logger.py                  # Structured logging + crash recovery
 │   └── window.py                  # Cosine spline blending for tile stitching
 │
@@ -312,11 +319,18 @@ geo-intel/
 | Lovász-Softmax loss | 1 | Directly optimises mIoU |
 | Instance-touching separation loss | 1 | Prevents adjacent buildings merging |
 | Watershed instance separation | 1 | Clean split of touching footprints |
+| Percentile normalization (2nd–98th) | 1 | Robust to satellite radiometric outliers |
+| Full 192 px tile overlap | 1 | Eliminates border blending artefacts |
+| CRF 10 iterations | 1 | Boundary convergence (5 was insufficient) |
+| min_fg_ratio 0.01 | 1 train | Filters near-empty training patches |
 | ArcFace angular-margin head | 2A | Better RCC vs Tiled discrimination |
-| SAHI sliced inference | 2B | 640px slices — detects small wells at tile boundaries |
-| CosineAnnealingWarmRestarts | 1 | Periodic LR re-exploration (works with SAM) |
-| Road class weight 4.5× | 1 | Forces thin path connectivity |
+| ArcFace m=0.55 (from config) | 2A | Correct margin — was silently hardcoded 0.50 |
+| Per-class conf thresholds (Stage 2A) | 2A | RCC=0.45 / Tiled=0.55 / Tin=0.50 / Other=0.40 |
+| SAHI sliced inference | 2B | 640 px slices — detects small wells at tile edges |
 | SAHI overlap 40% | 2B | Larger context for boundary objects |
+| Soft-NMS σ=0.5 | 2B | Proper box suppression (was 0.9 — near-disabled) |
+| Well conf threshold 0.10 | 2B | Eliminates false-positive well flood (was 0.03) |
+| FAST_TTA flag | 1 | Toggle: 8-pass fast vs 24-pass accurate TTA |
 
 ---
 
@@ -324,16 +338,23 @@ geo-intel/
 
 All hyperparameters live in `config.py`:
 
-| Parameter | Default | Notes |
-|-----------|---------|-------|
+| Parameter | Value | Notes |
+|-----------|-------|-------|
 | `DEVICE` | auto | cuda → mps → cpu, auto-detected |
 | `AMP_DTYPE` | auto | bf16 (CUDA) · fp16 (MPS) · fp32 (CPU) |
+| `FAST_TTA` | `False` | True = 8 passes, False = 24 passes (more accurate) |
 | `STAGE1["encoder"]` | `mit_b5` | 84M params |
-| `STAGE1["batch_size"]` | `4` | Auto-halved when SAM + ≤16 GB VRAM |
-| `STAGE1["class_weights"]` | `[0.30,1.80,4.50,2.20]` | Road 4.5× |
-| `STAGE2A["arcface_m"]` | `0.55` | Angular margin |
-| `STAGE2B["sahi_overlap_ratio"]` | `0.40` | Slice overlap |
-| `STAGE2B["class_conf_thresh"]["well"]` | `0.03` | Low threshold for small objects |
+| `STAGE1["patch_size"]` | `512` | Training patch size |
+| `STAGE1["overlap"]` | `192` | Tile overlap for seamless stitching |
+| `STAGE1["batch_size"]` | `4` | ×8 grad accum = effective batch 32 |
+| `STAGE1["crf_iter"]` | `10` | CRF iterations at inference |
+| `STAGE1["class_weights"]` | `[0.30,1.80,4.50,2.20]` | Road 4.5× to force thin path connectivity |
+| `STAGE1["min_fg_ratio"]` | `0.01` | Drop training patches with <1% foreground |
+| `STAGE2A["arcface_m"]` | `0.55` | Angular margin for rooftop classification |
+| `STAGE2A["stage2a_conf_thresh"]` | per-class dict | RCC=0.45, Tiled=0.55, Tin=0.50, Other=0.40 |
+| `STAGE2B["sahi_overlap_ratio"]` | `0.40` | Slice overlap for SAHI inference |
+| `STAGE2B["soft_nms_sigma"]` | `0.5` | Gaussian NMS decay factor |
+| `STAGE2B["class_conf_thresh"]["well"]` | `0.10` | Minimum confidence to emit a well detection |
 | `STAGE2B["agnostic_nms"]` | `True` | Suppress cross-class duplicates |
 
 ---
