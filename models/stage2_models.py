@@ -111,7 +111,12 @@ class RooftopClassifier(nn.Module):
         )
 
         if self.use_arcface:
-            self.head = ArcFaceHead(hidden_dim, self.num_classes, s=30.0, m=0.50)
+            self.head = ArcFaceHead(
+                hidden_dim,
+                self.num_classes,
+                s=float(cfg.get("arcface_s", 30.0)),
+                m=float(cfg.get("arcface_m", 0.50)),
+            )
         else:
             self.head = nn.Linear(hidden_dim, self.num_classes)
 
@@ -175,6 +180,7 @@ class RooftopClassifier(nn.Module):
         Scale weights: 0.875×→0.8, 1.0×→1.0, 1.25×→0.9 (base is authoritative).
         Total weighted passes: up to 24 (3 scales × 8 folds).
         """
+        was_training = self.training
         self.eval()
         _, _, H, W = x.shape
         all_probs = []
@@ -224,6 +230,8 @@ class RooftopClassifier(nn.Module):
         # Weighted sum then normalise
         mean_probs = (stacked * weights_t.view(-1, 1, 1)).sum(0) / weights_t.sum()
 
+        if was_training:
+            self.train()
         if return_probs:
             return mean_probs
         return mean_probs.argmax(1)
@@ -460,6 +468,7 @@ def soft_nms_gaussian(
     if len(boxes) == 0:
         return torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.float32)
 
+    out_device = boxes.device
     boxes = boxes.float()
     scores = scores.float().clone()
     N = len(boxes)
@@ -499,8 +508,8 @@ def soft_nms_gaussian(
         scores = scores[keep]
         indices = indices[keep]
 
-    kept_idx = torch.tensor(kept, dtype=torch.long)
-    out_scores = torch.tensor(kept_scores, dtype=torch.float32)
+    kept_idx = torch.tensor(kept, dtype=torch.long, device=out_device)
+    out_scores = torch.tensor(kept_scores, dtype=torch.float32, device=out_device)
     return kept_idx, out_scores
 
 
