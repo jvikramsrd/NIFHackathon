@@ -260,7 +260,7 @@ class GeoIntelPipeline:
         H, W = img_rgb.shape[:2]
         ps = int(CFG.STAGE1["patch_size"])  # type: ignore
         # Reduce overlap for faster inference (smooth blending prevents seams anyway)
-        overlap = min(int(CFG.STAGE1["overlap"]), 128)
+        overlap = int(CFG.STAGE1["overlap"])
         stride = ps - overlap  # type: ignore
         C = int(CFG.STAGE1["num_classes"])  # type: ignore
         prob_sum = np.zeros((C, H, W), dtype=np.float32)
@@ -298,7 +298,7 @@ class GeoIntelPipeline:
                                 inp_tensor,
                                 C,
                                 CFG.AMP_DTYPE,
-                                fast_tta=True,
+                                fast_tta=CFG.FAST_TTA,
                             )
                             .cpu()
                             .numpy()
@@ -316,7 +316,7 @@ class GeoIntelPipeline:
                 inp_tensor = torch.stack(batch_inputs).to(self.device)
                 probs = (
                     tta_predict(
-                        self.seg.model, inp_tensor, C, CFG.AMP_DTYPE, fast_tta=True
+                        self.seg.model, inp_tensor, C, CFG.AMP_DTYPE, fast_tta=CFG.FAST_TTA
                     )
                     .cpu()
                     .numpy()
