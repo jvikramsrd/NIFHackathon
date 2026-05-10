@@ -57,7 +57,9 @@ def configure_logging(level: Optional[str] = None, log_file: Optional[Path] = No
             datefmt="%Y-%m-%d %H:%M:%S",
         )
 
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+    # Use stdout so PYTHONUNBUFFERED=1 / python -u makes every log line
+    # appear immediately in the GUI (QProcess MergedChannels captures stdout).
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
     if log_file is not None:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         handlers.append(logging.FileHandler(log_file, encoding="utf-8"))

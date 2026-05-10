@@ -50,26 +50,15 @@ from utils.sam import SAM
 
 log = get_logger(__name__)
 
-WANDB_AVAILABLE = False
-try:
-    import wandb
-
-    WANDB_AVAILABLE = True
-except ImportError:
-    pass
-
 # ─────────────────────────────────────────────────────────────────────────────
 # STAGE 2A
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def train_stage2a(resume: bool = True, use_wandb: bool = True):
+def train_stage2a(resume: bool = True):
     device = setup(seed=int(CFG.STAGE1["seed"]))  # type: ignore
     cfg: typing.Any = CFG.STAGE2A
     amp_ctx, _ = get_amp_context(CFG.AMP_DTYPE)
-
-    if use_wandb and WANDB_AVAILABLE:
-        wandb.init(project="geo-intel", name="stage2a", config=dict(cfg), reinit=True)
 
     # ── Dataset ───────────────────────────────────────────────────────────────
     train_ds, val_ds = split_clf_dataset(
@@ -303,17 +292,6 @@ def train_stage2a(resume: bool = True, use_wandb: bool = True):
             f"train_acc={correct / total:.4f}  val_acc={val_acc:.4f}  {elapsed:.0f}s"
         )
 
-        if use_wandb and WANDB_AVAILABLE:
-            wandb.log(
-                {
-                    "epoch": epoch,
-                    "stage2a/train_loss": ep_loss / len(train_loader),
-                    "stage2a/train_acc": correct / max(1, total),
-                    "stage2a/val_acc": val_acc,
-                    "stage2a/lr": base_opt.param_groups[-1]["lr"],
-                }
-            )
-
         if val_acc > best_acc:
             best_acc = val_acc
             no_improv = 0
@@ -351,8 +329,6 @@ def train_stage2a(resume: bool = True, use_wandb: bool = True):
             break
 
     log.info(f"\nStage 2A done. Best acc: {best_acc:.4f}")
-    if use_wandb and WANDB_AVAILABLE:
-        wandb.finish()
     return ckpt_path
 
 

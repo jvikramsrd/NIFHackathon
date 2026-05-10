@@ -39,23 +39,12 @@ from utils.sam import SAM
 
 log = get_logger(__name__)
 
-WANDB_AVAILABLE = False
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    pass
-
-
-def train_stage1(resume: bool = True, use_wandb: bool = True):
+def train_stage1(resume: bool = True):
     cfg = cast(Dict[str, Any], CFG.STAGE1)
     # DDP-aware setup: no-op when WORLD_SIZE=1 (single GPU / no torchrun)
     ddp = setup_ddp(seed=cfg["seed"])
     device = ddp.device if ddp.enabled else setup(seed=cfg["seed"])
     amp_ctx, _ = get_amp_context(CFG.AMP_DTYPE)
-
-    if use_wandb and WANDB_AVAILABLE and is_main_process(ddp):
-        wandb.init(project="geo-intel", name="stage1", config=cfg, reinit=True)
 
     # ── Datasets ─────────────────────────────────────────────────────────────
     train_ds, val_ds = split_dataset(
@@ -338,10 +327,6 @@ def train_stage1(resume: bool = True, use_wandb: bool = True):
                 f"mIoU={val_miou:.4f}  lr={lr_now:.2e}  {elapsed:.0f}s"
             )
 
-            if WANDB_AVAILABLE and use_wandb:
-                wandb.log({"epoch": epoch, "train_loss": ep_loss, "val_loss": val_loss,
-                           "val_miou": val_miou, "lr": lr_now})
-
             if val_miou > best_miou:
                 best_miou = val_miou
                 no_improv = 0
@@ -370,9 +355,6 @@ def train_stage1(resume: bool = True, use_wandb: bool = True):
         swa_path = CFG.CKPT_DIR / "stage1_swa.pth"
         torch.save(swa_model.state_dict(), swa_path)
         log.info(f"  SWA model saved: {swa_path}")
-
-    if WANDB_AVAILABLE and use_wandb:
-        wandb.finish()
 
     log.info(f"\nStage 1 complete. Best mIoU: {best_miou:.4f}")
     return ckpt_path

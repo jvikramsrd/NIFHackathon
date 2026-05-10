@@ -81,12 +81,6 @@ if mode in ("--verify", "--all"):
         except Exception as e:
             fail.append((pkg, str(e)))
 
-    try:
-        import wandb
-        ok.append(("wandb", wandb.__version__))
-    except Exception:
-        pass
-
     print()
     for k, v in ok:
         print(f"  ✓  {k:<34} {v}")

@@ -56,7 +56,6 @@ psutil>=5.9.0        # P-core affinity pinning for i9-13900K DataLoader workers
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 tensorboard>=2.16.0
-wandb>=0.16.0  # experiment tracking & hyperparameter sweeps
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
 PyQt6>=6.6.0

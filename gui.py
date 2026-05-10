@@ -20,7 +20,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PyQt6.QtCore import (
-    Qt, QProcess, QTimer, QPropertyAnimation, QEasingCurve,
+    Qt, QProcess, QProcessEnvironment, QTimer, QPropertyAnimation, QEasingCurve,
     pyqtSignal, pyqtProperty, QObject, QRectF,
 )
 from PyQt6.QtGui import (
@@ -680,18 +680,26 @@ print(json.dumps(results))
 # LOG / METRIC HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Patterns match the actual log format from our training scripts.
+# Stage 1:  "Ep 001/100  train=0.4520  val=0.4100  mIoU=0.3800  lr=1.00e-03"
+# Stage 2A: "Ep 001/050  loss=0.4520  train_acc=0.85  val_acc=0.82"
+# Stage 2B: YOLO tabular output with "mAP50" column
 _METRIC_PATTERNS: dict[str, re.Pattern] = {
-    "mIoU": re.compile(r"m[Ii]o[Uu][:\s=]+([0-9.]+)"),
-    "Loss": re.compile(r"\b[Ll]oss[:\s=]+([0-9.]+)"),
-    "Acc":  re.compile(r"[Aa]cc(?:uracy)?[:\s=]+([0-9.]+)"),
-    "LR":   re.compile(r"\blr[:\s=]+([0-9.e+\-]+)", re.I),
-    "mAP":  re.compile(r"mAP(?:[@\d.]*)?[:\s=]+([0-9.]+)"),
+    "mIoU": re.compile(r"\bmIoU=([0-9.]+)"),
+    "Loss": re.compile(r"\b(?:loss|train|val)=([0-9.]+)"),
+    "Acc":  re.compile(r"\b(?:val_acc|train_acc|acc)=([0-9.]+)"),
+    "LR":   re.compile(r"\blr=([0-9.e+\-]+)"),
+    "mAP":  re.compile(r"\bmAP50(?!-95)\b[:\s]*([0-9.]+)"),
 }
 
 _EPOCH_PATTERNS = [
-    re.compile(r"Ep\s+(\d+)/(\d+)"),
-    re.compile(r"[Ee]poch[: ]+(\d+)/(\d+)"),
+    re.compile(r"Ep\s+(\d+)/(\d+)"),          # our logger: "Ep 001/100"
+    re.compile(r"[Ee]poch[:\s]+(\d+)/(\d+)"), # generic / YOLO header
+    re.compile(r"^\s*(\d+)/(\d+)\s+[\d.]+G"), # YOLO row: "  1/100  3.85G …"
 ]
+
+# Strip ANSI colour/cursor codes produced by tqdm and ultralytics
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def _line_color(line: str) -> str:
@@ -1027,7 +1035,7 @@ class PipelineTab(QWidget):
         iv.setSpacing(6)
 
         tif_row = QHBoxLayout()
-        lbl3 = QLabel("Input Raster")
+        lbl3 = QLabel("Input Folder")
         lbl3.setFixedWidth(72)
         self.tif_label = QLabel("(none selected)")
         self.tif_label.setObjectName("path_label")
@@ -1131,12 +1139,15 @@ class PipelineTab(QWidget):
         outer.addWidget(content, stretch=1)
         outer.addWidget(ckpt_panel)
 
-        # QProcess
+        # QProcess — merged channels so both stdout and stderr reach _on_output
         self.process = QProcess(self)
         self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.process.readyReadStandardOutput.connect(self._on_output)
         self.process.finished.connect(self._on_finished)
         self.process.errorOccurred.connect(self._on_process_error)
+
+        # Buffer for partial lines that haven't ended with \n yet
+        self._line_buf = ""
 
         # Elapsed timer (1 s)
         self._elapsed_timer = QTimer(self)
@@ -1180,12 +1191,9 @@ class PipelineTab(QWidget):
             self.data_label.setText(d)
 
     def _pick_tif(self):
-        p, _ = QFileDialog.getOpenFileName(
-            self, "Select Input Raster", str(ROOT / "dataset"),
-            "Raster files (*.tif *.tiff *.ecw);;GeoTIFF (*.tif *.tiff);;ECW (*.ecw);;All files (*)",
-        )
-        if p:
-            self.tif_label.setText(p)
+        d = QFileDialog.getExistingDirectory(self, "Select Input Folder", str(ROOT / "dataset"))
+        if d:
+            self.tif_label.setText(d)
 
     def _pick_out_dir(self):
         d = QFileDialog.getExistingDirectory(self, "Select Output Folder", str(ROOT / "outputs"))
@@ -1198,6 +1206,7 @@ class PipelineTab(QWidget):
         mode = self.mode_combo.currentText()
         self.log_view.clear()
         self._log_has_content = False
+        self._line_buf = ""
         self.progress.setValue(0)
         self._reset_metrics()
         self._current_epoch = 0
@@ -1215,18 +1224,33 @@ class PipelineTab(QWidget):
         elif mode == "train_stage2":
             self._stage_strip.set_active(1)
 
-        args = [str(ROOT / "run_pipeline.py"), "--mode", mode]
         if mode == "infer":
-            tif = self.tif_label.text()
-            if not tif or tif == "(none selected)":
-                self._append_log("[ERROR] Select a TIF file first.", PAL["err"])
+            folder = self.tif_label.text()
+            if not folder or folder == "(none selected)":
+                self._append_log("[ERROR] Select an input folder first.", PAL["err"])
                 self._on_finished(1, None)
                 return
-            args += ["--tif", tif, "--out", self.out_label.text()]
+            if not Path(folder).is_dir():
+                self._append_log(f"[ERROR] Not a valid directory: {folder}", PAL["err"])
+                self._on_finished(1, None)
+                return
+            args = [
+                str(ROOT / "infer_folder.py"),
+                "--test_folder", folder,
+                "--out_folder", self.out_label.text(),
+            ]
         else:
-            args += ["--data_root", self.data_label.text()]
+            args = [str(ROOT / "run_pipeline.py"), "--mode", mode,
+                    "--data_root", self.data_label.text()]
 
-        self.process.start(_find_pipeline_python(), args)
+        # Force unbuffered I/O so every log.info() appears immediately
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("PYTHONUNBUFFERED", "1")
+        env.insert("PYTHONIOENCODING", "utf-8")
+        self.process.setProcessEnvironment(env)
+
+        # -u: also disable Python's internal write buffer (belt-and-suspenders)
+        self.process.start(_find_pipeline_python(), ["-u"] + args)
 
     def _stop(self):
         self.process.kill()
@@ -1289,18 +1313,28 @@ class PipelineTab(QWidget):
 
     def _on_output(self):
         raw = self.process.readAllStandardOutput().data().decode("utf-8", errors="replace")
-        mode = self.mode_combo.currentText()
+        # Append to partial-line buffer, then split on any line ending
+        self._line_buf += raw
+        parts = re.split(r"\r\n|\n|\r", self._line_buf)
+        # Last element is the incomplete line (or "" if buffer ended on a separator)
+        self._line_buf = parts[-1]
+        self._process_lines(parts[:-1])
 
-        for line in raw.splitlines():
-            if not line.strip():
+    def _process_lines(self, lines: list):
+        mode = self.mode_combo.currentText()
+        for raw_line in lines:
+            # Strip ANSI codes and surrounding whitespace
+            line = _ANSI_RE.sub("", raw_line).strip()
+            if not line:
                 continue
+
             self._append_log(line)
             self._update_metrics(line)
 
-            # Advance stage strip based on log content
-            if re.search(r"\b(?:stage.?2a|classifier|convnext|arcface)\b", line, re.I):
+            # Advance stage strip based on content
+            if re.search(r"\b(?:stage.?2a|classifier|convnext|arcface|rooftop)\b", line, re.I):
                 self._stage_strip.set_active(1)
-            elif re.search(r"\b(?:stage.?2b|yolo|detector|sahi)\b", line, re.I):
+            elif re.search(r"\b(?:stage.?2b|yolo|ultralytics|detector|sahi|infra)\b", line, re.I):
                 self._stage_strip.set_active(2)
 
             # Epoch progress + operation label
@@ -1309,7 +1343,7 @@ class PipelineTab(QWidget):
                 if m:
                     try:
                         curr, total = int(m.group(1)), int(m.group(2))
-                        if 0 < total <= 10_000:
+                        if 0 < curr <= total <= 100_000:
                             self._current_epoch = curr
                             self._total_epochs = total
                             self.progress.setValue(int(curr / total * 100))
@@ -1320,6 +1354,13 @@ class PipelineTab(QWidget):
                     break
 
     def _on_finished(self, exit_code: int, _status):
+        # Flush any remaining bytes the process didn't end with a newline
+        tail = self.process.readAllStandardOutput().data().decode("utf-8", errors="replace")
+        self._line_buf += tail
+        if self._line_buf.strip():
+            self._process_lines([self._line_buf])
+        self._line_buf = ""
+
         ok = exit_code == 0
         elapsed = time.monotonic() - self._start_time if self._start_time else 0
         self._elapsed_timer.stop()
@@ -1427,6 +1468,10 @@ class MapViewerTab(QWidget):
 
         ThemeManager.get().changed.connect(self._apply_theme)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_display()
+
     def _apply_theme(self):
         self._update_display()
 
@@ -1453,24 +1498,26 @@ class MapViewerTab(QWidget):
     def _open_tif(self):
         start = str(ROOT / "dataset")
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open Raster", start, "Raster files (*.tif *.tiff *.ecw);;GeoTIFF (*.tif *.tiff);;ECW (*.ecw);;All files (*)"
+            self, "Open Raster", start,
+            "Raster files (*.tif *.tiff *.ecw);;GeoTIFF (*.tif *.tiff);;ECW (*.ecw);;All files (*)",
         )
         if not path:
             return
         try:
             import rasterio
             with rasterio.open(path) as src:
-                bands = min(src.count, 3)
-                data = src.read(list(range(1, bands + 1)))
-            rgb = np.transpose(data, (1, 2, 0))
+                n_bands = min(src.count, 3)
+                data = src.read(list(range(1, n_bands + 1)))  # (bands, H, W)
+            rgb = np.transpose(data, (1, 2, 0))               # (H, W, bands)
             if rgb.dtype != np.uint8:
                 rgb = _to_uint8(rgb)
-            if rgb.shape[2] < 3:
-                rgb = np.stack([rgb[:, :, 0]] * 3, axis=-1)
+            if rgb.ndim == 2 or rgb.shape[2] == 1:
+                ch = rgb[:, :, 0] if rgb.ndim == 3 else rgb
+                rgb = np.stack([ch, ch, ch], axis=-1)
             self._rgb = rgb
             self._update_display()
         except Exception as exc:
-            self.left_label.setText(f"Error: {exc}")
+            self.left_label.setText(f"Error loading raster: {exc}")
 
     def _load_mask(self):
         start = str(ROOT / "outputs")
@@ -1732,8 +1779,10 @@ class RequirementsTab(QWidget):
         # QProcess for the check script
         self._proc = QProcess(self)
         self._proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self._proc.readyReadStandardOutput.connect(self._on_check_output)
         self._proc.finished.connect(self._on_check_finished)
         self._proc.errorOccurred.connect(self._on_check_error)
+        self._check_buf: str = ""
 
         ThemeManager.get().changed.connect(self._apply_theme)
 
@@ -1778,20 +1827,28 @@ class RequirementsTab(QWidget):
         self._check_btn.setEnabled(False)
         self._set_pill("checking…", PAL["running"])
         self._table.setRowCount(0)
+        self._check_buf = ""
         self._proc.start(_find_pipeline_python(), ["-c", _REQUIREMENTS_CHECK_SCRIPT])
+
+    def _on_check_output(self):
+        chunk = self._proc.readAllStandardOutput().data().decode("utf-8", errors="replace")
+        self._check_buf += chunk
 
     def _on_check_error(self, error):
         self._check_btn.setEnabled(True)
         self._set_pill("error", PAL["err"])
         self._table.setRowCount(0)
+        self._table.insertRow(0)
         err_row = QTableWidgetItem(self._proc.errorString())
         err_row.setForeground(QColor(PAL["err"]))
-        self._table.insertRow(0)
         self._table.setItem(0, 3, err_row)
 
     def _on_check_finished(self, exit_code: int, _status):
         self._check_btn.setEnabled(True)
-        raw = self._proc.readAllStandardOutput().data().decode("utf-8", errors="replace").strip()
+        # Flush any remaining bytes not yet read by _on_check_output
+        self._check_buf += self._proc.readAllStandardOutput().data().decode("utf-8", errors="replace")
+        raw = self._check_buf.strip()
+        self._check_buf = ""
         if exit_code != 0:
             self._set_pill("check failed", PAL["err"])
             self._table.setRowCount(1)
@@ -1952,17 +2009,17 @@ def _to_uint8(arr: np.ndarray) -> np.ndarray:
 
 def _set_pixmap(label: QLabel, rgb: np.ndarray):
     h, w = rgb.shape[:2]
-    # Keep _buf alive until QPixmap.fromImage() has copied the data.
-    # QImage wraps the buffer without copying, so the bytes object must not be GC'd first.
     _buf = bytes(np.ascontiguousarray(rgb).data)
     img = QImage(_buf, w, h, w * 3, QImage.Format.Format_RGB888)
-    label.setPixmap(
-        QPixmap.fromImage(img).scaled(
-            label.size(),
+    pix = QPixmap.fromImage(img)
+    target = label.size()
+    if target.width() > 0 and target.height() > 0:
+        pix = pix.scaled(
+            target,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-    )
+    label.setPixmap(pix)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
