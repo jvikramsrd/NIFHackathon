@@ -53,7 +53,7 @@ if exist venv\ (
     echo   Created venv
 )
 call venv\Scripts\activate.bat
-python -m pip install --upgrade pip setuptools wheel --quiet
+python -m pip install --upgrade pip "setuptools>=69,<82" wheel --quiet
 echo   pip upgraded
 
 REM ── 3/6  Detect accelerator — select the right torch requirements file ──────
@@ -116,14 +116,7 @@ if not "!TORCH_URL!"=="" (
 )
 if errorlevel 1 ( echo [ERROR] PyTorch installation failed & pause & exit /b 1 )
 
-python -c "
-import torch
-d = 'cuda' if torch.cuda.is_available() else 'cpu'
-print(f'  torch {torch.__version__}  device={d}')
-if d == 'cuda':
-    print(f'  GPU:  {torch.cuda.get_device_name(0)}')
-    print(f'  VRAM: {torch.cuda.get_device_properties(0).total_memory/1024**3:.1f} GB')
-"
+python _setup_verify.py --torch
 echo   PyTorch ready
 
 REM ── 5/6  Geospatial stack ───────────────────────────────────────────────────
@@ -167,64 +160,13 @@ if errorlevel 1 ( echo   Skipped - CRF will be disabled ) else ( echo   Installe
 REM ── Verify ──────────────────────────────────────────────────────────────────
 echo.
 echo   Checking ECW...
-python -c "
-try:
-    from osgeo import gdal
-    n = [gdal.GetDriver(i).ShortName for i in range(gdal.GetDriverCount())]
-    print('  ECW driver:', 'YES' if 'ECW' in n else 'NO (conda install -c conda-forge libgdal-ecw)')
-except Exception as e:
-    print('  ECW: cannot check -', e)
-"
+python _setup_verify.py --ecw
 
 echo.
 echo   ========================================
 echo     Verification
 echo   ========================================
-python -c "
-import importlib, torch
-ok, fail = [], []
-
-try:
-    import torch; ok.append(('torch', torch.__version__))
-    d = 'cuda' if torch.cuda.is_available() else 'cpu'
-    ok.append(('device', d))
-    if d == 'cuda':
-        ok.append(('GPU', torch.cuda.get_device_name(0)))
-        p = torch.cuda.get_device_properties(0)
-        ok.append(('VRAM', f'{p.total_memory/1024**3:.1f} GB'))
-except Exception as e: fail.append(('torch', str(e)))
-
-for pkg, attr in [('timm','__version__'),('ultralytics','__version__'),
-                   ('segmentation_models_pytorch','__version__'),
-                   ('cv2','__version__'),('albumentations','__version__')]:
-    try:
-        m = importlib.import_module(pkg); ok.append((pkg, getattr(m, attr)))
-    except Exception as e: fail.append((pkg, str(e)))
-
-for pkg in ['rasterio','geopandas','shapely','pyproj']:
-    try:
-        m = importlib.import_module(pkg); ok.append((pkg, m.__version__))
-    except Exception as e: fail.append((pkg, str(e)))
-
-for pkg, attr in [('numpy','__version__'),('pandas','__version__'),
-                   ('PyQt6','QtCore.PYQT_VERSION_STR'),('matplotlib','__version__'),
-                   ('tensorboard','__version__'),('onnx','__version__')]:
-    try:
-        m = importlib.import_module(pkg)
-        v = getattr(m, attr, None)
-        if callable(v): v = v()
-        ok.append((pkg, v or getattr(m, '__version__', '?')))
-    except Exception as e: fail.append((pkg, str(e)))
-
-try:
-    import wandb; ok.append(('wandb', wandb.__version__))
-except: pass
-
-print()
-for k, v in ok:   print(f'  {k:<30} {v}')
-for k, v in fail: print(f'  {k:<30} MISSING ({v})')
-if fail: import sys; sys.exit(1)
-"
+python _setup_verify.py --verify
 
 echo.
 echo   ========================================

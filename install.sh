@@ -17,6 +17,7 @@
 #    --rocm VER   Force ROCm version  (e.g. --rocm 6.2)
 #    --no-geo     Skip geospatial stack (rasterio/fiona/geopandas)
 #    --no-crf     Skip pydensecrf2 (CRF post-processing)
+#    --help       Show this help
 # ══════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -26,19 +27,29 @@ BOLD='\033[1m'; RESET='\033[0m'
 info()  { echo -e "${CYAN}[info]${RESET}  $*"; }
 ok()    { echo -e "${GREEN}[ok]${RESET}    $*"; }
 warn()  { echo -e "${YELLOW}[warn]${RESET}  $*"; }
-error() { echo -e "${RED}[error]${RESET} $*"; exit 1; }
+error() { echo -e "${RED}[error]${RESET} $*" >&2; exit 1; }
 step()  { echo -e "\n  ${BOLD}$*${RESET}"; }
+
+usage() {
+    grep '^#  ' "$0" | sed 's/^#  //'
+    exit 0
+}
 
 # ── Parse args ───────────────────────────────────────────────────────────────
 FORCE_CPU=0; FORCE_ROCM=""; FORCE_CUDA=""; SKIP_GEO=0; SKIP_CRF=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --help|-h) usage ;;
     --cpu)    FORCE_CPU=1 ;;
-    --rocm)   FORCE_ROCM="$2"; shift ;;
-    --cuda)   FORCE_CUDA="$2"; shift ;;
+    --rocm)
+      [[ $# -lt 2 || -z "${2:-}" ]] && error "--rocm requires a version (e.g. --rocm 6.2)"
+      FORCE_ROCM="$2"; shift ;;
+    --cuda)
+      [[ $# -lt 2 || -z "${2:-}" ]] && error "--cuda requires a version (e.g. --cuda 12.1)"
+      FORCE_CUDA="$2"; shift ;;
     --no-geo) SKIP_GEO=1 ;;
     --no-crf) SKIP_CRF=1 ;;
-    *) warn "Unknown flag: $1" ;;
+    *) error "Unknown flag: $1  (run with --help)" ;;
   esac
   shift
 done
@@ -48,6 +59,9 @@ echo -e "  ${BOLD}╔═══════════════════�
 echo -e "  ${BOLD}║       Geo-Intel Pipeline — Installer                 ║${RESET}"
 echo -e "  ${BOLD}╚══════════════════════════════════════════════════════╝${RESET}"
 echo ""
+
+# ── Validate required files ─────────────────────────────────────────────────
+[[ -f requirements.txt ]] || error "requirements.txt not found — run this script from the project root"
 
 # ── Detect OS ───────────────────────────────────────────────────────────────
 OS=""; ARCH=$(uname -m)
@@ -60,10 +74,11 @@ info "Platform: ${OS} / ${ARCH}"
 # ── 1/6  Check Python ───────────────────────────────────────────────────────
 step "1/6  Checking Python"
 PYTHON=""
-for cmd in python3.11 python3.10 python3 python; do
+for cmd in python3.13 python3.12 python3.11 python3.10 python3 python; do
   if command -v "$cmd" &>/dev/null; then
-    VER=$("$cmd" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-    MAJOR=${VER%%.*}; MINOR=${VER##*.}
+    VER=$("$cmd" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null) || continue
+    MAJOR=$(echo "$VER" | cut -d. -f1)
+    MINOR=$(echo "$VER" | cut -d. -f2)
     if [[ "$MAJOR" -eq 3 && "$MINOR" -ge 10 ]]; then
       PYTHON="$cmd"; ok "$cmd $VER"; break
     fi
@@ -79,8 +94,9 @@ if [[ -d "$VENV_DIR" ]]; then
 else
   "$PYTHON" -m venv "$VENV_DIR"; ok "created $VENV_DIR"
 fi
+# shellcheck source=/dev/null
 source "$VENV_DIR/bin/activate"
-python -m pip install --upgrade pip setuptools wheel --quiet
+python -m pip install --upgrade pip "setuptools>=69,<82" wheel --quiet
 ok "pip upgraded"
 
 # ── 3/6  Accelerator detection — select the right torch requirements file ───
@@ -107,7 +123,7 @@ elif [[ "$OS" == "macos" ]]; then
 elif [[ "$OS" == "linux" ]]; then
   # AMD ROCm
   if [[ -e /dev/kfd ]] || command -v rocm-smi &>/dev/null; then
-    ROC_VER=$(rocm-smi --version 2>/dev/null | grep -oP '\d+\.\d+' | head -1 || true)
+    ROC_VER=$(rocm-smi --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1 || true)
     [[ -z "$ROC_VER" ]] && ROC_VER="6.2"
     if [[ "${ROC_VER%%.*}" -ge 6 ]]; then TORCH_FILE="requirements-torch-rocm.txt"
     else TORCH_URL="https://download.pytorch.org/whl/rocm${ROC_VER}"; fi
@@ -115,8 +131,14 @@ elif [[ "$OS" == "linux" ]]; then
     [[ ! -e /dev/kfd ]] && warn "/dev/kfd not found — GPU access may be limited"
   # NVIDIA CUDA
   elif command -v nvidia-smi &>/dev/null; then
-    CUDA_RAW=$(nvidia-smi 2>/dev/null | grep -oP 'CUDA Version: \K[\d.]+' || echo "")
-    [[ -z "$CUDA_RAW" ]] && CUDA_RAW=$(nvcc --version 2>/dev/null | grep -oP 'release \K[\d.]+' || echo "12.1")
+    CUDA_RAW=$(nvidia-smi 2>/dev/null | grep 'CUDA Version' | grep -oE '[0-9]+\.[0-9]+' | head -1 || true)
+    if [[ -z "$CUDA_RAW" ]]; then
+      CUDA_RAW=$(nvcc --version 2>/dev/null | grep 'release' | grep -oE '[0-9]+\.[0-9]+' | head -1 || true)
+    fi
+    if [[ -z "$CUDA_RAW" ]]; then
+      warn "nvidia-smi found but CUDA version detection failed — assuming CUDA 12.x"
+      CUDA_RAW="12.1"
+    fi
     if [[ "${CUDA_RAW%%.*}" -ge 12 ]]; then TORCH_FILE="requirements-torch-cuda.txt"
     else TORCH_FILE="requirements-torch-cuda11.txt"; fi
     TORCH_LABEL="NVIDIA CUDA $CUDA_RAW (detected)"
@@ -125,7 +147,9 @@ elif [[ "$OS" == "linux" ]]; then
   fi
 fi
 
-if [[ -n "$TORCH_FILE" ]]; then
+# Validate selected requirements file exists
+if [[ -n "${TORCH_FILE:-}" ]]; then
+  [[ -f "$TORCH_FILE" ]] || error "Requirements file not found: $TORCH_FILE"
   ok "$TORCH_LABEL  →  $TORCH_FILE"
 else
   ok "$TORCH_LABEL  →  $TORCH_URL"
@@ -139,15 +163,7 @@ else
   pip install torch torchvision torchaudio --index-url "$TORCH_URL" --quiet
 fi
 
-python -c "
-import torch
-dev = 'cuda' if torch.cuda.is_available() else \
-      ('mps' if getattr(torch.backends,'mps',None) and torch.backends.mps.is_available() else 'cpu')
-print(f'  torch {torch.__version__}  device={dev}')
-if dev == 'cuda':
-    print(f'  GPU:  {torch.cuda.get_device_name(0)}')
-    print(f'  VRAM: {torch.cuda.get_device_properties(0).total_memory/1024**3:.1f} GB')
-"
+python _setup_verify.py --torch
 ok "PyTorch ready"
 
 # ── 5/6  Geospatial stack ───────────────────────────────────────────────────
@@ -174,13 +190,18 @@ fi
 
 # ── 6/6  Pipeline dependencies + CRF + verify ───────────────────────────────
 step "6/6  Installing pipeline dependencies (requirements.txt)"
+
+# Temp file for onnxruntime-gpu fallback — cleaned up on exit
+TMP_REQ=""
+cleanup_tmp() { [[ -n "${TMP_REQ:-}" ]] && rm -f "$TMP_REQ"; }
+trap cleanup_tmp EXIT
+
 pip install -r requirements.txt --quiet 2>/dev/null || {
   warn "onnxruntime-gpu unavailable — retrying with CPU onnxruntime"
   TMP_REQ="$(mktemp)"
   grep -v 'onnxruntime' requirements.txt > "$TMP_REQ"
   pip install -r "$TMP_REQ" --quiet
   pip install onnxruntime --quiet 2>/dev/null || true
-  rm -f "$TMP_REQ"
 }
 ok "Dependencies installed"
 
@@ -190,59 +211,14 @@ fi
 
 # Check ECW driver
 echo ""
-python -c "
-try:
-    from osgeo import gdal
-    n = [gdal.GetDriver(i).ShortName for i in range(gdal.GetDriverCount())]
-    print(f'  ECW driver: {\"YES\" if \"ECW\" in n else \"NO (conda install -c conda-forge libgdal-ecw)\"}')
-except: pass
-" 2>/dev/null || true
+python _setup_verify.py --ecw 2>/dev/null || true
 
 # ── Verify ──────────────────────────────────────────────────────────────────
-python -c "
-import importlib, torch
-ok, fail = [], []
-
-try:
-    import torch; ok.append(('torch', torch.__version__))
-    d = 'cuda' if torch.cuda.is_available() else ('mps' if getattr(torch.backends,'mps',None) and torch.backends.mps.is_available() else 'cpu')
-    ok.append(('device', d))
-    if d == 'cuda':
-        ok.append(('GPU', torch.cuda.get_device_name(0)))
-        ok.append(('VRAM', f\"{torch.cuda.get_device_properties(0).total_memory/1024**3:.1f} GB\"))
-except Exception as e: fail.append(('torch', str(e)))
-
-for pkg, attr in [('timm','__version__'),('ultralytics','__version__'),
-                   ('segmentation_models_pytorch','__version__'),
-                   ('cv2','__version__'),('albumentations','__version__')]:
-    try:
-        m = importlib.import_module(pkg); ok.append((pkg, getattr(m, attr)))
-    except Exception as e: fail.append((pkg, str(e)))
-
-for pkg in ['rasterio','geopandas','shapely','pyproj']:
-    try:
-        m = importlib.import_module(pkg); ok.append((pkg, m.__version__))
-    except Exception as e: fail.append((pkg, str(e)))
-
-for pkg, attr in [('numpy','__version__'),('pandas','__version__'),
-                   ('PyQt6','QtCore.PYQT_VERSION_STR'),('matplotlib','__version__'),
-                   ('tensorboard','__version__'),('onnx','__version__')]:
-    try:
-        m = importlib.import_module(pkg)
-        v = getattr(m, attr, None)
-        if callable(v): v = v()
-        ok.append((pkg, v or getattr(m, '__version__', '?')))
-    except Exception as e: fail.append((pkg, str(e)))
-
-try:
-    import wandb; ok.append(('wandb', wandb.__version__))
-except: pass
-
-print()
-for k, v in ok:   print(f'  \u2713  {k:<34} {v}')
-for k, v in fail: print(f'  \u2717  {k:<34} MISSING ({v})')
-if fail: import sys; sys.exit(1)
-"
+echo ""
+echo -e "  ${BOLD}══════════════════════════════════════════════════════${RESET}"
+echo -e "  ${BOLD}Verification${RESET}"
+echo -e "  ${BOLD}══════════════════════════════════════════════════════${RESET}"
+python _setup_verify.py --verify
 
 echo ""
 echo -e "  ${BOLD}══════════════════════════════════════════════════════${RESET}"
