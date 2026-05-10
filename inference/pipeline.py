@@ -76,7 +76,8 @@ class GeoIntelPipeline:
         log.info("[1] Loading Stage-1 segmentation model …")
         ckpt = torch.load(stage1_ckpt, map_location=self.device, weights_only=False)
         self.seg = Stage1Module(CFG.STAGE1).to(self.device)
-        self.seg.load_state_dict(ckpt["state_dict"], strict=False)
+        seg_state = {k.removeprefix("module."): v for k, v in ckpt["state_dict"].items()}
+        self.seg.load_state_dict(seg_state, strict=True)
         self.seg.eval()
         if CFG.COMPILE_ENABLED:
             # fullgraph=False: Swin-B has conditional ops in attention
@@ -90,7 +91,8 @@ class GeoIntelPipeline:
         log.info("[2] Loading Stage-2A rooftop classifier …")
         ckpt2a = torch.load(stage2a_ckpt, map_location=self.device, weights_only=False)
         self.clf = RooftopClassifier(CFG.STAGE2A).to(self.device)
-        self.clf.load_state_dict(ckpt2a["state_dict"], strict=False)
+        clf_state = {k.removeprefix("module."): v for k, v in ckpt2a["state_dict"].items()}
+        self.clf.load_state_dict(clf_state, strict=True)
         self.clf.eval()
         self.clf = to_channels_last(self.clf)  # NHWC for ConvNeXt
         if CFG.COMPILE_ENABLED:
@@ -546,8 +548,11 @@ def _to_uint8(arr):
     if arr.ndim == 3:
         for i in range(arr.shape[2]):
             ch = arr[:, :, i].astype(np.float32)
-            mn, mx = ch.min(), ch.max()
-            out[:, :, i] = 0 if mx == mn else (ch - mn) / (mx - mn) * 255
+            lo, hi = np.percentile(ch, 2), np.percentile(ch, 98)
+            if hi <= lo:
+                out[:, :, i] = 0
+            else:
+                out[:, :, i] = np.clip((ch - lo) / (hi - lo) * 255, 0, 255)
     return out.astype(np.uint8)
 
 
