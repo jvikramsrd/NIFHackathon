@@ -108,7 +108,7 @@ def train_all():
     from train.train_stage2 import train_stage2a, train_stage2b
     from utils.hardware import clear_cuda_cache
 
-    _header("STAGE 1 — Semantic Segmentation  (UNet++ mit_b5)")
+    _header("STAGE 1 — Semantic Segmentation  (Unet mit_b5)")
     train_stage1()
     clear_cuda_cache()
 

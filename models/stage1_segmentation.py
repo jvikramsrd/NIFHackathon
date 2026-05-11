@@ -19,14 +19,16 @@ import torch.nn.functional as F
 
 
 def build_stage1_model(cfg: dict) -> nn.Module:
-    """Build UNet++ with scSE attention and optional deep supervision."""
-    model = smp.UnetPlusPlus(
+    """Build the configured smp architecture with scSE attention."""
+    arch = cfg.get("arch", "Unet")
+    ModelCls = getattr(smp, arch, smp.Unet)
+    model = ModelCls(
         encoder_name=cfg["encoder"],
         encoder_weights=cfg["encoder_weights"],
         in_channels=cfg["in_channels"],
         classes=cfg["num_classes"],
         activation=None,
-        decoder_attention_type="scse",
+        decoder_attention_type=cfg.get("decoder_attention_type", "scse"),
     )
     return model
 
