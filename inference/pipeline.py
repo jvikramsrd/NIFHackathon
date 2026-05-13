@@ -71,7 +71,7 @@ class GeoIntelPipeline:
 
         log.info(f"[Pipeline] {vram_stats()}")
 
-        # Stage 1 — Swin-B UNet++ (NO channels_last — transformer backbone)
+        # Stage 1 — Swin-B UNet++ (channels_last applied to match training)
         log.info("[1] Loading Stage-1 segmentation model …")
         ckpt = torch.load(stage1_ckpt, map_location=self.device, weights_only=False)
         self.seg = Stage1Module(CFG.STAGE1).to(self.device)
@@ -503,8 +503,6 @@ class GeoIntelPipeline:
         dets = []
         det_tiles_total = 0
         det_tiles_skipped = 0
-
-        import tempfile
 
         tmp_dir = Path(tempfile.mkdtemp(prefix="geo_infra_"))
 

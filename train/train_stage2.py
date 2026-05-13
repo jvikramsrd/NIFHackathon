@@ -207,7 +207,7 @@ def train_stage2a(resume: bool = True):
         no_improv = int(state.get("no_improv", 0))
         start_epoch = int(state.get("epoch", 0)) + 1
         if "ema_state" in state and state["ema_state"] is not None:
-            ema.shadow = {k: v.cpu() for k, v in state["ema_state"].items()}
+            ema.shadow = {k: v.to(device) for k, v in state["ema_state"].items()}
         log.info(
             f"  Resume state → start_epoch={start_epoch}, "
             f"best_acc={best_acc:.4f}, no_improv={no_improv}"
@@ -243,7 +243,7 @@ def train_stage2a(resume: bool = True):
                 # forward pass, saving ~1.5GB activation memory on the A4000.
                 logits_local = model.forward_train(aug_imgs, ya)
                 loss_a = model.criterion(logits_local, ya)
-                # Detach and re-use same logits for yb loss (no extra backward graph)
+                # Re-use same logits for yb loss (shared forward pass, no second forward needed)
                 loss_b = model.criterion(logits_local, yb)
                 lam_local = lam.mean() if isinstance(lam, torch.Tensor) else lam
                 return logits_local, loss_a * lam_local + loss_b * (1.0 - lam_local)
