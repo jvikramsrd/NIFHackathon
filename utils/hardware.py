@@ -216,10 +216,11 @@ class EMA:
     """
     Exponential Moving Average of model weights.
 
-    Shadow weights are stored on **CPU** to save ~400–500 MB VRAM on the A4000.
-    They are moved to GPU only during validation (apply_shadow) and back to CPU
-    afterward (restore). The CPU↔GPU transfer costs ~50ms on PCIe 4.0 x16,
-    which is negligible compared to a validation epoch.
+    Shadow weights are kept on the same device as the model (GPU) so that each
+    update is a pure GPU in-place operation with no PCIe round-trips.
+    `torch._foreach_mul_` / `torch._foreach_add_` batch all parameter updates
+    into two CUDA kernels instead of one kernel-pair per parameter, cutting
+    update overhead from ~500 kernel launches to 2.
     """
 
     def __init__(self, model: nn.Module, decay: float = 0.9998):
@@ -231,26 +232,31 @@ class EMA:
     def _register(self, model: nn.Module):
         for name, param in model.named_parameters():
             if param.requires_grad:
-                # Store shadow on CPU to free VRAM
-                self.shadow[name] = param.data.clone().detach().cpu()
+                self.shadow[name] = param.data.clone().detach()
 
     @torch.no_grad()
     def update(self, model: nn.Module):
+        shadows, params = [], []
         for name, param in model.named_parameters():
             if param.requires_grad and name in self.shadow:
-                # EMA on CPU: pull param to CPU, blend, store result on CPU
-                self.shadow[name] = (
-                    self.decay * self.shadow[name]
-                    + (1.0 - self.decay) * param.data.cpu()
-                )
+                shadows.append(self.shadow[name])
+                params.append(param.data)
+        if not shadows:
+            return
+        try:
+            torch._foreach_mul_(shadows, self.decay)
+            torch._foreach_add_(shadows, params, alpha=1.0 - self.decay)
+        except (AttributeError, RuntimeError):
+            for s, p in zip(shadows, params):
+                s.mul_(self.decay).add_(p, alpha=1.0 - self.decay)
 
     def apply_shadow(self, model: nn.Module):
-        """Move EMA weights to GPU and load into model for validation."""
+        """Swap EMA weights into model for validation."""
         self._backup = {}
         for name, param in model.named_parameters():
             if name in self.shadow:
                 self._backup[name] = param.data.clone()
-                param.data.copy_(self.shadow[name].to(param.device))
+                param.data.copy_(self.shadow[name])
 
     def restore(self, model: nn.Module):
         """Restore training weights after validation."""

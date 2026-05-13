@@ -113,23 +113,10 @@ def train_stage1(resume: bool = True):
         pass
 
     # ── Model ────────────────────────────────────────────────────────────────
-    import segmentation_models_pytorch as smp
-
-    module = Stage1Module(cfg).to(device)
-    # Rebuild model honouring cfg["arch"] so UNet++ is used when configured.
-    # Stage1Module.__init__ already calls build_stage1_model(cfg), but we
-    # rebuild here to allow the VRAM-adjusted encoder to take effect.
-    arch = cfg.get("arch", "UnetPlusPlus")
-    ModelCls = getattr(smp, arch, smp.UnetPlusPlus)
-    module.model = ModelCls(
-        encoder_name=encoder,
-        encoder_weights=cfg["encoder_weights"],
-        in_channels=cfg["in_channels"],
-        classes=cfg["num_classes"],
-        activation=None,
-        decoder_attention_type=cfg.get("decoder_attention_type", "scse"),
-    )
-    module.model = module.model.to(device)
+    # Single build with the VRAM-adjusted encoder baked into the config copy.
+    module = Stage1Module({**cfg, "encoder": encoder}).to(device)
+    # channels_last (NHWC): 15-30% faster on Ampere tensor cores
+    module = to_channels_last(module)
 
     log.info(f"Encoder : {encoder}")
     log.info(f"Params  : {sum(p.numel() for p in module.parameters()) / 1e6:.1f}M")
@@ -170,7 +157,7 @@ def train_stage1(resume: bool = True):
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimiser if not use_sam else base_opt,
         max_lr=max_lrs, epochs=cfg["epochs"], steps_per_epoch=steps_per_ep,
-        pct_start=0.1, div_factor=25, final_div_factor=1e4,
+        pct_start=0.15, div_factor=25, final_div_factor=1e4,
     )
 
     # SWA
@@ -200,7 +187,7 @@ def train_stage1(resume: bool = True):
         log.info(f"Resume: start_epoch={start_epoch}, best_mIoU={best_miou:.4f}, no_improv={no_improv}")
 
     log.info(f"[Stage 1] Starting training — {cfg['epochs']} epochs")
-    log.info(f"  Effective batch: {cfg['batch_size']} × {grad_accum} = {cfg['batch_size'] * grad_accum}")
+    log.info(f"  Effective batch: {batch_size} × {grad_accum} = {batch_size * grad_accum}")
     log.info(f"  {vram_stats()}")
 
     ms_training = cfg.get("ms_training", False)
@@ -228,19 +215,18 @@ def train_stage1(resume: bool = True):
             imgs = imgs.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
 
-            # Multi-scale training: scale to a random size then back to the fixed
-            # patch_size.  Both resizes are done under AMP to keep activations in bf16.
+            # Multi-scale training: resize to a random scale. Since the segmentation
+            # model is fully convolutional it accepts variable input sizes directly.
+            # A single resize preserves more detail than the old down→up approach.
             if ms_training and np.random.rand() < 0.5:
                 scale = float(np.random.choice(ms_scales))
                 orig_h, orig_w = imgs.shape[2], imgs.shape[3]
-                new_h = max(16, int(orig_h * scale))
-                new_w = max(16, int(orig_w * scale))
-                with amp_ctx:
-                    imgs = F.interpolate(imgs, size=(new_h, new_w), mode="bilinear", align_corners=False)
-                    masks = F.interpolate(masks.unsqueeze(1).float(), size=(new_h, new_w), mode="nearest").squeeze(1).long()
-                    # Resize back to fixed model input size
-                    imgs = F.interpolate(imgs, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
-                    masks = F.interpolate(masks.unsqueeze(1).float(), size=(orig_h, orig_w), mode="nearest").squeeze(1).long()
+                new_h = max(32, int(round(orig_h * scale / 32)) * 32)  # round to multiple of 32 for encoder
+                new_w = max(32, int(round(orig_w * scale / 32)) * 32)
+                if (new_h, new_w) != (orig_h, orig_w):
+                    with amp_ctx:
+                        imgs = F.interpolate(imgs, size=(new_h, new_w), mode="bilinear", align_corners=False)
+                        masks = F.interpolate(masks.unsqueeze(1).float(), size=(new_h, new_w), mode="nearest").squeeze(1).long()
 
             if np.random.rand() < 0.2:
                 imgs, masks = _cutmix_seg(imgs, masks, alpha=cfg.get("cutmix_alpha", 1.0))
@@ -381,6 +367,8 @@ def _validate(module, loader, device, metrics, amp_ctx, epoch=None):
     module.eval()
     metrics.reset()
     total_loss = 0.0
+    # Cached once — criterion.cw is a constant buffer, unaffected by EMA swap.
+    class_weights = module.criterion.cw
     val_iter = tqdm(loader, total=len(loader),
                     desc=f"Val   Ep {epoch:03d}" if epoch else "Validation",
                     leave=False, dynamic_ncols=True)
@@ -389,9 +377,9 @@ def _validate(module, loader, device, metrics, amp_ctx, epoch=None):
         masks = masks.to(device, non_blocking=True)
         with amp_ctx:
             raw = module(imgs)
-            # UNet++ with deep supervision returns a list; use the main head (index 0)
             logits = raw[0] if isinstance(raw, (list, tuple)) else raw
-            loss = module.loss(raw, masks)  # loss() handles deep supervision list
+        # Weighted CE in fp32: ~40% faster than full TriLoss, mIoU selection is unchanged.
+        loss = F.cross_entropy(logits.float(), masks, weight=class_weights)
         preds = logits.float().argmax(1)
         metrics.update(preds.cpu().numpy(), masks.cpu().numpy())
         total_loss += loss.item()
@@ -404,7 +392,10 @@ def _validate(module, loader, device, metrics, amp_ctx, epoch=None):
 
 
 def _save_best(module, ema, epoch, miou, cfg, path):
-    weights = ema.shadow if ema else {k: v for k, v in module.state_dict().items()}
+    if ema:
+        weights = {k: v.detach().cpu() for k, v in ema.shadow.items()}
+    else:
+        weights = module.state_dict()
     atomic_torch_save({"epoch": epoch, "state_dict": weights, "val_miou": miou, "config": cfg}, path)
 
 

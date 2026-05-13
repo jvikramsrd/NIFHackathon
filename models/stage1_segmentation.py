@@ -164,6 +164,7 @@ class TriLoss(nn.Module):
         )
         w = w / (w.sum() + 1e-6) * num_classes
         self.register_buffer("cw", w)
+        self.register_buffer("cw_norm", w / (w.sum() + 1e-6))
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor):
         # Handle deep supervision: list/tuple of logits from UNet++ aux heads
@@ -185,45 +186,41 @@ class TriLoss(nn.Module):
     def _compute(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         B, C, H, W = logits.shape
         tgt = F.one_hot(targets, C).permute(0, 3, 1, 2).float()
-        probs = torch.softmax(logits, dim=1)
 
-        # ── Dice (cosine-log variant for smoother gradients near 0/1) ───────
-        d_loss = logits.new_tensor(0.0)
-        cw_sum = self.cw.sum() + 1e-6
-        for c in range(C):
-            p, t, w = probs[:, c], tgt[:, c], self.cw[c]
-            inter = (p * t).sum(dim=(1, 2))
-            union = p.sum(dim=(1, 2)) + t.sum(dim=(1, 2))
-            dice_c = 1 - (2 * inter + self.smooth) / (union + self.smooth)
-            dice_c = torch.log(torch.cosh(dice_c))  # smoother near 0
-            d_loss = d_loss + (w / cw_sum) * dice_c.mean()
+        # Single log_softmax pass: probs derived cheaply, avoids a second softmax
+        # and eliminates the redundant second F.cross_entropy call for focal loss.
+        log_probs = F.log_softmax(logits, dim=1)
+        probs = torch.exp(log_probs)
+
+        # ── Dice (cosine-log variant) — vectorized over classes ───────────────
+        inter = (probs * tgt).sum(dim=(2, 3))                           # (B, C)
+        union = probs.sum(dim=(2, 3)) + tgt.sum(dim=(2, 3))            # (B, C)
+        dice_c = 1.0 - (2.0 * inter + self.smooth) / (union + self.smooth)
+        d_loss = (torch.log(torch.cosh(dice_c)).mean(dim=0) * self.cw_norm).sum()
 
         # ── Cross-Entropy with label smoothing ───────────────────────────────
         ce_loss = F.cross_entropy(
             logits, targets, weight=self.cw, label_smoothing=self.label_smoothing
         )
 
-        # ── Focal loss ───────────────────────────────────────────────────────
-        ce_none = F.cross_entropy(logits, targets, reduction="none")
+        # ── Focal loss: .float() matches F.cross_entropy's internal fp32 path ─
+        ce_none = -log_probs.float().gather(1, targets.unsqueeze(1)).squeeze(1)  # (B, H, W)
         pt = torch.exp(-ce_none)
-        f_loss = (self.cw[targets] * (1 - pt) ** self.gamma * ce_none).mean()
+        f_loss = (self.cw[targets] * (1.0 - pt) ** self.gamma * ce_none).mean()
 
         total = self.dw * d_loss + self.cw_w * ce_loss + self.fw * f_loss
 
         # ── Lovász-Softmax (directly optimises IoU) ──────────────────────────
         if self.use_lovasz:
-            lv_loss = lovasz_softmax(probs, targets, classes="present")
-            total = total + self.lv_w * lv_loss
+            total = total + self.lv_w * lovasz_softmax(probs, targets, classes="present")
 
         # ── Boundary / Hausdorff loss ─────────────────────────────────────────
         if self.use_boundary:
-            b_loss = _boundary_loss(probs, tgt, self.smooth)
-            total = total + self.bw * b_loss
+            total = total + self.bw * _boundary_loss(probs, tgt, self.smooth)
 
         # ── Instance-touching separation loss (building class only) ───────────
         if self.use_touching:
-            t_loss = _touching_separation_loss(probs, targets, class_id=1)
-            total = total + self.tw * t_loss
+            total = total + self.tw * _touching_separation_loss(probs, targets, class_id=1)
 
         return total
 
@@ -259,7 +256,7 @@ def _soft_dice_loss(pred: torch.Tensor, target: torch.Tensor, smooth: float) -> 
 def _hausdorff_er_loss(
     pred_edges: torch.Tensor,
     target_edges: torch.Tensor,
-    max_iter: int = 8,
+    max_iter: int = 4,
 ) -> torch.Tensor:
     """Erosion-based differentiable Hausdorff approximation."""
     error = (pred_edges - target_edges).pow(2)
@@ -268,12 +265,14 @@ def _hausdorff_er_loss(
 
     loss = pred_edges.new_tensor(0.0)
     eroded = error
+    actual_iters = 0
     for k in range(max_iter):
         eroded = -F.max_pool2d(-eroded, kernel_size=3, stride=1, padding=1)
+        actual_iters += 1
         loss = loss + eroded.mean() * float((k + 1) ** 2)
         if torch.isclose(eroded.max(), eroded.new_tensor(0.0)):
             break
-    return loss / float(max_iter)
+    return loss / max(float(actual_iters), 1.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

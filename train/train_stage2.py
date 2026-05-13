@@ -184,7 +184,7 @@ def train_stage2a(resume: bool = True):
     )
 
     best_acc = 0.0
-    patience = 12
+    patience = 15
     no_improv = 0
     ckpt_path = CFG.CKPT_DIR / "stage2a_best.pth"
     last_ckpt_path = CFG.CKPT_DIR / "stage2a_last.pth"
@@ -207,7 +207,7 @@ def train_stage2a(resume: bool = True):
         no_improv = int(state.get("no_improv", 0))
         start_epoch = int(state.get("epoch", 0)) + 1
         if "ema_state" in state and state["ema_state"] is not None:
-            ema.shadow = {k: v.to(device) for k, v in state["ema_state"].items()}
+            ema.shadow = {k: v.cpu() for k, v in state["ema_state"].items()}
         log.info(
             f"  Resume state → start_epoch={start_epoch}, "
             f"best_acc={best_acc:.4f}, no_improv={no_improv}"
@@ -269,7 +269,7 @@ def train_stage2a(resume: bool = True):
             ema.update(model)
 
             ep_loss += loss.item()
-            correct += (logits.argmax(1) == labels).sum().item()
+            correct += (logits.argmax(1) == ya).sum().item()
             total += labels.size(0)
 
             train_pbar.set_postfix(
@@ -349,8 +349,8 @@ def _val_clf(model, loader, device, cfg: typing.Any, amp_ctx, epoch=None):
         imgs = imgs.to(device)
         imgs = cl_input(imgs)  # keep NHWC consistent with training
         with amp_ctx:
-            # Use 16-fold multi-scale TTA for much higher validation accuracy
-            preds = model.predict(imgs, tta_steps=16).cpu().numpy()
+            # Use light TTA during training (cfg['tta_steps']), full TTA only at final inference
+            preds = model.predict(imgs, tta_steps=int(cfg.get("tta_steps", 4))).cpu().numpy()
 
         all_p.extend(preds)
         all_l.extend(labels.numpy())
@@ -420,7 +420,18 @@ def train_stage2b(resume: bool = True):
             warmup_epochs=float(cfg.get("warmup_epochs", 3)),
             patience=int(cfg.get("patience", 20)),
             cos_lr=bool(cfg.get("cos_lr", True)),
-            copy_paste=float(cfg.get("copy_paste", 0)),
+            mosaic=float(cfg.get("mosaic", 1.0)),
+            close_mosaic=int(cfg.get("close_mosaic", 20)),
+            hsv_h=float(cfg.get("hsv_h", 0.015)),
+            hsv_s=float(cfg.get("hsv_s", 0.5)),
+            hsv_v=float(cfg.get("hsv_v", 0.3)),
+            degrees=float(cfg.get("degrees", 15.0)),
+            translate=float(cfg.get("translate", 0.1)),
+            scale=float(cfg.get("scale", 0.5)),
+            fliplr=float(cfg.get("fliplr", 0.5)),
+            flipud=float(cfg.get("flipud", 0.0)),
+            mixup=float(cfg.get("mixup", 0.15)),
+            copy_paste=float(cfg.get("copy_paste", 0.30)),
             cache=cfg.get("cache", "disk"),
         )
         if cfg.get("use_obb"):

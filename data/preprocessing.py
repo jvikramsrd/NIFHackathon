@@ -620,7 +620,7 @@ def tile_image_and_mask(
     out_img_dir: str,
     out_mask_dir: str,
     prefix: str,
-    min_fg: float = 0.003,
+    min_fg: float = 0.01,
 ) -> int:
     os.makedirs(out_img_dir, exist_ok=True)
     os.makedirs(out_mask_dir, exist_ok=True)
@@ -1262,6 +1262,7 @@ def _extract_infra_streaming(
     try:
         with rasterio.open(str(raster_path)) as src:
             crs = src.crs
+            geo_transform = src.transform
             H, W = src.height, src.width
     except Exception as e:
         log.info(f"      [SKIP infra] {e}")
@@ -1305,7 +1306,10 @@ def _extract_infra_streaming(
 
             try:
                 pt = geom.centroid
-                pr, pc = src.index(pt.x, pt.y)
+                # Use inverse affine transform (src is closed by this point)
+                inv_t = ~geo_transform
+                pc_f, pr_f = inv_t * (pt.x, pt.y)
+                pr, pc = int(pr_f), int(pc_f)
                 if pr < 0 or pr >= H or pc < 0 or pc >= W:
                     continue
                 infra_objects.append((cid, int(pc), int(pr)))

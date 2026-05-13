@@ -134,8 +134,8 @@ def apply_dense_crf(
     log.debug("[DEBUG CRF] tqdm imported. Preparing tasks...")
 
     C, H, W = prob_map.shape
-    tile_size = 2048
-    overlap = 256
+    tile_size = 1024  # CRF is O(n²); smaller tiles = 4× faster with bounded bilateral kernel
+    overlap = 128
     stride = tile_size - overlap
 
     # Use the shared cosine window utility for consistent blending

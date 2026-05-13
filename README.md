@@ -13,7 +13,7 @@ INPUT: SVAMITVA drone orthophoto (GeoTIFF / ECW) + Annotation Shapefiles
          ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │  STAGE 1 — Semantic Segmentation                                     │
-│  Architecture : UNet++ (nested dense skip connections)               │
+│  Architecture : Unet + scSE attention                                │
 │  Encoder      : MixTransformer B5 (mit_b5) — 84M params             │
 │  Input        : 512×512 patches, multi-scale (256/512/768)           │
 │  Output       : 4-class mask → Background / Building / Road / Water  │
@@ -67,7 +67,7 @@ Windows:    GeoIntel\GeoIntel.exe
 
 #### Prerequisites
 
-- Python 3.10 or 3.11
+- Python 3.10 – 3.12 (3.13 has known PyQt6 DLL issues on Windows; use 3.12)
 - Git
 
 #### 1. Clone
@@ -184,7 +184,7 @@ This installs two console commands:
 
 | Stage | Model | Input | Batch | NVIDIA A4000 | Apple M2 Max (96 GB unified) |
 |-------|-------|-------|-------|--------------|-------------------------------|
-| 1 — Segmentation | UNet++ mit_b5 | 512×512 | 2 | ~12.0 GB | ~18 GB unified |
+| 1 — Segmentation | Unet mit_b5 | 512×512 | 4 | ~13.5 GB | ~18 GB unified |
 | 2A — Classification | ConvNeXt-Large | 224×224 | 32 | ~7.8 GB | ~8 GB unified |
 | 2B — Detection | YOLOv9e | 1280×1280 | 2 | ~7.2 GB | ~9 GB unified |
 
@@ -303,11 +303,11 @@ NIFHackathon/
 │   └── dataset.py                 # PyTorch Datasets + Albumentations pipelines
 │
 ├── models/
-│   ├── stage1_segmentation.py     # UNet++ + TriLoss + Lovász + TTA
+│   ├── stage1_segmentation.py     # Unet + scSE + TriLoss + Lovász + TTA
 │   └── stage2_models.py           # ConvNeXt-Large + ArcFace + YOLOv9 + SAHI
 │
 ├── train/
-│   ├── train_stage1.py            # SAM, EMA, SWA, grad checkpointing
+│   ├── train_stage1.py            # EMA, SWA, grad checkpointing (SAM available, off by default)
 │   └── train_stage2.py            # Classifier + YOLO training loops
 │
 ├── inference/
@@ -334,7 +334,7 @@ NIFHackathon/
 
 | Feature | Stage | Impact |
 |---------|-------|--------|
-| UNet++ deep supervision | 1 | Sharper building boundaries |
+| Unet + scSE decoder attention | 1 | Channel + spatial recalibration on skip features |
 | Lovász-Softmax loss | 1 | Directly optimises mIoU |
 | Instance-touching separation loss | 1 | Prevents adjacent buildings merging |
 | Watershed instance separation | 1 | Clean split of touching footprints |
@@ -362,10 +362,13 @@ All hyperparameters live in `config.py`:
 | `DEVICE` | auto | cuda → mps → cpu, auto-detected |
 | `AMP_DTYPE` | auto | bf16 (CUDA) · fp16 (MPS) · fp32 (CPU) |
 | `FAST_TTA` | `False` | True = 8 passes, False = 24 passes (more accurate) |
+| `STAGE1["arch"]` | `Unet` | smp decoder; MiT encoders are not compatible with `UnetPlusPlus` |
 | `STAGE1["encoder"]` | `mit_b5` | 84M params |
 | `STAGE1["patch_size"]` | `512` | Training patch size |
 | `STAGE1["overlap"]` | `192` | Tile overlap for seamless stitching |
-| `STAGE1["batch_size"]` | `4` | ×8 grad accum = effective batch 32 |
+| `STAGE1["batch_size"]` | `4` | ×8 grad accum = effective batch 32 (SAM off) |
+| `STAGE1["epochs"]` | `60` | Default fine-tuning length for pretrained mit_b5 |
+| `STAGE1["use_sam"]` | `False` | Enabling doubles per-iter cost and forces grad_accum=1 |
 | `STAGE1["crf_iter"]` | `10` | CRF iterations at inference |
 | `STAGE1["class_weights"]` | `[0.30,1.80,4.50,2.20]` | Road 4.5× to force thin path connectivity |
 | `STAGE1["min_fg_ratio"]` | `0.01` | Drop training patches with <1% foreground |

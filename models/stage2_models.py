@@ -312,6 +312,7 @@ class InfrastructureDetector:
             translate=self.cfg.get("translate", 0.1),
             scale=self.cfg.get("scale", 0.5),
             fliplr=self.cfg.get("fliplr", 0.5),
+            flipud=self.cfg.get("flipud", 0.0),
             mixup=self.cfg.get("mixup", 0.15),
             copy_paste=self.cfg.get("copy_paste", 0.30),
             cache=self.cfg.get("cache", "ram"),

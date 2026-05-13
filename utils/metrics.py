@@ -127,7 +127,7 @@ class ClassificationMetrics:
 # ensures a single source of truth for mAP calculations.
 
 
-def _box_iou(b1, b2, threshold: float = None):
+def _box_iou(b1, b2):
     ix1 = max(b1[0], b2[0])
     iy1 = max(b1[1], b2[1])
     ix2 = min(b1[2], b2[2])
@@ -187,7 +187,7 @@ def compute_map(
                     if j in matched:
                         continue
                     # Pass the current threshold to the IoU calculation
-                    iou = _box_iou(pred[:4], gt[:4], threshold=iou_thresh)
+                    iou = _box_iou(pred[:4], gt[:4])
                     if iou > best_iou:
                         best_iou, best_j = iou, j
 

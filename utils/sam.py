@@ -65,7 +65,7 @@ class SAM(torch.optim.Optimizer):
                 p.add_(e_w)  # w + epsilon
 
         if zero_grad:
-            self.zero_grad()
+            self.zero_grad(set_to_none=True)
 
     @torch.no_grad()
     def second_step(self, zero_grad: bool = False) -> None:
@@ -79,7 +79,7 @@ class SAM(torch.optim.Optimizer):
         self._base.step()
 
         if zero_grad:
-            self.zero_grad()
+            self.zero_grad(set_to_none=True)
 
     @torch.no_grad()
     def step(self, closure=None) -> None:
