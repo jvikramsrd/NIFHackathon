@@ -74,10 +74,11 @@ else:
 COMPILE_ENABLED = False
 COMPILE_MODE = "reduce-overhead"
 FAST_TTA = False  # True = 2-scale×4-fold (8 passes); False = 3-scale×8-fold (24 passes, more accurate)
-NUM_WORKERS = 4
+NUM_WORKERS = 8
 PIN_MEMORY = True
-PREFETCH_FACTOR = 2
+PREFETCH_FACTOR = 4
 PERSISTENT_WORKERS = True
+MAX_STEPS_PER_EPOCH = 1000  # cap steps/epoch to keep wall-time ≤ 30 min
 
 # ─── SVAMITVA SHP → Class mapping ────────────────────────────────────────────
 # Each SHP file uses a specific attribute column for classification.
@@ -158,14 +159,14 @@ STAGE1 = dict(
     in_channels=3,
     decoder_attention_type='scse',
     patch_size=512,
-    patch_sizes=(256, 512, 768),
+    patch_sizes=(512,),
     overlap=128,
     batch_size=6,
     grad_accum=4,
     lr=2e-4,
     encoder_lr_mult=0.1,
     weight_decay=1e-4,
-    epochs=40,
+    epochs=80,
     warmup_epochs=3,
     scheduler='cosine',
     use_sam=False,

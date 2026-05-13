@@ -152,7 +152,7 @@ def train_stage1(resume: bool = True):
     else:
         optimiser = base_opt
 
-    steps_per_ep = math.ceil(len(train_loader) / grad_accum)
+    steps_per_ep = math.ceil(min(len(train_loader), int(getattr(CFG, "MAX_STEPS_PER_EPOCH", len(train_loader)))) / grad_accum)
     max_lrs = [g.get("lr", cfg["lr"]) for g in param_groups]
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimiser if not use_sam else base_opt,
@@ -192,6 +192,7 @@ def train_stage1(resume: bool = True):
 
     ms_training = cfg.get("ms_training", False)
     ms_scales = cfg.get("ms_scales", (0.75, 1.0, 1.25))
+    max_steps_per_epoch = int(getattr(CFG, "MAX_STEPS_PER_EPOCH", len(train_loader)))
 
     # ── Training loop ─────────────────────────────────────────────────────────
     for epoch in range(start_epoch, cfg["epochs"] + 1):
@@ -208,10 +209,15 @@ def train_stage1(resume: bool = True):
         else:
             optimiser.zero_grad(set_to_none=True)
 
-        train_pbar = tqdm(enumerate(train_loader), total=len(train_loader),
+        capped_steps = min(len(train_loader), max_steps_per_epoch)
+        train_pbar = tqdm(enumerate(train_loader), total=capped_steps,
                           desc=f"Train Ep {epoch:03d}", leave=False, dynamic_ncols=True)
+        actual_steps = 0
 
         for step, (imgs, masks) in train_pbar:
+            if step >= max_steps_per_epoch:
+                break
+            actual_steps += 1
             imgs = imgs.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
 
@@ -276,8 +282,8 @@ def train_stage1(resume: bool = True):
             ep_loss += loss.item() * grad_accum
             train_pbar.set_postfix(loss=f"{loss.item() * grad_accum:.4f}")
 
-        # Flush remaining gradients if loader length is not a multiple of grad_accum
-        if not use_sam and (len(train_loader) % grad_accum) != 0:
+        # Flush remaining gradients if steps run is not a multiple of grad_accum
+        if not use_sam and (actual_steps % grad_accum) != 0:
             total_norm = torch.nn.utils.clip_grad_norm_(module.parameters(), 1.0)
             if total_norm.item() <= 10.0:
                 optimiser.step()
@@ -289,7 +295,7 @@ def train_stage1(resume: bool = True):
                 if ema:
                     ema.update(module)
 
-        ep_loss /= len(train_loader)
+        ep_loss /= max(actual_steps, 1)
 
         if ema:
             ema.apply_shadow(module)

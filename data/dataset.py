@@ -188,8 +188,6 @@ def get_train_transforms(patch_size: int = 640, patch_sizes=None):
                 ],
                 p=0.7,
             ),
-            # Simulate haze/fog in aerial imagery
-            A.RandomFog(fog_coef_range=(0.05, 0.15), p=0.20),
             A.OneOf(
                 [
                     A.GaussNoise(std_range=(0.04, 0.24)),
@@ -199,15 +197,7 @@ def get_train_transforms(patch_size: int = 640, patch_sizes=None):
                 ],
                 p=0.35,
             ),
-            A.OneOf(
-                [
-                    A.ElasticTransform(alpha=120, sigma=6),
-                    A.Perspective(scale=(0.05, 0.1)),
-                    # GridDistortion: simulates sensor wobble / terrain undulation
-                    A.GridDistortion(num_steps=5, distort_limit=0.3, p=1.0),
-                ],
-                p=0.30,
-            ),
+            A.Perspective(scale=(0.05, 0.1), p=0.20),
             # NOTE: A.Affine with scale was removed — the multi-scale crop block
             # above already handles scale augmentation, and double-scaling mis-aligns
             # the segmentation mask relative to the image.
