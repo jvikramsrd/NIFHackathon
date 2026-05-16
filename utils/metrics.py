@@ -55,13 +55,21 @@ class SegmentationMetrics:
 
         pix_acc = tp.sum() / np.maximum(cm.sum(), 1e-6)
 
+        # Exclude background (class 0) from mean reductions. Guard against the
+        # num_classes == 1 case where iou[1:] is empty — np.mean of an empty
+        # slice raises a RuntimeWarning and returns NaN.
+        fg_iou = iou[1:] if iou.shape[0] > 1 else iou
+        fg_f1 = f1[1:] if f1.shape[0] > 1 else f1
+        fg_cm_rows = cm[1:] if cm.shape[0] > 1 else cm
+
         return {
             "class_iou": iou.tolist(),
             "class_f1": f1.tolist(),
-            "mean_iou": float(iou[1:].mean()),  # exclude background
-            "mean_f1": float(f1[1:].mean()),
+            "mean_iou": float(fg_iou.mean()) if fg_iou.size else 0.0,
+            "mean_f1": float(fg_f1.mean()) if fg_f1.size else 0.0,
             "pixel_acc": float(pix_acc),
-            "fg_pixel_acc": float(tp[1:].sum() / np.maximum(cm[1:].sum(), 1e-6)),
+            "fg_pixel_acc": float(tp[1:].sum() / np.maximum(fg_cm_rows.sum(), 1e-6))
+                if iou.shape[0] > 1 else float(pix_acc),
         }
 
     def summary(self) -> str:
@@ -186,11 +194,12 @@ def compute_map(
                 for j, gt in enumerate(gts_c):
                     if j in matched:
                         continue
-                    # Pass the current threshold to the IoU calculation
                     iou = _box_iou(pred[:4], gt[:4])
                     if iou > best_iou:
                         best_iou, best_j = iou, j
 
+                # Threshold is applied AFTER finding the best-matching GT for
+                # this prediction (standard VOC/COCO mAP convention).
                 if best_iou >= iou_thresh:
                     tp[i] = 1
                     matched.add(best_j)

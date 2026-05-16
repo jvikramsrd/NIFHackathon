@@ -100,7 +100,7 @@ NIFHackathon/
 │   └── preprocessing.py        ← Raw TIF → patches/crops/YOLO labels
 │
 ├── models/
-│   ├── stage1_segmentation.py  ← UNet++ model, losses, TTA
+│   ├── stage1_segmentation.py  ← Unet/MiT-B4 model, losses, TTA
 │   └── stage2_models.py        ← ConvNeXt+ArcFace classifier, YOLO detector
 │
 ├── inference/
@@ -150,7 +150,7 @@ GeoTIFF ortho
       │
       ├─────────────────────────────────────────────────────────┐
       ▼                                                         │
-[STAGE 1]  UNet++ / MiT-B5                                      │
+[STAGE 1]  Unet / MiT-B4                                        │
   Tiled inference (512px patches, 192px overlap)                │
   3-scale × 8-fold TTA (24 passes, controlled by FAST_TTA)      │
   Dense CRF refinement (10 iterations)                          │
@@ -186,14 +186,14 @@ GeoTIFF ortho
 
 ### Model: `models/stage1_segmentation.py`
 
-**Architecture:** UNet++ with:
-- Encoder: **MiT-B5** (Mix Transformer, 82M params) — pretrained on ImageNet
+**Architecture:** Unet with:
+- Encoder: **MiT-B4** (Mix Transformer) — pretrained on ImageNet
 - Decoder: **scSE attention** (channel + spatial squeeze-excitation) on every decoder block
 - Activation: `None` (raw logits, softmax applied at loss/inference time)
 
-**Why UNet++:** Nested dense skip connections give sharper boundaries compared to standard UNet, critical for separating adjacent buildings.
+**Why Unet:** It is the most stable SMP decoder with MiT encoders, trains faster than UNet++/MAnet variants, and keeps clean skip-feature detail for building, road, and water boundaries.
 
-**Why MiT-B5:** Hierarchical Vision Transformer. Captures both fine-grained texture (tile ridges, road markings) and global context (building clusters) in a single encoder.
+**Why MiT-B4:** Hierarchical Vision Transformer. It captures fine-grained texture and settlement context while cutting VRAM and iteration time versus MiT-B5.
 
 ### Loss: `TriLoss`
 
@@ -211,7 +211,7 @@ A weighted sum of six losses:
 **Class weights:** `[0.30, 1.80, 4.50, 2.20]` for background/building/road/waterbody.  
 Road gets the highest weight (4.5×) because it is narrow and easily confused with shadows.
 
-**Deep supervision:** UNet++ produces auxiliary outputs at decoder stages 2/3/4. The loss averages them with weights `[1.0, 0.4, 0.2, 0.1]`, forcing intermediate decoder features to be meaningful.
+**Auxiliary-output ready:** The loss still supports auxiliary logits if a future architecture returns them, but the production Unet path uses a single main head.
 
 ### TTA: `tta_predict`
 
@@ -377,10 +377,10 @@ Preprocessing's `_to_uint8` also uses percentile stretch (2nd–98th, excluding 
 ### Stage 1: `train/train_stage1.py`
 
 **Optimiser:** **SAM (Sharpness-Aware Minimization)** wrapping AdamW.  
-SAM finds flatter loss minima, which generalise better. It does two forward+backward passes per step. On 16 GB VRAM with UNet++/MiT-B5, this forces `batch_size=2` (auto-detected and applied).
+SAM finds flatter loss minima, which generalise better. It does two forward+backward passes per step. With Unet/MiT-B4, the code keeps the encoder fixed and only reduces batch size on low-VRAM GPUs.
 
 **Layer-wise learning rates:**
-- Encoder (MiT-B5): `lr × 0.1 = 2e-5` — fine-tunes pretrained features gently
+- Encoder (MiT-B4): `lr × 0.1 = 2e-5` — fine-tunes pretrained features gently
 - Decoder: `lr = 2e-4` — trains from scratch aggressively
 
 **Scheduler:** OneCycleLR (`pct_start=0.1`, `div_factor=25`, `final_div_factor=1e4`)
@@ -414,7 +414,7 @@ Patches are sorted by foreground ratio into 4 quartile strata, then each stratum
 
 **DDP support:** Fully implemented via `utils/ddp.py`. Launch with `train/launch_ddp.py`. Single-GPU falls through to standard training with no code changes.
 
-**Gradient checkpointing:** Enabled on MiT-B5 encoder if supported (`model.encoder.set_grad_checkpointing(True)`).
+**Gradient checkpointing:** Enabled on MiT-B4 encoder if supported (`model.encoder.set_grad_checkpointing(True)`).
 
 **Gradient clipping:** `clip_grad_norm_(1.0)`. Skips optimizer step if norm > 10.0 (spike guard).
 
@@ -606,19 +606,19 @@ PREFETCH_FACTOR= 3
 ```python
 num_classes        = 4
 class_names        = ['background', 'building', 'road', 'waterbody']
-arch               = 'UnetPlusPlus'
-encoder            = 'mit_b5'
+arch               = 'Unet'
+encoder            = 'mit_b4'
 encoder_weights    = 'imagenet'
 patch_size         = 512
-patch_sizes        = (256, 512, 768)   # multi-scale training crop sizes
-overlap            = 192               # tile overlap at inference (no longer capped)
-batch_size         = 4                 # auto-reduced to 2 when SAM is active on 16GB
-grad_accum         = 8
+patch_sizes        = (512,)
+overlap            = 128
+batch_size         = 8                 # auto-reduced on low-VRAM GPUs
+grad_accum         = 4
 lr                 = 2e-4
 encoder_lr_mult    = 0.1               # encoder LR = lr * 0.1
 weight_decay       = 1e-4
-epochs             = 150
-warmup_epochs      = 5
+epochs             = 80
+warmup_epochs      = 3
 # Loss weights
 dice_weight        = 0.40
 bce_weight         = 0.15
@@ -723,7 +723,7 @@ All improvements made to this codebase, in chronological order from oldest to ne
 
 ---
 
-### feat: Docker support + SAM + DDP (`fb618f4`)
+### feat: SAM + DDP + reproducible installer (`fb618f4`)
 
 **What was added:**
 - **SAM optimizer** (`utils/sam.py`): Sharpness-Aware Minimisation wrapping AdamW. Two forward+backward passes per step → flatter loss minima → better generalisation.
@@ -731,8 +731,9 @@ All improvements made to this codebase, in chronological order from oldest to ne
 - **EMA** (`utils/hardware.py`): Exponential Moving Average over model weights. Validation uses EMA weights; best checkpoint saves EMA, not raw weights.
 - **SWA**: Stochastic Weight Averaging from epoch 75%, with BN stat update after training.
 - **Modular training pipelines**: `train_stage1.py`, `train_stage2.py` as importable functions.
-- **Docker support**: Dockerfile + `install.sh` for reproducible environment.
+- **Cross-platform installer**: `install.sh` (macOS/Linux) + `setup_venv.bat` (Windows) detect the right PyTorch wheel (CUDA / ROCm / MPS / CPU) and provision a `venv`.
 - **Atomic checkpointing** (`utils/checkpointing.py`): Writes to `.tmp` first, then `os.replace()`.
+- _(Note: a prior Dockerfile was removed in v1.x — PyInstaller binaries are now the recommended distribution; see `geo_intel.spec` and `geo_intel_cli.spec`.)_
 
 ---
 
@@ -796,8 +797,7 @@ All improvements made to this codebase, in chronological order from oldest to ne
 This commit introduced a large set of improvements across the entire codebase:
 
 **Stage 1 model:**
-- Upgraded encoder from `mit_b4` → **`mit_b5`** (larger transformer, better features)
-- Added **UNet++ nested dense skip connections** (was standard UNet)
+- Standardized Stage 1 on **Unet + MiT-B4** for production speed/accuracy balance
 - Added **scSE decoder attention** on all decoder blocks
 - Added **deep supervision** (auxiliary heads at stages 2/3/4, aux weights 0.4/0.2/0.1)
 - Added **Lovász-Softmax loss** (directly optimises mIoU instead of a proxy)
@@ -811,8 +811,8 @@ This commit introduced a large set of improvements across the entire codebase:
 - Stratified train/val split by foreground ratio quartile
 - OneCycleLR scheduler (replaced CosineAnnealingLR)
 - VRAM auto-guard: auto-reduces batch size when SAM is active on ≤16 GB GPU
-- VRAM auto-guard: auto-downgrades encoder to `mit_b4` if VRAM < 14 GB
-- Gradient checkpointing on MiT-B5 encoder
+- VRAM auto-guard: keeps `mit_b4` fixed and reduces batch size on low-VRAM GPUs
+- Gradient checkpointing on MiT-B4 encoder
 - Gradient spike guard: skips optimizer step if grad norm > 10
 
 **Stage 1 inference:**

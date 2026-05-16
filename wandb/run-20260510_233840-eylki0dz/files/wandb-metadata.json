@@ -1,0 +1,34 @@
+{
+  "os":  "Windows-11-10.0.26200-SP0",
+  "python":  "CPython 3.14.4",
+  "startedAt":  "2026-05-10T18:08:40.411713Z",
+  "args":  [
+    "--mode",
+    "train_stage1",
+    "--data_root",
+    "C:/Users/Jvikr/OneDrive/Documents/NIFHackathon/dataset"
+  ],
+  "program":  "C:\\Users\\Jvikr\\OneDrive\\Documents\\NIFHackathon\\run_pipeline.py",
+  "codePath":  "run_pipeline.py",
+  "codePathLocal":  "run_pipeline.py",
+  "git":  {
+    "remote":  "https://github.com/jvikramsrd/NIFHackathon.git",
+    "commit":  "ef49128d1fe29420754b84a1113289a20a0aa6c0"
+  },
+  "email":  "jvikramsrd@gmail.com",
+  "root":  "C:\\Users\\Jvikr\\OneDrive\\Documents\\NIFHackathon",
+  "host":  "Laptop-Vikrama",
+  "executable":  "C:\\Users\\Jvikr\\OneDrive\\Documents\\NIFHackathon\\venv\\Scripts\\python.exe",
+  "cpu_count":  6,
+  "cpu_count_logical":  12,
+  "disk":  {
+    "/":  {
+      "total":  "511048675328",
+      "used":  "335840952320"
+    }
+  },
+  "memory":  {
+    "total":  "16330452992"
+  },
+  "writerId":  "bo15e1yzpj2iv0a303zwbfy7o15pj05b"
+}

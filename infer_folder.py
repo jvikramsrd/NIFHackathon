@@ -1,5 +1,4 @@
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -77,7 +76,7 @@ def infer_folder(test_folder: str, out_base_dir: str):
 
             # Create a unique output subfolder for this specific file
             out_dir = out_base_path / raster.stem
-            os.makedirs(out_dir, exist_ok=True)
+            out_dir.mkdir(parents=True, exist_ok=True)
 
             # Convert ECW → TIF if needed (deleted after this image is done)
             process_path = raster

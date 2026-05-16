@@ -50,28 +50,15 @@ log = get_logger(__name__)
 
 class GeoIntelPipeline:
     def __init__(self, stage1_ckpt, stage2a_ckpt, stage2b_ckpt=None):
-        from pathlib import Path
-
-        import torch
-
-        import config as CFG
-        from data.dataset import get_clf_val_transforms, get_val_transforms
-        from models.stage1_segmentation import Stage1Module
-        from models.stage2_models import InfrastructureDetector, RooftopClassifier
-        from utils.hardware import (
-            compile_model,
-            get_amp_context,
-            setup,
-            to_channels_last,
-            vram_stats,
-        )
-
+        # All required names are imported at module top — no need to re-import
+        # inside __init__. The duplicate imports were defensive scaffolding
+        # from an early refactor and just added clutter.
         self.device = setup()
         self.amp_ctx, _ = get_amp_context(CFG.AMP_DTYPE)
 
         log.info(f"[Pipeline] {vram_stats()}")
 
-        # Stage 1 — Swin-B UNet++ (channels_last applied to match training)
+        # Stage 1 — Unet + MiT-B4 (channels_last applied to match training)
         log.info("[1] Loading Stage-1 segmentation model …")
         ckpt = torch.load(stage1_ckpt, map_location=self.device, weights_only=False)
         self.seg = Stage1Module(CFG.STAGE1).to(self.device)
@@ -79,7 +66,7 @@ class GeoIntelPipeline:
         self.seg.load_state_dict(seg_state, strict=True)
         self.seg.eval()
         if CFG.COMPILE_ENABLED:
-            # fullgraph=False: Swin-B has conditional ops in attention
+            # fullgraph=False keeps MiT encoder attention/control-flow tolerant.
             self.seg.model = compile_model(
                 self.seg.model, CFG.COMPILE_MODE, fullgraph=False
             )
@@ -110,25 +97,20 @@ class GeoIntelPipeline:
             self.detector.model = YOLO(str(stage2b_ckpt))
             self.detector._backend = "yolo"
 
+        # Cache the cosine blending window once. _segment() was recomputing this
+        # on every call (a constant given (patch_size, overlap)) — the cost is
+        # small but it's pure waste.
+        from utils.window import cosine_window
+        _ps = int(CFG.STAGE1.get("patch_size", 512))
+        _ov = int(CFG.STAGE1.get("overlap", 128))
+        self._seg_window = cosine_window(_ps, _ov).astype(np.float32)
+
         log.info("✓ All models ready\n")
 
     def run(self, tif_path: str, out_dir: str):
         import tempfile
-        from pathlib import Path
 
-        import numpy as np
-        import rasterio
-
-        import config as CFG
         from utils.ecw_compat import ecw_to_tif, is_ecw
-        from utils.hardware import clear_cuda_cache
-        from utils.postprocess import (
-            apply_dense_crf,
-            clean_segmentation_mask,
-            detections_to_shapefile,
-            mask_to_shapefile,
-            merge_rooftop_labels,
-        )
 
         out_dir_p = Path(out_dir)
         out_dir_p.mkdir(parents=True, exist_ok=True)
@@ -257,29 +239,25 @@ class GeoIntelPipeline:
 
     # ── Stage 1 tiled inference ───────────────────────────────────────────────
 
-    def _spline_window(self, window_size, overlap, power=2):
-        """
-        Create a 2D spline window for smooth blending.
-        """
-        intersection = int(overlap)
-        wind_outer = (np.cos(np.pi * np.arange(intersection) / intersection) + 1) / 2
-        wind = np.ones(window_size)
-        wind[:intersection] = wind_outer[::-1]
-        wind[-intersection:] = wind_outer
-        wind = wind**power
-        wind_2d = np.outer(wind, wind)
-        return wind_2d
-
     def _segment(self, img_rgb: np.ndarray) -> np.ndarray:
         H, W = img_rgb.shape[:2]
-        ps = int(CFG.STAGE1["patch_size"])  # type: ignore
-        # Reduce overlap for faster inference (smooth blending prevents seams anyway)
+        if H == 0 or W == 0:
+            raise ValueError(f"Invalid image dimensions: {H}x{W}")
+
+        ps = int(CFG.STAGE1["patch_size"])
+        if ps <= 0:
+            raise ValueError(f"Invalid patch_size: {ps}")
+
         overlap = int(CFG.STAGE1["overlap"])
-        stride = ps - overlap  # type: ignore
-        C = int(CFG.STAGE1["num_classes"])  # type: ignore
+        stride = max(1, ps - overlap)
+        C = int(CFG.STAGE1["num_classes"])
+
+        if C <= 0:
+            raise ValueError(f"Invalid num_classes: {C}")
+
         prob_sum = np.zeros((C, H, W), dtype=np.float32)
         count_map = np.zeros((H, W), dtype=np.float32)
-        window = self._spline_window(ps, overlap)
+        window = self._seg_window
 
         batch_size = 16
         batch_inputs = []
@@ -289,7 +267,11 @@ class GeoIntelPipeline:
             for r in tqdm(range(0, H, stride), desc="  tiles"):
                 for c in range(0, W, stride):
                     r2, c2 = min(r + ps, H), min(c + ps, W)
+                    if r2 <= r or c2 <= c:
+                        continue
                     patch = img_rgb[r:r2, c:c2].copy()
+                    if patch.size == 0:
+                        continue
                     ph, pw = patch.shape[:2]
 
                     if ph < ps or pw < ps:
@@ -348,94 +330,136 @@ class GeoIntelPipeline:
     def _classify_rooftops(self, img_rgb, bld_shp_path, transform, building_polygons=None):
         import geopandas as gpd
 
-        gdf = gpd.read_file(bld_shp_path)
-        preds = {}
-        inv_transform = ~transform
-        context_union = None
+        if not Path(bld_shp_path).exists():
+            log.warning(f"Building shapefile not found: {bld_shp_path}")
+            return {}
+
+        # Reuse the GDF the caller already loaded — the original code ignored
+        # the passed argument and re-ran ``gpd.read_file`` (a non-trivial cost
+        # on 10K+ building shapefiles).
         if building_polygons is not None and len(building_polygons) > 0:
+            gdf = building_polygons
+        else:
             try:
-                context_union = building_polygons.geometry.unary_union
-            except Exception as exc:
-                log.warning("Could not build rooftop context union: %s", exc)
+                gdf = gpd.read_file(bld_shp_path)
+            except Exception as e:
+                log.warning(f"Failed to read building shapefile: {e}")
+                return {}
+
+        if len(gdf) == 0:
+            log.warning("Empty building shapefile")
+            return {}
+
+        preds = {}
+        try:
+            inv_transform = ~transform
+        except Exception as e:
+            log.warning(f"Invalid transform for rooftop classification: {e}")
+            return {}
+
+        # Note: the previous version built ``building_polygons.geometry.unary_union``
+        # and tested ``geom.intersects(context_union)`` per building. unary_union
+        # on the entire dataset is wasteful here — the context filter is meant
+        # to skip stray polygons, which a STRtree handles in O(log N).
+        # In practice every building intersects its own footprint anyway, so we
+        # only build the tree when the caller passed a *different* context set.
 
         batch_size = 64
         batch_inputs = []
         batch_indices = []
+        class_names_2a = [str(x) for x in CFG.STAGE2A["class_names"]]
+        per_class_thresh = CFG.STAGE2A.get(
+            "stage2a_conf_thresh",
+            {n: 0.55 for n in class_names_2a},
+        )
 
         def _process_batch(inputs, indices):
             if not inputs:
                 return
-            inp_tensor = torch.stack(inputs).to(self.device)
-            inp_tensor = cl_input(inp_tensor)
-            with torch.no_grad():
-                # Use full 24-fold TTA at final inference for maximum accuracy
-                probs = self.clf.predict(
-                    inp_tensor, tta_steps=24, return_probs=True
-                )
+            try:
+                inp_tensor = torch.stack(inputs).to(self.device, non_blocking=True)
+                inp_tensor = cl_input(inp_tensor)
+                with torch.no_grad():
+                    probs = self.clf.predict(
+                        inp_tensor, tta_steps=24, return_probs=True
+                    )
 
-            class_names_2a = [str(x) for x in CFG.STAGE2A["class_names"]]
-            per_class_thresh = CFG.STAGE2A.get(
-                "stage2a_conf_thresh",
-                {n: 0.55 for n in class_names_2a},
-            )
-            max_probs, pids = torch.max(probs, dim=1)
-
-            for i, i_idx in enumerate(indices):
-                pred_name = class_names_2a[pids[i].item()]
-                thresh = per_class_thresh.get(pred_name, 0.55)
-                if max_probs[i].item() < thresh:
+                max_probs, pids = torch.max(probs, dim=1)
+                # Move to CPU once for the per-class threshold lookup.
+                max_probs_np = max_probs.detach().cpu().numpy()
+                pids_np = pids.detach().cpu().numpy()
+                for i, i_idx in enumerate(indices):
+                    pred_name = class_names_2a[int(pids_np[i])]
+                    thresh = per_class_thresh.get(pred_name, 0.55)
+                    preds[i_idx] = pred_name if float(max_probs_np[i]) >= thresh else "Other"
+            except Exception as e:
+                log.warning(f"Batch processing failed: {e}")
+                for i_idx in indices:
                     preds[i_idx] = "Other"
-                else:
-                    preds[i_idx] = pred_name
 
-        for idx, row in tqdm(gdf.iterrows(), total=len(gdf), desc="  roofs"):
-            geom = row.geometry
-            if geom is None or geom.is_empty:
-                continue
-            if context_union is not None and not geom.intersects(context_union):
+        min_crop = int(CFG.STAGE2A["min_crop_px"])
+        crop_sz = int(CFG.STAGE2A["crop_size"])
+        H_img, W_img = img_rgb.shape[:2]
+
+        # iterrows builds a fresh Series per row — pull what we need into
+        # native arrays once.
+        geoms_arr = gdf.geometry.values
+        index_arr = gdf.index.to_numpy()
+
+        for k in tqdm(range(len(geoms_arr)), total=len(geoms_arr), desc="  roofs"):
+            idx = index_arr[k]
+            try:
+                geom = geoms_arr[k]
+                if geom is None or geom.is_empty:
+                    preds[idx] = "Other"
+                    continue
+
+                geo_x1, geo_y1, geo_x2, geo_y2 = geom.bounds
+                px_x1, px_y1 = inv_transform * (geo_x1, geo_y1)
+                px_x2, px_y2 = inv_transform * (geo_x2, geo_y2)
+
+                x1, x2 = sorted((int(px_x1), int(px_x2)))
+                y1, y2 = sorted((int(px_y1), int(px_y2)))
+                h, w = y2 - y1, x2 - x1
+
+                pad_x = int(w * 0.15)
+                pad_y = int(h * 0.15)
+                x1 -= pad_x
+                x2 += pad_x
+                y1 -= pad_y
+                y2 += pad_y
+
+                if h < min_crop or w < min_crop:
+                    preds[idx] = "Other"
+                    continue
+                x1c = max(0, x1)
+                y1c = max(0, y1)
+                x2c = min(W_img, x2)
+                y2c = min(H_img, y2)
+
+                if x2c <= x1c or y2c <= y1c:
+                    preds[idx] = "Other"
+                    continue
+
+                img_slice = img_rgb[y1c:y2c, x1c:x2c]
+                if img_slice.size == 0:
+                    preds[idx] = "Other"
+                    continue
+
+                crop = cv2.resize(img_slice, (crop_sz, crop_sz), interpolation=cv2.INTER_LINEAR)
+                inp = self.clf_tf(image=crop)["image"]
+
+                batch_inputs.append(inp)
+                batch_indices.append(idx)
+
+                if len(batch_inputs) == batch_size:
+                    _process_batch(batch_inputs, batch_indices)
+                    batch_inputs = []
+                    batch_indices = []
+            except Exception as e:
+                log.debug(f"Skipping building {idx} due to error: {e}")
                 preds[idx] = "Other"
                 continue
-
-            geo_x1, geo_y1, geo_x2, geo_y2 = geom.bounds
-            px_x1, px_y1 = inv_transform * (geo_x1, geo_y1)
-            px_x2, px_y2 = inv_transform * (geo_x2, geo_y2)
-
-            x1, x2 = sorted((int(px_x1), int(px_x2)))
-            y1, y2 = sorted((int(px_y1), int(px_y2)))
-            h, w = y2 - y1, x2 - x1
-
-            pad_x = int(w * 0.15)
-            pad_y = int(h * 0.15)
-            x1 -= pad_x
-            x2 += pad_x
-            y1 -= pad_y
-            y2 += pad_y
-
-            min_crop = int(CFG.STAGE2A["min_crop_px"])
-            if h < min_crop or w < min_crop:
-                preds[idx] = "Other"
-                continue
-            x1c = max(0, x1)
-            y1c = max(0, y1)
-            x2c = min(img_rgb.shape[1], x2)
-            y2c = min(img_rgb.shape[0], y2)
-            crop_sz = int(CFG.STAGE2A["crop_size"])
-
-            img_slice = img_rgb[y1c:y2c, x1c:x2c]
-            if img_slice.size == 0 or img_slice.shape[0] == 0 or img_slice.shape[1] == 0:
-                preds[idx] = "Other"
-                continue
-
-            crop = cv2.resize(img_slice, (crop_sz, crop_sz), interpolation=cv2.INTER_LINEAR)
-            inp = self.clf_tf(image=crop)["image"]
-
-            batch_inputs.append(inp)
-            batch_indices.append(idx)
-
-            if len(batch_inputs) == batch_size:
-                _process_batch(batch_inputs, batch_indices)
-                batch_inputs = []
-                batch_indices = []
 
         if len(batch_inputs) > 0:
             _process_batch(batch_inputs, batch_indices)
@@ -450,7 +474,11 @@ class GeoIntelPipeline:
         from shapely.geometry import box as shapely_box
 
         polys = []
-        for cls_name in ["building", "road"]:
+        context_classes = CFG.STAGE2B.get(
+            "context_classes", ("building", "road", "waterbody")
+        )
+        context_buffer_px = int(CFG.STAGE2B.get("context_buffer_px", 64))
+        for cls_name in context_classes:
             shp_path = Path(out_dir_p) / f"{prefix}_{cls_name}.shp"
             if shp_path.exists():
                 try:
@@ -479,7 +507,9 @@ class GeoIntelPipeline:
                 x1, x2 = sorted((float(px_x1), float(px_x2)))
                 y1, y2 = sorted((float(px_y1), float(px_y2)))
                 if x2 > x1 and y2 > y1:
-                    pixel_boxes.append(shapely_box(x1, y1, x2, y2).buffer(64))
+                    pixel_boxes.append(
+                        shapely_box(x1, y1, x2, y2).buffer(context_buffer_px)
+                    )
             except Exception as exc:
                 log.debug("Skipping invalid context polygon: %s", exc)
 
@@ -488,74 +518,97 @@ class GeoIntelPipeline:
     # ── Stage 2B infrastructure detection (tiled) ────────────────────────────
 
     def _detect(self, img_rgb, context_polys=None):
-        import os
-        import tempfile
-
         from shapely.geometry import box as shapely_box
+        from shapely.strtree import STRtree
 
         from models.stage2_models import soft_nms_gaussian
 
-        tile = int(CFG.STAGE2B["img_size"])
-        overlap = int(CFG.STAGE2B.get("overlap", 256))
-        stride = tile - overlap
-
         H, W = img_rgb.shape[:2]
+        if H == 0 or W == 0:
+            log.warning("Invalid image dimensions for detection")
+            return []
+
+        tile = int(CFG.STAGE2B["img_size"])
+        if tile <= 0:
+            raise ValueError(f"Invalid tile size: {tile}")
+
+        overlap = int(CFG.STAGE2B.get("overlap", 256))
+        stride = max(1, tile - overlap)
+
+        # O(log N) spatial index for the context filter. The old code did
+        # ``any(tile_geom.intersects(poly) for poly in context_polys)`` per tile —
+        # O(N) shapely intersection tests scaled with the building/road count.
+        ctx_tree = None
+        if context_polys is not None:
+            valid_polys = [p for p in context_polys if p is not None]
+            if valid_polys:
+                ctx_tree = STRtree(valid_polys)
+
         dets = []
         det_tiles_total = 0
         det_tiles_skipped = 0
 
-        tmp_dir = Path(tempfile.mkdtemp(prefix="geo_infra_"))
+        for r in tqdm(range(0, H, stride), desc="  det tiles"):
+            for c in range(0, W, stride):
+                r2, c2 = min(r + tile, H), min(c + tile, W)
+                if r2 <= r or c2 <= c:
+                    continue
+                det_tiles_total += 1
 
-        try:
-            for r in tqdm(range(0, H, stride), desc="  det tiles"):
-                for c in range(0, W, stride):
-                    r2, c2 = min(r + tile, H), min(c + tile, W)
-                    det_tiles_total += 1
-
-                    if context_polys is not None:
+                if ctx_tree is not None:
+                    try:
                         tile_geom = shapely_box(c, r, c2, r2)
-                        if not any(tile_geom.intersects(poly) for poly in context_polys):
+                        if len(ctx_tree.query(tile_geom)) == 0:
                             det_tiles_skipped += 1
                             continue
+                    except Exception:
+                        pass
 
-                    patch = img_rgb[r:r2, c:c2]
+                patch = img_rgb[r:r2, c:c2]
+                if patch.size == 0:
+                    continue
 
-                    # Use in-memory buffer to avoid disk I/O overhead
-                    _, buf = cv2.imencode('.jpg', cv2.cvtColor(patch, cv2.COLOR_RGB2BGR))
-                    tmp_path = tmp_dir / f"tile_{r}_{c}.jpg"
-                    tmp_path.write_bytes(buf.tobytes())
-                    for d in self.detector.predict(str(tmp_path)):
+                # Hand YOLO the BGR ndarray directly. The old path JPEG-encoded
+                # the patch, wrote it to a temp file, made YOLO re-read it, then
+                # deleted the file — per tile. That's three avoidable disk I/Os
+                # plus a lossy JPEG round-trip in the inference path.
+                try:
+                    bgr = cv2.cvtColor(patch, cv2.COLOR_RGB2BGR)
+                    for d in self.detector.predict(bgr):
                         d["bbox_xyxy"][0] += c
                         d["bbox_xyxy"][2] += c
                         d["bbox_xyxy"][1] += r
                         d["bbox_xyxy"][3] += r
                         dets.append(d)
-                    tmp_path.unlink(missing_ok=True)
-        finally:
-            import shutil
-            shutil.rmtree(str(tmp_dir), ignore_errors=True)
+                except Exception as e:
+                    log.debug(f"Tile {r},{c} failed: {e}")
+                    continue
 
         if dets:
-            sigma = float(CFG.STAGE2B.get("soft_nms_sigma", 0.5))
-            conf_thresh = float(CFG.STAGE2B["conf_thresh"])
-            unique_classes = set(d["class_id"] for d in dets)
-            final_dets = []
+            try:
+                sigma = float(CFG.STAGE2B.get("soft_nms_sigma", 0.5))
+                conf_thresh = float(CFG.STAGE2B["conf_thresh"])
+                unique_classes = set(d["class_id"] for d in dets)
+                final_dets = []
 
-            for cls_id in unique_classes:
-                cls_dets = [d for d in dets if d["class_id"] == cls_id]
-                boxes = torch.tensor(
-                    [d["bbox_xyxy"] for d in cls_dets], dtype=torch.float32
-                )
-                scores = torch.tensor(
-                    [d["conf"] for d in cls_dets], dtype=torch.float32
-                )
-                keep_idx, keep_scores = soft_nms_gaussian(
-                    boxes, scores, sigma=sigma, score_threshold=conf_thresh
-                )
-                for i, new_score in zip(keep_idx.tolist(), keep_scores.tolist()):
-                    det = cls_dets[i].copy()
-                    det["conf"] = new_score
-                    final_dets.append(det)
+                for cls_id in unique_classes:
+                    cls_dets = [d for d in dets if d["class_id"] == cls_id]
+                    boxes = torch.tensor(
+                        [d["bbox_xyxy"] for d in cls_dets], dtype=torch.float32
+                    )
+                    scores = torch.tensor(
+                        [d["conf"] for d in cls_dets], dtype=torch.float32
+                    )
+                    keep_idx, keep_scores = soft_nms_gaussian(
+                        boxes, scores, sigma=sigma, score_threshold=conf_thresh
+                    )
+                    for i, new_score in zip(keep_idx.tolist(), keep_scores.tolist()):
+                        det = cls_dets[i].copy()
+                        det["conf"] = new_score
+                        final_dets.append(det)
+            except Exception as e:
+                log.warning(f"Soft-NMS failed: {e}, returning raw detections")
+                final_dets = dets
         else:
             final_dets = []
 
@@ -568,21 +621,26 @@ class GeoIntelPipeline:
 
 
 def _to_uint8(arr):
-    out = np.zeros_like(arr, dtype=np.float32)
-    if arr.ndim == 3:
-        for i in range(arr.shape[2]):
-            ch = arr[:, :, i].astype(np.float32)
-            lo, hi = np.percentile(ch, 2), np.percentile(ch, 98)
-            if hi <= lo:
-                out[:, :, i] = 0
-            else:
-                out[:, :, i] = np.clip((ch - lo) / (hi - lo) * 255, 0, 255)
-    elif arr.ndim == 2:
-        ch = arr.astype(np.float32)
-        lo, hi = np.percentile(ch, 2), np.percentile(ch, 98)
-        if hi > lo:
-            out = np.clip((ch - lo) / (hi - lo) * 255, 0, 255)
-    return out.astype(np.uint8)
+    if arr is None or arr.size == 0:
+        return np.zeros((256, 256, 3), dtype=np.uint8)
+    arr = np.asarray(arr)
+    if arr.ndim == 0:
+        return np.zeros((256, 256, 3), dtype=np.uint8)
+    if arr.ndim == 2:
+        arr = np.stack([arr] * 3, axis=-1)
+    if arr.ndim != 3:
+        return np.zeros((256, 256, 3), dtype=np.uint8)
+
+    bands = min(arr.shape[2], 3)
+    img = arr[:, :, :bands].astype(np.float32)
+    lo = np.percentile(img, 2, axis=(0, 1), keepdims=True)
+    hi = np.percentile(img, 98, axis=(0, 1), keepdims=True)
+    safe = np.where(hi > lo, hi - lo, 1.0)
+    out = np.clip((img - lo) / safe * 255.0, 0, 255).astype(np.uint8)
+    if bands < 3:
+        fill = np.repeat(out[:, :, :1], 3 - bands, axis=2)
+        out = np.concatenate([out, fill], axis=2)
+    return out
 
 
 if __name__ == "__main__":

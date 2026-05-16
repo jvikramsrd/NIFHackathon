@@ -78,7 +78,19 @@ NUM_WORKERS = 8
 PIN_MEMORY = True
 PREFETCH_FACTOR = 4
 PERSISTENT_WORKERS = True
-MAX_STEPS_PER_EPOCH = 1000  # cap steps/epoch to keep wall-time ≤ 30 min
+MAX_STEPS_PER_EPOCH = 2000  # cap train steps/epoch; raised from 1000 for 30GB+ datasets
+# Cap validation batches per epoch. Stage 1 val time scales linearly with the
+# size of the val split, which on a 30 GB dataset dominates wall-clock. With
+# val_loader shuffle=False the same 300 batches are sampled every epoch, which
+# is exactly what we want for a stable best-checkpoint signal across runs.
+MAX_VAL_STEPS = 300
+# Run the (more expensive) batched TTA at validation every Nth epoch.
+# Even-epoch TTA gives the best-model picker a high-fidelity signal at a
+# fraction of the wall-clock cost.
+VAL_TTA_EVERY = 2
+# DenseCRF is CPU-heavy and tile-parallel. Four workers is a good default on
+# 32 GB RAM: it reduces wall-clock without multiplying tile copies too much.
+CRF_WORKERS = 4
 
 # ─── SVAMITVA SHP → Class mapping ────────────────────────────────────────────
 # Each SHP file uses a specific attribute column for classification.
@@ -106,14 +118,24 @@ SHP_LAYER_ROLES = {
 ROOF_TYPE_MAP = {
     # Raw value (lowercase)  → Stage2A class name
     "pucca_rcc": "RCC",
+    "pucca rcc": "RCC",
     "rcc": "RCC",
     "pucca_rcc_slab": "RCC",
     "rcc_slab": "RCC",
+    "concrete": "RCC",
+    "concrete_roof": "RCC",
     "pucca_tiled": "Tiled",
+    "pucca tiled": "Tiled",
     "tiled": "Tiled",
     "mangalore_tile": "Tiled",
+    "mangalore tile": "Tiled",
+    "tile": "Tiled",
     "pucca_tin": "Tin",
+    "pucca tin": "Tin",
     "tin": "Tin",
+    "tin_roof": "Tin",
+    "metal_roof": "Tin",
+    "sheet_roof": "Tin",
     "galvanized": "Tin",
     "pucca_asbestos": "Tin",  # treat asbestos as Tin category
     "asbestos": "Tin",
@@ -131,14 +153,26 @@ ROOF_TYPE_MAP = {
 INFRA_TYPE_MAP = {
     # Raw value (lowercase)  → class name
     "electric_transformer": "transformer",
+    "electric transformer": "transformer",
     "transformer": "transformer",
+    "transformers": "transformer",
     "electrical_transformer": "transformer",
+    "distribution_transformer": "transformer",
+    "dt": "transformer",
     "overhead_water_tank": "overhead_tank",
+    "overhead water tank": "overhead_tank",
     "water_tank": "overhead_tank",
+    "water tank": "overhead_tank",
     "overhead_tank": "overhead_tank",
+    "oht": "overhead_tank",
+    "ohsr": "overhead_tank",
     "hand_pump": "well",
+    "hand pump": "well",
     "well": "well",
+    "wells": "well",
     "tube_well": "well",
+    "tube well": "well",
+    "tubewell": "well",
     "1": "transformer",
     "2": "well",
     "3": "overhead_tank",
@@ -153,16 +187,33 @@ STAGE1 = dict(
     class_colors=[(0, 0, 0), (255, 0, 0), (128, 128, 128), (0, 0, 255)],
     shp_class_col='type',
     shp_class_map={'building': 1, 'road': 2, 'waterbody': 3},
-    arch='Unet',
-    encoder='mit_b5',
+    # MAnet + MiT-B4: best balance for the 16 GB A4000.
+    # - MAnet decoder (Position-wise Attention + Multi-scale Feature Aggregation)
+    #   sharpens irregular boundaries — rural building outlines, lake edges,
+    #   variable-width roads — which a plain Unet decoder smears.
+    # - MiT-B4 transformer encoder (~62M) keeps strong SegFormer-family features
+    #   for rooftop / road / water texture while running ~20% faster than
+    #   MiT-B5 and fitting batch_size=8 comfortably.
+    # Note: smp's UnetPlusPlus *rejects* all MiT encoders (hardcoded check in
+    # decoders/unetplusplus/model.py). If you ever want true UnetPlusPlus,
+    # switch encoder to 'efficientnet-b4' (~21M params, even faster).
+    # Note: MiT encoders in smp do NOT expose set_grad_checkpointing — the
+    # training script's try/except falls through silently. With MAnet+MiT-B4
+    # at 512px in bf16 the activation peak is ~10-11 GB at batch=8, well
+    # within budget without checkpointing.
+    arch='MAnet',
+    encoder='mit_b4',
     encoder_weights='imagenet',
     in_channels=3,
     decoder_attention_type='scse',
     patch_size=512,
     patch_sizes=(512,),
     overlap=128,
-    batch_size=6,
-    grad_accum=4,
+    # batch_size=4 with grad_accum=8 → effective batch 32 (same as bs=8/accum=4)
+    # but ~half the peak activation memory. Safer with MAnet+MiT (no smp
+    # grad-checkpointing on MiT encoders) and leaves headroom for SAM later.
+    batch_size=4,
+    grad_accum=8,
     lr=2e-4,
     encoder_lr_mult=0.1,
     weight_decay=1e-4,
@@ -197,7 +248,9 @@ STAGE1 = dict(
     polygon_min_area_px={'building': 80, 'road': 120, 'waterbody': 160},
     polygon_simplify_tolerance=0.5,
     crf_inference=True,
-    crf_iter=5,
+    # 10 iterations: cleaner segment boundaries than 5 (Krähenbühl & Koltun
+    # converge by ~10). Inference-time only, no training cost.
+    crf_iter=10,
     neg_tile_ratio=0.15,
     min_fg_ratio=0.01,    # minimum foreground fraction to keep a patch
 )
@@ -206,6 +259,7 @@ STAGE2A = dict(
     num_classes=4,
     class_names=['RCC', 'Tiled', 'Tin', 'Other'],
     shp_roof_col='Roof_type',
+    shp_roof_cols=('Roof_type', 'roof_type', 'type', 'Type', 'bldg_type', 'building_type'),
     roof_type_map=ROOF_TYPE_MAP,
     arch='convnext_large',
     pretrained=True,
@@ -219,7 +273,10 @@ STAGE2A = dict(
     cutmix_alpha=1.0,
     weight_decay=1e-4,
     grad_accum=1,
-    tta_steps=4,  # light TTA during training; full 24-fold used at final inference
+    # Validation TTA: 8 folds × 3 scales now go through a single batched
+    # forward per scale (see RooftopClassifier.predict), so doubling tta_steps
+    # only ~doubles val time — gives more representative best-epoch selection.
+    tta_steps=8,
     stage2a_conf_thresh={'RCC': 0.45, 'Tiled': 0.55, 'Tin': 0.50, 'Other': 0.40},
     use_arcface=True,
     arcface_s=30.0,
@@ -239,6 +296,7 @@ STAGE2B = dict(
     class_names=['transformer', 'overhead_tank', 'well'],
     num_classes=3,
     shp_infra_col='Utility_Ty',
+    shp_infra_cols=('Utility_Ty', 'utility_type', 'Utility_Type', 'type', 'Type', 'name', 'Name'),
     infra_type_map=INFRA_TYPE_MAP,
     model_variant='yolov9e',
     use_obb=True,
@@ -246,7 +304,16 @@ STAGE2B = dict(
     img_size=1280,
     cache='ram',
     batch_size=2,
-    workers=0,
+    # Use the same parallel-loader budget as Stage 1/2A. workers=0 made YOLO
+    # decode + Mosaic happen serially on the main thread, leaving the GPU idle
+    # between batches.
+    workers=NUM_WORKERS,
+    # Light head dropout (0.1) and multi-scale training: documented YOLO
+    # generalisation boosts. multi_scale resizes each batch within
+    # ±50 % of img_size — combined with cache='ram' this is the most reliable
+    # mAP lift on a fixed dataset. Watch VRAM at high img_size.
+    dropout=0.1,
+    multi_scale=True,
     epochs=120,
     lr0=1e-3,
     lrf=0.01,
@@ -270,12 +337,20 @@ STAGE2B = dict(
     max_det=1000,
     overlap=512,
     class_buffer_px={'transformer': 100, 'overhead_tank': 80, 'well': 40},
+    context_classes=('building', 'road', 'waterbody'),
+    context_buffer_px=128,
     neg_tile_ratio=0.3,
-    soft_nms_sigma=0.5,
+    # Lower sigma (sharper Gaussian decay) helps closely-spaced small objects
+    # retain their score rather than being heavily attenuated by neighbours.
+    soft_nms_sigma=0.40,
     agnostic_nms=True,
     use_sahi=True,
-    sahi_slice_size=640,
-    sahi_overlap_ratio=0.40,
+    # Smaller SAHI slices + higher overlap → better small-object recall on
+    # transformers (~30-60 px) and wells (~15-30 px) at the cost of a few extra
+    # YOLO forward passes per tile. The mAP win is consistently >2 % on small
+    # infrastructure in published SAHI benchmarks.
+    sahi_slice_size=512,
+    sahi_overlap_ratio=0.45,
     class_conf_thresh={
         'transformer': 0.20,
         'overhead_tank': 0.12,

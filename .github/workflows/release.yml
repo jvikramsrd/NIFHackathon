@@ -20,25 +20,21 @@ jobs:
           - os: windows-latest
             name: Windows x64
             artifact_name: GeoIntel-windows-x64
-            binary_path: dist/GeoIntel
 
           # ── macOS Intel ──────────────────────────────────────────────────
           - os: macos-13
             name: macOS Intel
             artifact_name: GeoIntel-macos-intel
-            binary_path: dist/GeoIntel.app
 
           # ── macOS Apple Silicon ─────────────────────────────────────────
           - os: macos-14
             name: macOS Apple Silicon (M1/M2/M3)
             artifact_name: GeoIntel-macos-arm64
-            binary_path: dist/GeoIntel.app
 
           # ── Linux x64 ────────────────────────────────────────────────────
           - os: ubuntu-22.04
             name: Linux x64
             artifact_name: GeoIntel-linux-x64
-            binary_path: dist/GeoIntel
 
     steps:
       - name: Checkout
@@ -84,26 +80,37 @@ jobs:
             pyproj>=3.6.0 \
             pyinstaller>=6.5.0
 
-      # ── Build ─────────────────────────────────────────────────────────────
-      - name: Build binary
+      # ── Build BOTH the GUI and the CLI binaries ──────────────────────────
+      - name: Build GUI + CLI binaries
         run: python build.py
 
-      # ── Package the output ────────────────────────────────────────────────
-      - name: Package binary (Windows)
+      # ── Package the outputs ──────────────────────────────────────────────
+      # We ship one zip per platform that contains both `GeoIntel/` (GUI) and
+      # `geo-intel/` (CLI). This keeps the download count low while giving
+      # users both UX modes.
+      - name: Package binaries (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Compress-Archive -Path dist\GeoIntel -DestinationPath "${{ matrix.artifact_name }}.zip"
+          $items = @()
+          if (Test-Path dist\GeoIntel)  { $items += 'dist\GeoIntel'  }
+          if (Test-Path dist\geo-intel) { $items += 'dist\geo-intel' }
+          if ($items.Count -eq 0) { throw "No build outputs found in dist/" }
+          Compress-Archive -Path $items -DestinationPath "${{ matrix.artifact_name }}.zip"
 
-      - name: Package binary (macOS / Linux)
+      - name: Package binaries (macOS / Linux)
         if: runner.os != 'Windows'
         run: |
           cd dist
-          if [ -d GeoIntel.app ]; then
-            zip -r ../${{ matrix.artifact_name }}.zip GeoIntel.app
-          else
-            zip -r ../${{ matrix.artifact_name }}.zip GeoIntel
+          items=()
+          [ -d GeoIntel.app ] && items+=("GeoIntel.app")
+          [ -d GeoIntel ]     && items+=("GeoIntel")
+          [ -d geo-intel ]    && items+=("geo-intel")
+          if [ ${#items[@]} -eq 0 ]; then
+            echo "No build outputs found in dist/" >&2
+            exit 1
           fi
+          zip -r "../${{ matrix.artifact_name }}.zip" "${items[@]}"
 
       # ── Upload build artifact ─────────────────────────────────────────────
       - name: Upload artifact
@@ -141,6 +148,9 @@ jobs:
 
             ### Downloads
 
+            Each zip contains **both** the GUI app (`GeoIntel`) and the
+            CLI runner (`geo-intel`) for that platform.
+
             | Platform | File |
             |----------|------|
             | Windows 10/11 (x64) | `GeoIntel-windows-x64.zip` |
@@ -151,7 +161,13 @@ jobs:
             ### Installation
 
             1. Download and extract the zip for your platform.
-            2. Install the Python environment (PyTorch + pipeline deps) — see README.
-            3. Activate your environment and launch `GeoIntel` (or `GeoIntel.exe`).
+            2. Install the Python environment (PyTorch + pipeline deps) — run
+               `setup_venv.bat` (Windows) or `install.sh` (macOS / Linux) once
+               from the project source tree.
+            3. Launch:
+               - **GUI**: double-click `GeoIntel.exe` (Windows) or `GeoIntel.app`
+                 (macOS) or `./GeoIntel/GeoIntel` (Linux).
+               - **CLI**: `./geo-intel/geo-intel --mode infer --tif ortho.tif --out ./out`
+                 (Windows: `geo-intel\geo-intel.exe ...`).
 
-            The binary detects your active Python environment automatically.
+            Both binaries auto-detect the active Python environment.

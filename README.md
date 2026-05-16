@@ -14,7 +14,7 @@ INPUT: SVAMITVA drone orthophoto (GeoTIFF / ECW) + Annotation Shapefiles
 ┌──────────────────────────────────────────────────────────────────────┐
 │  STAGE 1 — Semantic Segmentation                                     │
 │  Architecture : Unet + scSE attention                                │
-│  Encoder      : MixTransformer B5 (mit_b5) — 84M params             │
+│  Encoder      : MixTransformer B4 (mit_b4) — faster production fit  │
 │  Input        : 512×512 patches, multi-scale (256/512/768)           │
 │  Output       : 4-class mask → Background / Building / Road / Water  │
 │  Loss         : TriLoss [Lovász-Softmax + Dice + Focal + Boundary +  │
@@ -184,7 +184,7 @@ This installs two console commands:
 
 | Stage | Model | Input | Batch | NVIDIA A4000 | Apple M2 Max (96 GB unified) |
 |-------|-------|-------|-------|--------------|-------------------------------|
-| 1 — Segmentation | Unet mit_b5 | 512×512 | 4 | ~13.5 GB | ~18 GB unified |
+| 1 — Segmentation | Unet mit_b4 | 512×512 | 8 | ~12 GB | ~16 GB unified |
 | 2A — Classification | ConvNeXt-Large | 224×224 | 32 | ~7.8 GB | ~8 GB unified |
 | 2B — Detection | YOLOv9e | 1280×1280 | 2 | ~7.2 GB | ~9 GB unified |
 
@@ -363,11 +363,11 @@ All hyperparameters live in `config.py`:
 | `AMP_DTYPE` | auto | bf16 (CUDA) · fp16 (MPS) · fp32 (CPU) |
 | `FAST_TTA` | `False` | True = 8 passes, False = 24 passes (more accurate) |
 | `STAGE1["arch"]` | `Unet` | smp decoder; MiT encoders are not compatible with `UnetPlusPlus` |
-| `STAGE1["encoder"]` | `mit_b5` | 84M params |
+| `STAGE1["encoder"]` | `mit_b4` | Production speed/accuracy balance |
 | `STAGE1["patch_size"]` | `512` | Training patch size |
 | `STAGE1["overlap"]` | `192` | Tile overlap for seamless stitching |
-| `STAGE1["batch_size"]` | `4` | ×8 grad accum = effective batch 32 (SAM off) |
-| `STAGE1["epochs"]` | `60` | Default fine-tuning length for pretrained mit_b5 |
+| `STAGE1["batch_size"]` | `8` | ×4 grad accum = effective batch 32 (SAM off) |
+| `STAGE1["epochs"]` | `80` | Default fine-tuning length for pretrained mit_b4 |
 | `STAGE1["use_sam"]` | `False` | Enabling doubles per-iter cost and forces grad_accum=1 |
 | `STAGE1["crf_iter"]` | `10` | CRF iterations at inference |
 | `STAGE1["class_weights"]` | `[0.30,1.80,4.50,2.20]` | Road 4.5× to force thin path connectivity |

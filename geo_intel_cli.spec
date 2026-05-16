@@ -1,27 +1,26 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec for the Geo-Intel GUI binary.
+PyInstaller spec for the Geo-Intel CLI binary (``geo-intel``).
 
-The binary bundles only the GUI shell (gui.py) + the pipeline Python source
-files. PyTorch, rasterio, and other heavy ML libraries are NOT bundled —
-they live in the user's Python environment and are invoked via subprocess.
-
-This keeps the binary under ~400 MB on all platforms.
+Wraps ``run_pipeline.py`` as a console executable. Same architecture as the
+GUI binary (``geo_intel.spec``): the heavy ML libraries (PyTorch, ultralytics,
+segmentation_models_pytorch, etc.) are NOT bundled — they live in the user's
+Python environment and are invoked in-process or via subprocess. This keeps
+the binary under ~150 MB on all platforms.
 
 Build with:
-    python build.py
+    python build.py --cli
     OR
-    pyinstaller geo_intel.spec
+    pyinstaller geo_intel_cli.spec
 """
 
 import sys
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_data_files
 
 ROOT = Path(SPECPATH)
 
-# ── Source files to embed (pipeline code runs as subprocess but needs to be
-#    findable relative to the binary's _MEIPASS temp dir) ─────────────────────
+# ── Source files to embed — pipeline code lives next to the binary ───────────
 pipeline_sources = [
     (str(ROOT / "config.py"),          "."),
     (str(ROOT / "run_pipeline.py"),    "."),
@@ -35,15 +34,13 @@ pipeline_sources = [
     (str(ROOT / "utils"),              "utils"),
 ]
 
-# ── Collect data files from libraries that need them at runtime ───────────────
+# ── Data files from libs we DO bundle (small, geospatial-critical) ───────────
 lib_datas = []
-for pkg in ("matplotlib", "pyproj", "certifi"):
+for pkg in ("pyproj", "certifi"):
     try:
         lib_datas += collect_data_files(pkg)
     except Exception:
         pass
-
-# rasterio ships GDAL data and proj databases inside the wheel
 for pkg in ("rasterio", "fiona"):
     try:
         lib_datas += collect_data_files(pkg, include_py_files=False)
@@ -52,41 +49,33 @@ for pkg in ("rasterio", "fiona"):
 
 all_datas = pipeline_sources + lib_datas
 
-# ── Hidden imports — modules discovered at runtime that PyInstaller misses ────
+# ── Hidden imports — modules loaded dynamically by name ──────────────────────
 hidden_imports = [
-    # PyQt6 essentials
-    "PyQt6.sip",
-    "PyQt6.QtCore",
-    "PyQt6.QtGui",
-    "PyQt6.QtWidgets",
-    "PyQt6.QtPrintSupport",
-    # matplotlib Qt backend
-    "matplotlib.backends.backend_qtagg",
-    "matplotlib.backends.backend_qt",
-    # cv2
+    # cv2 / numpy core
     "cv2",
-    # numpy
     "numpy",
     "numpy.core._multiarray_umath",
-    # rasterio / GDAL (loaded as plugins)
+    # rasterio / GDAL plugins
     "rasterio._shim",
     "rasterio.control",
     "rasterio.crs",
     "rasterio.sample",
     "rasterio.vrt",
     "rasterio._features",
-    # json / stdlib
+    # stdlib called by reflection
     "json",
     "csv",
     "re",
     "subprocess",
     "shutil",
+    "argparse",
+    "logging",
 ]
 
 block_cipher = None
 
 a = Analysis(
-    [str(ROOT / "gui.py")],
+    [str(ROOT / "run_pipeline.py")],
     pathex=[str(ROOT)],
     binaries=[],
     datas=all_datas,
@@ -95,7 +84,9 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # Exclude heavy ML libs — they run in the user's env, not the bundle
+        # Exclude heavy ML libs — they run in the user's Python env, not the
+        # bundle. The CLI imports them lazily inside subcommand handlers, so
+        # the binary itself only needs them present at run-time, not bundled.
         "torch", "torchvision", "torchaudio",
         "tensorflow", "tensorflow_core",
         "jax",
@@ -116,6 +107,9 @@ a = Analysis(
         "tensorboard",
         "onnx",
         "onnxruntime",
+        # GUI-only — keep CLI binary lean
+        "PyQt6",
+        "matplotlib",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -130,17 +124,17 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="GeoIntel",
+    name="geo-intel",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False,          # no terminal window
+    console=True,           # CLI: keep the terminal window
     disable_windowed_traceback=False,
-    target_arch=None,       # host arch; override via --target-arch on Apple Silicon
+    target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,              # add a .ico / .icns here when available
+    icon=None,
 )
 
 coll = COLLECT(
@@ -151,21 +145,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name="GeoIntel",
+    name="geo-intel",
 )
-
-# macOS .app bundle
-if sys.platform == "darwin":
-    app = BUNDLE(
-        coll,
-        name="GeoIntel.app",
-        icon=None,
-        bundle_identifier="com.geointel.pipeline",
-        info_plist={
-            "NSPrincipalClass": "NSApplication",
-            "NSAppleScriptEnabled": False,
-            "CFBundleDisplayName": "Geo-Intel",
-            "CFBundleShortVersionString": "1.0.0",
-            "NSHighResolutionCapable": True,
-        },
-    )

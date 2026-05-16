@@ -1,6 +1,10 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+# Canonical setuptools build backend. The previous value
+# "setuptools.backends.legacy:build" does not exist in any released
+# setuptools — it would crash `pip install .` and `python -m build`
+# with ModuleNotFoundError.
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "geo-intel"

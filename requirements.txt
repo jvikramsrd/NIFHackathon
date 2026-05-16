@@ -49,7 +49,6 @@ tqdm>=4.66.1
 pyyaml>=6.0.1
 matplotlib>=3.8.0
 lxml
-pytest>=8.0.0
 
 # ── Hardware / System ─────────────────────────────────────────────────────────
 psutil>=5.9.0        # P-core affinity pinning for i9-13900K DataLoader workers
@@ -60,11 +59,16 @@ tensorboard>=2.16.0
 # ── GUI ───────────────────────────────────────────────────────────────────────
 PyQt6>=6.6.0
 
-# ── Optional (significant accuracy improvement) ───────────────────────────────
-# pydensecrf2        # Dense CRF boundary refinement — install after VS Build Tools
-
-# ── ONNX Export / Deployment ────────────────────────────────────────────────
+# ── ONNX Export (graph only — runtime is optional, see notes below) ──────────
 onnx>=1.16.0
-onnxruntime-gpu>=1.17.0
-# TensorRT — install via NVIDIA package index:
-# pip install nvidia-tensorrt --index-url https://pypi.ngc.nvidia.com
+
+# ── Optional dependencies ─────────────────────────────────────────────────────
+# Test runner — install via:    pip install -e .[dev]
+# CRF refinement —              pip install pydensecrf2
+# ONNX GPU runtime —            pip install onnxruntime-gpu  (or onnxruntime for CPU/AMD)
+# TensorRT —                    pip install nvidia-tensorrt --index-url https://pypi.ngc.nvidia.com
+#
+# These were previously pinned in this file. Forcing onnxruntime-gpu in core
+# broke fresh installs on CPU-only and AMD machines; install.sh and
+# setup_venv.bat both had workarounds for it. Pulled out to keep the base
+# install always succeed.

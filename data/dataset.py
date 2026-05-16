@@ -7,7 +7,9 @@ data/dataset.py  (A4000-optimised)
 • Persistent workers + prefetch_factor for 10-worker setup
 """
 
+import os
 import random
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Tuple
 
@@ -42,7 +44,14 @@ class SegmentationDataset(Dataset):
         if file_list is not None:
             self.img_paths = [Path(p) for p in file_list if Path(p).exists()]
         else:
-            self.img_paths = [p for p in self.img_dir.glob("*.png") if p.stat().st_size > 0]
+            # os.scandir is significantly faster than glob+stat on Windows: it
+            # returns DirEntry objects whose stat is cached from the directory
+            # enumeration, so the size check piggybacks on a single syscall.
+            self.img_paths = [
+                Path(e.path)
+                for e in os.scandir(str(self.img_dir))
+                if e.name.endswith(".png") and e.stat().st_size > 0
+            ]
         if len(self.img_paths) == 0:
             raise ValueError(f"No valid PNG patches in {img_dir}")
         self.transform = transform or (
@@ -107,9 +116,9 @@ class RooftopDataset(Dataset):
             for cls in class_names:
                 cls_dir = self.root / cls
                 if cls_dir.is_dir():
-                    for p in cls_dir.glob("*.png"):
-                        if p.stat().st_size > 0:
-                            self.samples.append((p, self.c2id[cls]))
+                    for e in os.scandir(str(cls_dir)):
+                        if e.name.endswith(".png") and e.stat().st_size > 0:
+                            self.samples.append((Path(e.path), self.c2id[cls]))
             self.samples.sort(key=lambda x: str(x[0]))
 
         if len(self.samples) == 0:
@@ -140,11 +149,20 @@ class RooftopDataset(Dataset):
             img = np.zeros((self.transform.transforms[0].size[0] if hasattr(self.transform.transforms[0], 'size') else 224,
                             self.transform.transforms[0].size[1] if hasattr(self.transform.transforms[0], 'size') else 224, 3), dtype=np.uint8)
 
+        # Per-crop contrast normalisation, in place: replaces
+        #   img_norm = (img_f - mean) / std * 64.0 + 127.0
+        # which allocated 4 float32 buffers per sample (~600 KB each for a
+        # 224×224 crop). Doing it in place keeps the math identical with one
+        # float-tensor allocation total.
         img_f = img.astype(np.float32)
         mean = img_f.mean(axis=(0, 1), keepdims=True)
         std = img_f.std(axis=(0, 1), keepdims=True) + 1e-6
-        img_norm = (img_f - mean) / std * 64.0 + 127.0
-        img = np.clip(img_norm, 0, 255).astype(np.uint8)
+        img_f -= mean
+        img_f /= std
+        img_f *= 64.0
+        img_f += 127.0
+        np.clip(img_f, 0, 255, out=img_f)
+        img = img_f.astype(np.uint8)
 
         img = self.transform(image=img)["image"]
         return img, torch.tensor(label, dtype=torch.long)
@@ -166,9 +184,22 @@ class RooftopDataset(Dataset):
 
 def get_train_transforms(patch_size: int = 640, patch_sizes=None):
     patch_sizes = tuple(int(p) for p in (patch_sizes or (patch_size,)))
-    multi_scale_crops = []
-    for crop_size in patch_sizes:
-        multi_scale_crops.append(
+
+    # Build a crop stage. The common config case (single patch_size matching
+    # patch_size) was previously wrapped in an A.OneOf over a 1-element list
+    # *and* included an identity A.Resize — both pure overhead. Detect that
+    # case and drop straight to PadIfNeeded + RandomCrop.
+    if len(patch_sizes) == 1 and patch_sizes[0] == patch_size:
+        crop_stage = [
+            A.PadIfNeeded(
+                min_height=patch_size,
+                min_width=patch_size,
+                border_mode=cv2.BORDER_REFLECT,
+            ),
+            A.RandomCrop(height=patch_size, width=patch_size),
+        ]
+    else:
+        multi_scale_crops = [
             A.Compose(
                 [
                     A.PadIfNeeded(
@@ -180,11 +211,13 @@ def get_train_transforms(patch_size: int = 640, patch_sizes=None):
                     A.Resize(height=patch_size, width=patch_size),
                 ]
             )
-        )
+            for crop_size in patch_sizes
+        ]
+        crop_stage = [A.OneOf(multi_scale_crops, p=1.0)]
 
     return A.Compose(
         [
-            A.OneOf(multi_scale_crops, p=1.0),
+            *crop_stage,
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
             A.RandomRotate90(p=1.0),
@@ -358,7 +391,11 @@ def split_clf_dataset(
         cls_dir = Path(root_dir) / cls
         if not cls_dir.is_dir():
             continue
-        cls_samples = [(p, c2id[cls]) for p in cls_dir.glob("*.png") if p.stat().st_size > 0]
+        cls_samples = [
+            (Path(e.path), c2id[cls])
+            for e in os.scandir(str(cls_dir))
+            if e.name.endswith(".png") and e.stat().st_size > 0
+        ]
         if not cls_samples:
             continue
         cls_samples.sort(key=lambda x: str(x[0]))
@@ -403,7 +440,11 @@ def split_dataset(
     patch_sizes=None,
 ):
     mask_dir_p = Path(mask_dir)
-    all_imgs = [p for p in Path(img_dir).glob("*.png") if p.stat().st_size > 0]
+    all_imgs = [
+        Path(e.path)
+        for e in os.scandir(str(img_dir))
+        if e.name.endswith(".png") and e.stat().st_size > 0
+    ]
     if not all_imgs:
         raise ValueError(f"No valid PNG patches found in {img_dir}")
 
@@ -421,7 +462,11 @@ def split_dataset(
         except Exception:
             return 0.0
 
-    ratios = [_fg_ratio(p) for p in all_imgs]
+    # Parallel mask reads: this dominates startup time on large patch sets.
+    # I/O-bound, so threads beat processes (no spawn overhead, GIL released in cv2).
+    n_workers = max(2, min((os.cpu_count() or 4), 16))
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        ratios = list(ex.map(_fg_ratio, all_imgs))
     sorted_idx = sorted(range(len(all_imgs)), key=lambda i: ratios[i])
     n = len(sorted_idx)
     strata_size = max(1, n // 4)

@@ -40,6 +40,7 @@ from utils.hardware import (
     cl_input,
     compile_model,
     get_amp_context,
+    maybe_backward,
     setup,
     to_channels_last,
     vram_stats,
@@ -58,7 +59,13 @@ log = get_logger(__name__)
 def train_stage2a(resume: bool = True):
     device = setup(seed=int(CFG.STAGE1["seed"]))  # type: ignore
     cfg: typing.Any = CFG.STAGE2A
-    amp_ctx, _ = get_amp_context(CFG.AMP_DTYPE)
+    amp_ctx, scaler = get_amp_context(CFG.AMP_DTYPE)
+    # bf16 → scaler is None (no-op). fp16 → real GradScaler.
+    if scaler is not None and bool(cfg.get("use_sam", False)):
+        raise RuntimeError(
+            "Stage 2A: SAM is incompatible with fp16 GradScaler. "
+            "Use CFG.AMP_DTYPE=torch.bfloat16 (Ampere+) or set use_sam=False."
+        )
 
     # ── Dataset ───────────────────────────────────────────────────────────────
     train_ds, val_ds = split_clf_dataset(
@@ -197,12 +204,47 @@ def train_stage2a(resume: bool = True):
     if resume and last_ckpt_path.exists():
         log.info(f"  Resuming Stage 2A from: {last_ckpt_path}")
         state = torch.load(last_ckpt_path, map_location=device, weights_only=False)
-        model.load_state_dict(state["model_state"], strict=False)
+
+        # Report any silently-dropped keys (strict=False) AND catch shape
+        # mismatches (which always raise) with a clear message.
         try:
-            optimiser.load_state_dict(state["optimizer_state"])
-            scheduler.load_state_dict(state["scheduler_state"])
-        except Exception as e:
-            log.warning("Skipping optimizer load: %s", e)
+            incompatible = model.load_state_dict(state["model_state"], strict=False)
+            miss = list(getattr(incompatible, "missing_keys", []) or [])
+            unexp = list(getattr(incompatible, "unexpected_keys", []) or [])
+        except RuntimeError as e:
+            log.error(
+                "Stage 2A checkpoint shape mismatch at %s — almost certainly a "
+                "stale checkpoint from a different STAGE2A['arch']. Delete the "
+                "checkpoint to retrain from scratch. Underlying error:\n  %s",
+                last_ckpt_path, str(e).split("\n", 1)[0],
+            )
+            raise
+        if miss or unexp:
+            log.warning(
+                "Stage 2A checkpoint key mismatch — missing=%d, unexpected=%d. "
+                "If STAGE2A['arch'] or related cfg changed, %s is stale.",
+                len(miss), len(unexp), last_ckpt_path,
+            )
+
+        # optimizer + scheduler are independent and may be missing independently
+        # (heavy optimizer state is only saved every 5 epochs; scheduler state
+        # is tiny and saved every epoch).
+        if "optimizer_state" in state:
+            try:
+                optimiser.load_state_dict(state["optimizer_state"])
+            except Exception as e:
+                log.warning("Skipping optimizer load: %s", e)
+        else:
+            log.info("No optimizer_state in checkpoint; moments will re-warm.")
+
+        if "scheduler_state" in state:
+            try:
+                scheduler.load_state_dict(state["scheduler_state"])
+            except Exception as e:
+                log.warning("Skipping scheduler load (LR will restart!): %s", e)
+        else:
+            log.warning("No scheduler_state in checkpoint — LR resets to warmup.")
+
         best_acc = float(state.get("best_acc", 0.0))
         no_improv = int(state.get("no_improv", 0))
         start_epoch = int(state.get("epoch", 0)) + 1
@@ -228,7 +270,10 @@ def train_stage2a(resume: bool = True):
             dynamic_ncols=True,
         )
         for imgs, labels in train_pbar:
-            imgs, labels = imgs.to(device), labels.to(device)
+            # pin_memory is on, so non_blocking=True lets the H2D DMA overlap
+            # with the previous batch's backward — otherwise the .to() syncs.
+            imgs = imgs.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             imgs = cl_input(imgs)  # NHWC → 15-25% faster on Ampere
 
             # Randomly choose MixUp or CutMix
@@ -250,21 +295,28 @@ def train_stage2a(resume: bool = True):
 
             optimiser.zero_grad(set_to_none=True)
             if use_sam:
+                # SAM + bf16 path (scaler is None here, guarded above).
                 with amp_ctx:
                     logits, loss = _mixed_loss()
-                loss.backward()
+                maybe_backward(loss, scaler)
                 optimiser.first_step(zero_grad=True)
                 with amp_ctx:
                     logits, loss_second = _mixed_loss()
-                loss_second.backward()
+                maybe_backward(loss_second, scaler)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimiser.second_step(zero_grad=True)
             else:
                 with amp_ctx:
                     logits, loss = _mixed_loss()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimiser.step()
+                maybe_backward(loss, scaler)
+                if scaler is not None:
+                    scaler.unscale_(optimiser)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimiser)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimiser.step()
             scheduler.step()
             ema.update(model)
 
@@ -310,19 +362,21 @@ def train_stage2a(resume: bool = True):
         else:
             no_improv += 1
 
-        atomic_torch_save(
-            {
-                "epoch": epoch,
-                "model_state": {k: v.cpu() for k, v in model.state_dict().items()},
-                "ema_state": {k: v.cpu() for k, v in ema.shadow.items()},
-                "optimizer_state": optimiser.state_dict(),
-                "scheduler_state": scheduler.state_dict(),
-                "best_acc": float(best_acc),
-                "no_improv": int(no_improv),
-                "config": cfg,
-            },
-            last_ckpt_path,
-        )
+        # Heavy optimizer state only written every 5 epochs (~2× model size).
+        # scheduler_state is ~1.7 KB and must be saved every epoch — without
+        # it the LR resets to warmup on any non-mod-5 resume.
+        last_payload = {
+            "epoch": epoch,
+            "model_state": {k: v.cpu() for k, v in model.state_dict().items()},
+            "ema_state": {k: v.cpu() for k, v in ema.shadow.items()},
+            "scheduler_state": scheduler.state_dict(),  # tiny, always save
+            "best_acc": float(best_acc),
+            "no_improv": int(no_improv),
+            "config": cfg,
+        }
+        if epoch % 5 == 0:
+            last_payload["optimizer_state"] = optimiser.state_dict()
+        atomic_torch_save(last_payload, last_ckpt_path)
 
         if no_improv >= patience:
             log.info("  Early stop.")
@@ -335,7 +389,15 @@ def train_stage2a(resume: bool = True):
 @torch.no_grad()
 def _val_clf(model, loader, device, cfg: typing.Any, amp_ctx, epoch=None):
     model.eval()
-    all_p, all_l = [], []
+    # Collect predictions / labels as GPU tensors, concatenate once at the end.
+    # The original used Python lists + per-batch ``.cpu().numpy()`` + a final
+    # ``np.array(list)`` (extra copy), and called ``labels.numpy()`` *twice*
+    # per batch just to compute a tqdm postfix.
+    pred_chunks: list = []
+    label_chunks: list = []
+    # Running counts as GPU scalars so the postfix is O(1) per batch.
+    running_correct = torch.zeros((), device=device, dtype=torch.int64)
+    running_total = torch.zeros((), device=device, dtype=torch.int64)
 
     val_pbar = tqdm(
         loader,
@@ -346,22 +408,35 @@ def _val_clf(model, loader, device, cfg: typing.Any, amp_ctx, epoch=None):
     )
 
     for imgs, labels in val_pbar:
-        imgs = imgs.to(device)
-        imgs = cl_input(imgs)  # keep NHWC consistent with training
+        imgs = imgs.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        imgs = cl_input(imgs)
         with amp_ctx:
-            # Use light TTA during training (cfg['tta_steps']), full TTA only at final inference
-            preds = model.predict(imgs, tta_steps=int(cfg.get("tta_steps", 4))).cpu().numpy()
+            preds = model.predict(imgs, tta_steps=int(cfg.get("tta_steps", 4)))
 
-        all_p.extend(preds)
-        all_l.extend(labels.numpy())
+        preds = preds.detach()
+        labels = labels.detach()
+        pred_chunks.append(preds)
+        label_chunks.append(labels)
 
-        batch_acc = (preds == labels.numpy()).mean() if len(preds) > 0 else 0.0
-        val_pbar.set_postfix(batch_acc=f"{batch_acc:.4f}")
+        running_correct += (preds == labels).sum()
+        running_total += labels.numel()
+        # One scalar .item() per batch (cheap) vs full tensor round-trip.
+        val_pbar.set_postfix(
+            acc=f"{(running_correct.item() / max(int(running_total.item()), 1)):.4f}"
+        )
 
-    acc = (np.array(all_p) == np.array(all_l)).mean()
+    if pred_chunks:
+        all_p_np = torch.cat(pred_chunks).cpu().numpy()
+        all_l_np = torch.cat(label_chunks).cpu().numpy()
+    else:
+        all_p_np = np.zeros(0, dtype=np.int64)
+        all_l_np = np.zeros(0, dtype=np.int64)
+
+    acc = float((all_p_np == all_l_np).mean()) if all_p_np.size else 0.0
     report = classification_report(
-        all_l,
-        all_p,
+        all_l_np,
+        all_p_np,
         labels=range(len(cfg["class_names"])),  # type: ignore
         target_names=cfg["class_names"],  # type: ignore
         zero_division=0,  # type: ignore
@@ -433,6 +508,12 @@ def train_stage2b(resume: bool = True):
             mixup=float(cfg.get("mixup", 0.15)),
             copy_paste=float(cfg.get("copy_paste", 0.30)),
             cache=cfg.get("cache", "disk"),
+            # Accuracy lifts: light head dropout + multi-scale training.
+            dropout=float(cfg.get("dropout", 0.0)),
+            multi_scale=bool(cfg.get("multi_scale", False)),
+            workers=int(cfg.get("workers", CFG.NUM_WORKERS)),
+            amp=True,
+            verbose=True,
         )
         if cfg.get("use_obb"):
             train_args["task"] = "obb"
@@ -484,34 +565,50 @@ def _write_yolo_yaml() -> str:
                     shutil.copy2(lbl_p, dst_l)
 
     import geopandas as gpd
+    from data.preprocessing import canonical_mapped_label, find_attribute_column
 
     canonical_classes = set()
     log.debug("Scanning dataset for dynamic YOLO classes...")
     try:
         for shp_path in CFG.DATA_ROOT.rglob("*.shp"):
-            if shp_path.name.startswith(
-                ("Utility", "Bridge", "Road", "Water", "Built")
-            ):
+            if shp_path.name.startswith(("Utility", "Utility_Poly")):
                 try:
                     gdf = gpd.read_file(str(shp_path))
-                    col = cfg.get("shp_infra_col", "Utility_Ty")
-                    if col in gdf.columns:
+                    col = find_attribute_column(
+                        gdf,
+                        cfg.get(
+                            "shp_infra_cols",
+                            [cfg.get("shp_infra_col", "Utility_Ty")],
+                        ),
+                    )
+                    if col:
                         unique_vals = gdf[col].dropna().unique()
                         for v in unique_vals:
-                            mapped = cfg.get("infra_type_map", {}).get(
-                                str(v).lower(), str(v)
+                            mapped = canonical_mapped_label(
+                                v, cfg.get("infra_type_map", {}), default=None
                             )
-                            canonical_classes.add(mapped)
+                            if mapped:
+                                canonical_classes.add(mapped)
                 except Exception:
                     pass
     except Exception:
         pass
 
+    # Keep the configured order. The YOLO label ids were generated with
+    # cfg["class_names"], so sorting detected classes would silently swap ids
+    # (e.g. transformer id 0 becoming overhead_tank id 0).
+    final_names = list(cfg["class_names"])
     if canonical_classes:
-        final_names = sorted(list(canonical_classes))
-        log.info(f"  [INFO] Dynamically detected classes: {final_names}")
+        detected_ordered = [name for name in final_names if name in canonical_classes]
+        missing = [name for name in final_names if name not in canonical_classes]
+        log.info(
+            "  [INFO] Detected YOLO classes: %s | keeping configured id order: %s",
+            detected_ordered,
+            final_names,
+        )
+        if missing:
+            log.info("  [INFO] No labels detected yet for: %s", missing)
     else:
-        final_names = cfg["class_names"]
         log.info(f"  [INFO] Using fallback classes from config: {final_names}")
 
     data = {

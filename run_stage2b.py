@@ -234,6 +234,7 @@ def train_stage2b(data_yaml: str, resume: bool = True):
             epochs=cfg2b["epochs"],
             imgsz=cfg2b["img_size"],
             batch=cfg2b["batch_size"],
+            workers=int(cfg2b.get("workers", 0)),
             device="0",
             project=str(CFG.CKPT_DIR),
             name=f"stage2b_{variant}",
@@ -246,6 +247,10 @@ def train_stage2b(data_yaml: str, resume: bool = True):
             cos_lr=bool(cfg2b.get("cos_lr", True)),
             copy_paste=float(cfg2b.get("copy_paste", 0)),
             cache=cfg2b.get("cache", "disk"),
+            # Keep parity with train_stage2.py: accuracy lifts shared with the
+            # other entry point. Light head dropout + multi-scale training.
+            dropout=float(cfg2b.get("dropout", 0.0)),
+            multi_scale=bool(cfg2b.get("multi_scale", False)),
         )
         if cfg2b.get("use_obb"):
             train_args["task"] = "obb"

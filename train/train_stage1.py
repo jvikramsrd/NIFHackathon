@@ -6,7 +6,7 @@ New in v2:
   • Multi-scale training — random resize for scale invariance
   • Boundary-aware loss — sharper edges, fewer merged buildings
   • WandB experiment tracking (optional, auto-detected)
-  • mit_b5 encoder (upgraded from mit_b4)
+  • mit_b4 encoder (production speed/accuracy balance)
   • Structured logging via utils.logger
 """
 
@@ -30,7 +30,7 @@ from models.stage1_segmentation import Stage1Module
 from utils.checkpointing import atomic_torch_save
 from utils.ddp import cleanup_ddp, is_main_process, make_loader, set_epoch, setup_ddp, wrap_ddp
 from utils.hardware import (
-    EMA, compile_model, get_amp_context, setup,
+    EMA, compile_model, get_amp_context, maybe_backward, maybe_step, setup,
     to_channels_last, vram_stats, worker_init_fn,
 )
 from utils.logger import crash_logged, get_logger
@@ -44,7 +44,15 @@ def train_stage1(resume: bool = True):
     # DDP-aware setup: no-op when WORLD_SIZE=1 (single GPU / no torchrun)
     ddp = setup_ddp(seed=cfg["seed"])
     device = ddp.device if ddp.enabled else setup(seed=cfg["seed"])
-    amp_ctx, _ = get_amp_context(CFG.AMP_DTYPE)
+    amp_ctx, scaler = get_amp_context(CFG.AMP_DTYPE)
+    # scaler is None for bf16 (no-op fast path), a real GradScaler for fp16.
+    # SAM's two-step protocol is incompatible with GradScaler (it would need a
+    # mid-step unscale + re-scale that the public API doesn't expose).
+    if scaler is not None and bool(cfg.get("use_sam", False)):
+        raise RuntimeError(
+            "SAM is not compatible with fp16 GradScaler. "
+            "Switch CFG.AMP_DTYPE to torch.bfloat16 (Ampere+) or disable SAM."
+        )
 
     # ── Datasets ─────────────────────────────────────────────────────────────
     train_ds, val_ds = split_dataset(
@@ -74,9 +82,8 @@ def train_stage1(resume: bool = True):
     batch_size = int(cfg["batch_size"])
 
     # ── VRAM auto-guard: SAM doubles peak activation memory ──────────────────
-    # UNet++ mit_b5 at 512px with batch=4 peaks at ~15.5 GB with a single pass.
-    # SAM does TWO forward+backward passes per step → ~31 GB peak without guard.
-    # Halving batch to 2 brings peak to ~12 GB, well within 16 GB A4000 budget.
+    # SAM does TWO forward+backward passes per step. Keep a conservative guard
+    # even with the lighter Unet/MiT-B4 build.
     use_sam_cfg = cfg.get("use_sam", False)
     try:
         vram_total = torch.cuda.get_device_properties(device).total_memory / 1024**3
@@ -102,18 +109,22 @@ def train_stage1(resume: bool = True):
         train_loader = make_loader(train_ds, ddp, batch_size=batch_size, shuffle=True, drop_last=True, **loader_kw)
         val_loader   = make_loader(val_ds,   ddp, batch_size=max(1, batch_size // 2), shuffle=False, **loader_kw)
 
-    # ── Auto-detect VRAM and downgrade encoder if needed ─────────────────────
+    # ── Auto-detect VRAM and tune batch size if needed ───────────────────────
     encoder = cfg["encoder"]
     try:
         vram_gb = torch.cuda.get_device_properties(device).total_memory / 1024**3
-        if vram_gb < 14 and encoder == "mit_b5":
-            log.warning(f"VRAM={vram_gb:.1f}GB < 14GB — downgrading encoder to mit_b4")
-            encoder = "mit_b4"
+        if vram_gb < 12 and batch_size > 4:
+            old_bs = batch_size
+            batch_size = 4
+            log.warning(
+                f"VRAM={vram_gb:.1f}GB — reducing Stage 1 batch "
+                f"{old_bs}→{batch_size} while keeping encoder={encoder}"
+            )
     except Exception:
         pass
 
     # ── Model ────────────────────────────────────────────────────────────────
-    # Single build with the VRAM-adjusted encoder baked into the config copy.
+    # Single build with the configured Unet/MiT encoder baked into the config copy.
     module = Stage1Module({**cfg, "encoder": encoder}).to(device)
     # channels_last (NHWC): 15-30% faster on Ampere tensor cores
     module = to_channels_last(module)
@@ -224,15 +235,19 @@ def train_stage1(resume: bool = True):
             # Multi-scale training: resize to a random scale. Since the segmentation
             # model is fully convolutional it accepts variable input sizes directly.
             # A single resize preserves more detail than the old down→up approach.
+            # ``F.interpolate`` is fp32-safe and gains nothing from autocast — the
+            # original wrapped it in amp_ctx unnecessarily, which forced a
+            # downcast→upcast through the bf16 pipeline.
             if ms_training and np.random.rand() < 0.5:
                 scale = float(np.random.choice(ms_scales))
                 orig_h, orig_w = imgs.shape[2], imgs.shape[3]
-                new_h = max(32, int(round(orig_h * scale / 32)) * 32)  # round to multiple of 32 for encoder
+                new_h = max(32, int(round(orig_h * scale / 32)) * 32)  # multiple of 32 for encoder
                 new_w = max(32, int(round(orig_w * scale / 32)) * 32)
                 if (new_h, new_w) != (orig_h, orig_w):
-                    with amp_ctx:
-                        imgs = F.interpolate(imgs, size=(new_h, new_w), mode="bilinear", align_corners=False)
-                        masks = F.interpolate(masks.unsqueeze(1).float(), size=(new_h, new_w), mode="nearest").squeeze(1).long()
+                    imgs = F.interpolate(imgs, size=(new_h, new_w), mode="bilinear", align_corners=False)
+                    masks = F.interpolate(
+                        masks.unsqueeze(1).float(), size=(new_h, new_w), mode="nearest"
+                    ).squeeze(1).long()
 
             if np.random.rand() < 0.2:
                 imgs, masks = _cutmix_seg(imgs, masks, alpha=cfg.get("cutmix_alpha", 1.0))
@@ -244,16 +259,18 @@ def train_stage1(resume: bool = True):
 
             if use_sam:
                 loss = _forward()
-                loss.backward()
+                maybe_backward(loss, scaler)
+                # SAM's two-step protocol is incompatible with GradScaler's
+                # unscale-once semantics, so we disallow fp16+SAM at config time
+                # below; with bf16 the scaler is None and these calls are
+                # straight torch.* ops.
                 optimiser.first_step(zero_grad=True)
-                # Free activation memory before second forward pass — critical on 16GB A4000
                 del loss
-                torch.cuda.empty_cache()
                 loss2 = _forward()
-                loss2.backward()
+                maybe_backward(loss2, scaler)
                 torch.nn.utils.clip_grad_norm_(module.parameters(), 1.0)
                 optimiser.second_step(zero_grad=True)
-                loss = loss2  # use second pass loss for logging
+                loss = loss2
                 try:
                     scheduler.step()
                 except ValueError:
@@ -262,44 +279,81 @@ def train_stage1(resume: bool = True):
                     ema.update(module)
             else:
                 loss = _forward()
-                loss.backward()
+                maybe_backward(loss, scaler)
 
                 if (step + 1) % grad_accum == 0:
-                    total_norm = torch.nn.utils.clip_grad_norm_(module.parameters(), 1.0)
+                    # We need to PEEK at the gradient norm before stepping,
+                    # so we can skip the step on a spike. The helper
+                    # ``maybe_step`` always steps, so we open-code the
+                    # scaler-aware sequence here.
+                    if scaler is not None:
+                        scaler.unscale_(optimiser)
+                    total_norm = torch.nn.utils.clip_grad_norm_(
+                        module.parameters(), 1.0,
+                    )
                     if total_norm.item() > 10.0:
-                        log.warning(f"Gradient norm spike ({total_norm.item():.2f}) — skipping step")
-                        optimiser.zero_grad(set_to_none=True)
+                        log.warning(
+                            f"Gradient norm spike ({total_norm.item():.2f}) — skipping step"
+                        )
+                        if scaler is not None:
+                            # Advance scaler bookkeeping without stepping;
+                            # update() also reacts to inf/nan grads detected
+                            # during unscale_, growing/decreasing the loss
+                            # scale as appropriate.
+                            scaler.update()
                     else:
-                        optimiser.step()
+                        if scaler is not None:
+                            scaler.step(optimiser)
+                            scaler.update()
+                        else:
+                            optimiser.step()
                         try:
                             scheduler.step()
                         except ValueError:
                             pass
-                        optimiser.zero_grad(set_to_none=True)
                         if ema:
                             ema.update(module)
+                    optimiser.zero_grad(set_to_none=True)
 
             ep_loss += loss.item() * grad_accum
             train_pbar.set_postfix(loss=f"{loss.item() * grad_accum:.4f}")
 
         # Flush remaining gradients if steps run is not a multiple of grad_accum
         if not use_sam and (actual_steps % grad_accum) != 0:
+            if scaler is not None:
+                scaler.unscale_(optimiser)
             total_norm = torch.nn.utils.clip_grad_norm_(module.parameters(), 1.0)
             if total_norm.item() <= 10.0:
-                optimiser.step()
+                if scaler is not None:
+                    scaler.step(optimiser)
+                    scaler.update()
+                else:
+                    optimiser.step()
                 try:
                     scheduler.step()
                 except ValueError:
                     pass
-                optimiser.zero_grad(set_to_none=True)
                 if ema:
                     ema.update(module)
+            elif scaler is not None:
+                scaler.update()
+            optimiser.zero_grad(set_to_none=True)
 
         ep_loss /= max(actual_steps, 1)
 
         if ema:
             ema.apply_shadow(module)
-        val_miou, val_loss = _validate(module, val_loader, device, metrics, amp_ctx, epoch=epoch)
+        val_tta_every = max(1, int(getattr(CFG, "VAL_TTA_EVERY", 1)))
+        use_val_tta = (epoch % val_tta_every) == 0
+        val_miou, val_loss = _validate(
+            module,
+            val_loader,
+            device,
+            metrics,
+            amp_ctx,
+            epoch=epoch,
+            use_tta=use_val_tta,
+        )
         if ema:
             ema.restore(module)
 
@@ -361,40 +415,81 @@ def _cutmix_seg(imgs: torch.Tensor, masks: torch.Tensor, alpha: float = 1.0):
     cx, cy = np.random.randint(W), np.random.randint(H)
     x1, y1 = max(cx - cut_w // 2, 0), max(cy - cut_h // 2, 0)
     x2, y2 = min(cx + cut_w // 2, W), min(cy + cut_h // 2, H)
-    imgs = imgs.clone()
-    masks = masks.clone()
+    # Skip the full B×C×H×W clones — advanced indexing on the RHS already
+    # materialises a fresh tensor for the source slice, and the caller
+    # reassigns its `imgs`/`masks` reference, so in-place writes are safe.
     imgs[:, :, y1:y2, x1:x2] = imgs[idx, :, y1:y2, x1:x2]
     masks[:, y1:y2, x1:x2] = masks[idx, y1:y2, x1:x2]
     return imgs, masks
 
 
 @torch.no_grad()
-def _validate(module, loader, device, metrics, amp_ctx, epoch=None):
+def _validate(module, loader, device, metrics, amp_ctx, epoch=None, use_tta=True):
+    """Validation pass.
+
+    ``use_tta=True`` runs the same batched fast TTA used at inference (2 scales
+    × 4 folds, one batched forward per scale via tta_predict). This makes the
+    val mIoU representative of deployed-model mIoU, so the best-checkpoint
+    selector picks a model that actually performs better at inference — a real
+    accuracy win at the cost of ~2-3× validation time per epoch (training is
+    unaffected; val is a small fraction of epoch time).
+    """
     module.eval()
     metrics.reset()
     total_loss = 0.0
     # Cached once — criterion.cw is a constant buffer, unaffected by EMA swap.
     class_weights = module.criterion.cw
-    val_iter = tqdm(loader, total=len(loader),
+    max_val_steps = min(
+        len(loader),
+        int(getattr(CFG, "MAX_VAL_STEPS", len(loader))),
+    )
+    val_iter = tqdm(loader, total=max_val_steps,
                     desc=f"Val   Ep {epoch:03d}" if epoch else "Validation",
                     leave=False, dynamic_ncols=True)
-    for imgs, masks in val_iter:
+    # GPU-side confusion matrix accumulator — see prior comment.
+    nc = metrics.num_classes
+    gpu_cm = torch.zeros((nc, nc), dtype=torch.int64, device=device)
+    batches_seen = 0
+    for step, (imgs, masks) in enumerate(val_iter):
+        if step >= max_val_steps:
+            break
+        batches_seen += 1
         imgs = imgs.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
         with amp_ctx:
             raw = module(imgs)
             logits = raw[0] if isinstance(raw, (list, tuple)) else raw
-        # Weighted CE in fp32: ~40% faster than full TriLoss, mIoU selection is unchanged.
+        # Loss is for logging only; CE on the single forward is fine.
         loss = F.cross_entropy(logits.float(), masks, weight=class_weights)
-        preds = logits.float().argmax(1)
-        metrics.update(preds.cpu().numpy(), masks.cpu().numpy())
+
+        if use_tta:
+            # Predictions use the batched fast TTA (1 forward per scale).
+            preds = module.predict(
+                imgs, use_tta=True, fast_tta=True, amp_dtype=CFG.AMP_DTYPE,
+            )
+        else:
+            preds = logits.float().argmax(1)
+
+        p = preds.reshape(-1).to(torch.int64)
+        t = masks.reshape(-1).to(torch.int64)
+        valid = (t >= 0) & (t < nc)
+        if valid.any():
+            p = p[valid]
+            t = t[valid]
+            idx = nc * t + p
+            gpu_cm += torch.bincount(idx, minlength=nc * nc).reshape(nc, nc)
+
         total_loss += loss.item()
         val_iter.set_postfix(loss=f"{loss.item():.4f}")
+
+    # One small transfer instead of B×(B,H,W) per batch
+    metrics._conf_mat = gpu_cm.cpu().numpy()
+
     res = metrics.compute()
     miou = res["mean_iou"]
     for name, iou in zip(metrics.class_names, res["class_iou"]):
         log.info(f"    {name:12s} IoU={iou:.3f}")
-    return miou, total_loss / len(loader)
+    return miou, total_loss / max(batches_seen, 1)
 
 
 def _save_best(module, ema, epoch, miou, cfg, path):
@@ -405,30 +500,85 @@ def _save_best(module, ema, epoch, miou, cfg, path):
     atomic_torch_save({"epoch": epoch, "state_dict": weights, "val_miou": miou, "config": cfg}, path)
 
 
+_OPTIM_SAVE_EVERY = 5  # write the heavy optimizer/scheduler state every N epochs
+
+
 def _save_last(module, ema, optimiser, scheduler, epoch, best_miou, no_improv, cfg, path):
+    # AdamW moments re-warm up in a few steps so the heavy optimizer state
+    # (~2× model size) is saved only every _OPTIM_SAVE_EVERY epochs to avoid
+    # dominating checkpoint I/O.
+    # ⚠ The scheduler_state is ~1.7 KB regardless of model size, but losing
+    # it means OneCycleLR restarts at step 0 on resume — the LR would be the
+    # warmup LR instead of the actual mid-training value. ALWAYS save it.
     model_state = {k: v.detach().cpu() for k, v in module.state_dict().items()}
     ema_state = {k: v.detach().cpu() for k, v in ema.shadow.items()} if ema else None
-    atomic_torch_save({
+    payload = {
         "epoch": epoch, "model_state": model_state, "ema_state": ema_state,
-        "optimizer_state": optimiser.state_dict(), "scheduler_state": scheduler.state_dict(),
+        "scheduler_state": scheduler.state_dict(),  # tiny, always save
         "best_miou": float(best_miou), "no_improv": int(no_improv), "config": cfg,
-    }, path)
+    }
+    if epoch % _OPTIM_SAVE_EVERY == 0:
+        payload["optimizer_state"] = optimiser.state_dict()
+    atomic_torch_save(payload, path)
 
 
 def _load_training_state(module, optimiser, scheduler, ema, ckpt_path: Path, device):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     model_state = ckpt.get("model_state") or ckpt.get("state_dict", {})
-    module.load_state_dict(model_state, strict=False)
+
+    # strict=False is needed so DDP-wrapped checkpoints (prefixed with
+    # "module.") still load into a non-DDP run, but it also silently drops
+    # mismatched KEYS after an arch change. Shape mismatches still raise even
+    # with strict=False, so we catch those explicitly and produce the same
+    # clear message instead of an opaque PyTorch traceback.
+    try:
+        incompatible = module.load_state_dict(model_state, strict=False)
+        missing = list(getattr(incompatible, "missing_keys", []) or [])
+        unexpected = list(getattr(incompatible, "unexpected_keys", []) or [])
+    except RuntimeError as e:
+        log.error(
+            "Checkpoint shape mismatch at %s — almost certainly a stale "
+            "checkpoint from a different STAGE1['arch'] or ['encoder']. "
+            "Delete the checkpoint to retrain from scratch, or restore the "
+            "original architecture. Underlying error:\n  %s",
+            ckpt_path, str(e).split("\n", 1)[0],
+        )
+        raise
+    if missing or unexpected:
+        log.warning(
+            "Checkpoint key mismatch on resume — missing=%d, unexpected=%d. "
+            "If you recently changed STAGE1['arch'] or ['encoder'], "
+            "the old checkpoint at %s is stale and training is effectively from scratch.",
+            len(missing), len(unexpected), ckpt_path,
+        )
+        if missing:
+            log.warning("  example missing keys: %s", missing[:3])
+        if unexpected:
+            log.warning("  example unexpected keys: %s", unexpected[:3])
+
     if "optimizer_state" in ckpt:
         try:
             optimiser.load_state_dict(ckpt["optimizer_state"])
         except Exception as e:
             log.warning(f"Skipping optimizer load: {e}")
+    else:
+        log.info(
+            "No optimizer_state in checkpoint (last save was a non-mod-%d epoch). "
+            "AdamW moments will re-warm over a few steps.",
+            _OPTIM_SAVE_EVERY,
+        )
+
     if "scheduler_state" in ckpt:
         try:
             scheduler.load_state_dict(ckpt["scheduler_state"])
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"Skipping scheduler load (LR will restart at warmup!): {e}")
+    else:
+        log.warning(
+            "No scheduler_state in checkpoint — LR will reset to warmup. "
+            "This shouldn't happen with the current _save_last; please report."
+        )
+
     if ema and ckpt.get("ema_state") is not None:
         ema.shadow = {k: v.to(device) for k, v in ckpt["ema_state"].items()}
     start_epoch = int(ckpt.get("epoch", 0)) + 1

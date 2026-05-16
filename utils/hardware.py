@@ -8,6 +8,7 @@ Call `setup()` at the top of every train/inference script.
 import os
 import platform
 import sys
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -32,28 +33,39 @@ def setup(seed: int = 42, verbose: bool = True) -> torch.device:
     if platform.system() == "Windows":
         import multiprocessing
 
-        # set_start_method may already be configured by an earlier stage
         try:
             multiprocessing.set_start_method("spawn", force=True)
         except RuntimeError:
             pass
+        except ValueError:
+            pass
 
-        # i9-13900K: 8 P-cores (fast) + 16 E-cores (efficiency).
-        # Pin OpenMP / MKL to P-core count so BLAS never lands on E-cores.
-        os.environ["OMP_NUM_THREADS"] = "8"
-        os.environ["MKL_NUM_THREADS"] = "8"
-        os.environ["OPENBLAS_NUM_THREADS"] = "8"
+        os.environ.setdefault("OMP_NUM_THREADS", "8")
+        os.environ.setdefault("MKL_NUM_THREADS", "8")
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", "8")
 
-    # PyTorch inter/intra-op thread pools must be configured before parallel work.
-    # Make setup idempotent: set once, skip on subsequent calls.
+    # ── GDAL / rasterio I/O performance ──────────────────────────────────────
+    # These env vars only take effect before the GDAL driver registry is built.
+    # GDAL_CACHEMAX: per-process block cache (MB). Default 40 MB — way too low
+    #   for multi-GB orthos. 2048 MB amortises strip reads on TIFFs.
+    # GDAL_DISABLE_READDIR_ON_OPEN: skip scanning the entire sibling-file list
+    #   when opening a raster (huge speedup on folders with thousands of files).
+    # CPL_VSIL_CURL_USE_HEAD: disable HEAD requests on remote VSI (no-op for
+    #   local files, but cheap to leave).
+    # See https://gdal.org/user/configoptions.html
+    os.environ.setdefault("GDAL_CACHEMAX", "2048")
+    os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
+    os.environ.setdefault("CPL_VSIL_CURL_USE_HEAD", "NO")
+    os.environ.setdefault("GDAL_NUM_THREADS", "ALL_CPUS")
+
     if not _SETUP_DONE:
         try:
-            torch.set_num_threads(8)  # intra-op (single-op parallelism)
-        except RuntimeError:
+            torch.set_num_threads(8)
+        except (RuntimeError, ValueError):
             pass
         try:
-            torch.set_num_interop_threads(4)  # inter-op (graph-level parallelism)
-        except RuntimeError:
+            torch.set_num_interop_threads(4)
+        except (RuntimeError, ValueError):
             pass
         _SETUP_DONE = True
 
@@ -62,24 +74,30 @@ def setup(seed: int = 42, verbose: bool = True) -> torch.device:
         log.info("[HW] WARNING: CUDA not available — running on CPU")
         return torch.device("cpu")
 
-    device = torch.device("cuda:0")
+    try:
+        device = torch.device("cuda:0")
+    except Exception:
+        log.info("[HW] WARNING: Cannot create CUDA device — falling back to CPU")
+        return torch.device("cpu")
 
-    # TF32 — free ~3× matmul throughput on Ampere, no accuracy loss
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.deterministic = False
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+    except Exception:
+        pass
 
-    # PyTorch 2.x explicit matmul precision API (complements allow_tf32)
-    # "high" = TF32 for matmul, "highest" = FP32 (slower), "medium" = bf16
-    torch.set_float32_matmul_precision("high")
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
 
-    # Flash Attention via SDPA (PyTorch 2.x) — speeds up Swin attention
     try:
         torch.backends.cuda.enable_flash_sdp(True)
         torch.backends.cuda.enable_mem_efficient_sdp(True)
-        torch.backends.cuda.enable_math_sdp(False)  # disable slow fallback
-    except AttributeError:
+        torch.backends.cuda.enable_math_sdp(False)
+    except (AttributeError, Exception):
         pass
 
     # ── Reproducibility ─────────────────────────────────────────────────────
@@ -90,55 +108,77 @@ def setup(seed: int = 42, verbose: bool = True) -> torch.device:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    try:
+        torch.cuda.manual_seed_all(seed)
+    except Exception:
+        pass
 
     # ── Diagnostics ─────────────────────────────────────────────────────────
     if verbose:
-        gpu = torch.cuda.get_device_properties(device)
-        vram_gb = gpu.total_memory / 1024**3
-        cc = f"{gpu.major}.{gpu.minor}"
-        log.info("=" * 60)
-        log.info(f"  GPU              : {gpu.name}")
-        log.info(f"  VRAM             : {vram_gb:.1f} GB")
-        log.info(f"  SM count         : {gpu.multi_processor_count}  (CC {cc})")
-        log.info(f"  CUDA             : {torch.version.cuda}")
-        log.info(f"  PyTorch          : {torch.__version__}")
-        log.info(f"  bf16 native      : {gpu.major >= 8}")
-        log.info(f"  TF32             : {torch.backends.cudnn.allow_tf32}")
-        log.info(f"  matmul precision : {torch.get_float32_matmul_precision()}")
-        log.info(f"  intra threads    : {torch.get_num_threads()}")
-        log.info(f"  interop threads  : {torch.get_num_interop_threads()}")
-        log.info("=" * 60)
+        try:
+            gpu = torch.cuda.get_device_properties(device)
+            vram_gb = gpu.total_memory / 1024**3
+            cc = f"{gpu.major}.{gpu.minor}"
+            log.info("=" * 60)
+            log.info(f"  GPU              : {gpu.name}")
+            log.info(f"  VRAM             : {vram_gb:.1f} GB")
+            log.info(f"  SM count         : {gpu.multi_processor_count}  (CC {cc})")
+            log.info(f"  CUDA             : {torch.version.cuda}")
+            log.info(f"  PyTorch          : {torch.__version__}")
+            log.info(f"  bf16 native      : {gpu.major >= 8}")
+            log.info(f"  TF32             : {torch.backends.cudnn.allow_tf32}")
+            log.info(f"  matmul precision : {torch.get_float32_matmul_precision()}")
+            log.info(f"  intra threads    : {torch.get_num_threads()}")
+            log.info(f"  interop threads  : {torch.get_num_interop_threads()}")
+            log.info("=" * 60)
+        except Exception as e:
+            log.info(f"[HW] Could not get GPU diagnostics: {e}")
 
     return device
 
 
 def worker_init_fn(worker_id: int):
     """
-    DataLoader worker initialiser — pins each worker to a P-core on i9-13900K.
+    DataLoader worker initialiser.
 
-    i9-13900K core layout (Windows logical processors):
-      LP 0–7   → P-cores (fast, hyperthreaded: LP 0/1 = core 0, etc.)
-      LP 8–23  → E-cores (efficiency)
-
-    We assign worker 0→LP0, worker1→LP2, ... up to 4 workers per P-core pair.
-    This keeps all data-loading work on fast P-cores.
-
-    Usage:
-        DataLoader(..., worker_init_fn=worker_init_fn)
+    1. Cap PyTorch's intra-op pool inside this worker to 1 thread.
+       ``torch.set_num_threads`` is honoured at runtime, so this works even
+       though the parent process set 8 threads for itself.
+    2. Disable OpenCV's internal threading (``setNumThreads(0)``) and OpenCL,
+       so each cv2 call inside a worker doesn't spawn ``num_cores`` threads
+       on top of the N DataLoader workers.
+    3. Force the OpenMP / BLAS env vars to "1" (overwrite the inherited "8"
+       from the parent). Some BLAS libs read these at thread-pool creation
+       time — if numpy hasn't been touched yet in this worker, this still
+       takes effect on first use.
+    4. Pin each worker to a fast P-core (LP 0-15) on the i9-13900K.
     """
     try:
-        import os
+        import cv2  # noqa: PLC0415
+        cv2.setNumThreads(0)
+        cv2.ocl.setUseOpenCL(False)
+    except Exception:
+        pass
 
-        import psutil
+    try:
+        torch.set_num_threads(1)
+    except Exception:
+        pass
+
+    # Force-overwrite (not setdefault) — the parent set 8 for itself, but the
+    # whole point of this function is to cap workers to 1.
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+        os.environ[var] = "1"
+
+    try:
+        import psutil  # noqa: PLC0415
 
         p = psutil.Process(os.getpid())
-        # P-core logical processors: 0,1,2,3,4,5,6,7 (8 P-cores × 2 HT = 16 LPs)
-        p_core_lps = list(range(16))  # LP 0–15 are P-core threads on 13900K
+        p_core_lps = list(range(16))
         lp = p_core_lps[worker_id % len(p_core_lps)]
         p.cpu_affinity([lp])
     except Exception:
-        pass  # psutil not installed or affinity not supported — silently skip
+        pass
 
 
 def compile_model(
@@ -188,28 +228,80 @@ def cl_input(tensor: torch.Tensor) -> torch.Tensor:
 
 def get_amp_context(dtype: torch.dtype = torch.bfloat16):
     """
-    Return the right AMP context.
-    bfloat16 on Ampere needs no GradScaler.
-    float16  on older cards needs GradScaler.
+    Return the right AMP context and a (possibly None) GradScaler.
 
-    Uses torch.amp.autocast (PyTorch 2.x API).
-    torch.cuda.amp.autocast is deprecated in PyTorch 2.5.
+    Returns ``(autocast_ctx, scaler)`` where:
+      - ``scaler is None`` for bfloat16 (its 8-bit exponent matches fp32, so
+        attention softmax probabilities don't underflow and gradients don't
+        need scaling). This is the default for Ampere/Ada/Hopper.
+      - ``scaler is a GradScaler`` for float16 (5-bit exponent → tiny attention
+        gradients can flush to 0; the scaler multiplies the loss by a dynamic
+        factor before backward so they survive).
+
+    Callers MUST use the scaler when it is non-None, otherwise float16
+    training will silently produce NaN losses on attention-heavy models.
+    See ``maybe_backward`` / ``maybe_step`` helpers below for the safe pattern.
     """
-    # Use the new torch.amp.autocast API (works in PyTorch 2.0+)
+    # torch.amp.* is the PyTorch 2.x API; the cuda.amp.* re-exports are
+    # deprecated but still work on older builds.
     try:
         from torch.amp import GradScaler, autocast
     except ImportError:
-        # Fallback for older PyTorch versions
         from torch.cuda.amp import GradScaler, autocast
 
-    if dtype == torch.bfloat16:
+    from contextlib import nullcontext
+
+    cuda_available = torch.cuda.is_available()
+
+    if dtype == torch.bfloat16 and cuda_available:
         ctx = autocast("cuda", dtype=torch.bfloat16)
         scaler = None  # bf16 doesn't underflow → no scaling needed
-    else:
+    elif dtype == torch.float16 and cuda_available:
         ctx = autocast("cuda", dtype=torch.float16)
         scaler = GradScaler("cuda")
+    else:
+        # fp32, unsupported dtypes, or CUDA absent: no autocast, no scaler.
+        # nullcontext keeps the training-loop ``with amp_ctx:`` blocks
+        # compiling cleanly even when there is no AMP work to do.
+        ctx = nullcontext()
+        scaler = None
 
     return ctx, scaler
+
+
+def maybe_backward(loss: torch.Tensor, scaler) -> None:
+    """Scale-then-backward when ``scaler`` is non-None, plain backward otherwise.
+
+    Use this everywhere you would have written ``loss.backward()`` in a script
+    that wants to be safe across bf16 and fp16.
+    """
+    if scaler is not None:
+        scaler.scale(loss).backward()
+    else:
+        loss.backward()
+
+
+def maybe_step(optimiser, scaler, max_grad_norm: Optional[float] = None,
+               parameters=None) -> Optional[torch.Tensor]:
+    """Take an optimiser step, honouring the AMP scaler when present.
+
+    Returns the pre-clip gradient norm (``torch.Tensor`` scalar) when
+    ``max_grad_norm`` is provided, else None. Callers can act on the norm
+    (e.g. skip the step on a spike) before discarding it.
+    """
+    grad_norm = None
+    if scaler is not None:
+        # Unscale FIRST so clip_grad_norm sees the true gradients.
+        scaler.unscale_(optimiser)
+        if max_grad_norm is not None and parameters is not None:
+            grad_norm = torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm)
+        scaler.step(optimiser)
+        scaler.update()
+    else:
+        if max_grad_norm is not None and parameters is not None:
+            grad_norm = torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm)
+        optimiser.step()
+    return grad_norm
 
 
 class EMA:
@@ -243,12 +335,20 @@ class EMA:
                 params.append(param.data)
         if not shadows:
             return
+        # torch.lerp(start, end, w) == start + w*(end-start), so
+        # _foreach_lerp_(shadow, param, 1-decay) folds the multiply+add
+        # into a single fused kernel.  Two _foreach_* kernels (mul_ + add_)
+        # are still issued by the fallback path.
+        w = 1.0 - self.decay
         try:
-            torch._foreach_mul_(shadows, self.decay)
-            torch._foreach_add_(shadows, params, alpha=1.0 - self.decay)
+            torch._foreach_lerp_(shadows, params, w)
         except (AttributeError, RuntimeError):
-            for s, p in zip(shadows, params):
-                s.mul_(self.decay).add_(p, alpha=1.0 - self.decay)
+            try:
+                torch._foreach_mul_(shadows, self.decay)
+                torch._foreach_add_(shadows, params, alpha=w)
+            except (AttributeError, RuntimeError):
+                for s, p in zip(shadows, params):
+                    s.mul_(self.decay).add_(p, alpha=w)
 
     def apply_shadow(self, model: nn.Module):
         """Swap EMA weights into model for validation."""

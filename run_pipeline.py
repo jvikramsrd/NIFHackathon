@@ -43,6 +43,14 @@ def preprocess(data_root: str):
     from data.preprocessing import preprocess_folder
 
     data_root_path = Path(data_root)
+    if not data_root_path.exists():
+        log.error("Data root does not exist: %s", data_root_path)
+        log.info("  Pass an existing folder via --data_root, for example:")
+        log.info("    python run_pipeline.py --mode preprocess --data_root ./dataset")
+        return
+    if not data_root_path.is_dir():
+        log.error("Data root is not a directory: %s", data_root_path)
+        return
 
     candidates = [data_root_path] + [d for d in data_root_path.iterdir() if d.is_dir()]
 
@@ -108,11 +116,11 @@ def train_all():
     from train.train_stage2 import train_stage2a, train_stage2b
     from utils.hardware import clear_cuda_cache
 
-    _header("STAGE 1 — Semantic Segmentation  (Unet mit_b5)")
+    _header(f"STAGE 1 — Semantic Segmentation  ({CFG.STAGE1['arch']} {CFG.STAGE1['encoder']})")
     train_stage1()
     clear_cuda_cache()
 
-    _header("STAGE 2A — Rooftop Classifier  (ConvNeXt-Large)")
+    _header(f"STAGE 2A — Rooftop Classifier  ({CFG.STAGE2A['arch']})")
     train_stage2a()
     clear_cuda_cache()
 
@@ -276,7 +284,8 @@ def _run_cli(argv=None):
     )
     ap.add_argument("--tif", default=None, help="Test raster for --mode infer")
     ap.add_argument("--out", default="./outputs/test", help="Output dir for infer")
-    args = ap.parse_args()
+    # Honour the argv parameter so cli_main(sys.argv[1:]) works as advertised.
+    args = ap.parse_args(argv)
 
     mode = str(args.mode)
     data_root = str(args.data_root)
@@ -297,7 +306,10 @@ def _run_cli(argv=None):
     elif mode == "evaluate":
         evaluate()
     elif mode == "infer":
-        assert args.tif, "--tif is required for infer mode"
+        # Use a real error instead of `assert` (assertions are stripped under
+        # `python -O`, which would silently produce a NoneType error later).
+        if not args.tif:
+            ap.error("--tif is required for --mode infer")
         infer(str(args.tif), str(args.out))
     elif mode == "all":
         preprocess(data_root)

@@ -8,13 +8,44 @@ Post-processing for Stage 1 segmentation output:
   4. Rooftop label merge (Stage 2A results → building polygons)
 """
 
+import math
+import os
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
 from utils.logger import get_logger
+
+# Optional geo stack — hoisted to module level so we pay the import cost once
+# rather than on every call to mask_to_shapefile / clean_vector_geometries /
+# detections_to_shapefile / merge_rooftop_labels. Each of those was importing
+# the same modules locally — a measurable cost when post-processing many tiles.
+try:
+    import geopandas as gpd
+    import pandas as pd
+    import rasterio.features
+    from shapely.affinity import affine_transform, rotate
+    from shapely.affinity import scale as shapely_scale
+    from shapely.geometry import GeometryCollection, MultiPolygon, Point, Polygon
+    from shapely.geometry import box as shapely_box
+    from shapely.geometry import shape
+    from shapely.strtree import STRtree
+    _GEO_AVAILABLE = True
+except ImportError:
+    _GEO_AVAILABLE = False
+
+try:
+    from shapely.validation import make_valid as _make_valid
+except ImportError:
+    _make_valid = None
+
+try:
+    import config as _CFG
+except ImportError:
+    _CFG = None
 
 warnings.filterwarnings("ignore")
 
@@ -63,15 +94,13 @@ def _process_crf_tile(args):
     log.debug("  [DEBUG CRF] addPairwiseGaussian")
     d.addPairwiseGaussian(sxy=pos_xy_std, compat=pos_w)
 
-    # --- EXPERT ADDITION: Texture-Aware Pairwise Bilateral ---
-    # Calculate local gradient variance (using Sobel filters on the RGB image)
-    log.debug("  [DEBUG CRF] Calculating local texture variance for boundary weighting...")
-    # Gradient magnitude across channels as a proxy for texture evidence
-    sobel_x = cv2.Sobel(image_rgb, cv2.CV_64F, 1, 0, ksize=3)
-    sobel_y = cv2.Sobel(image_rgb, cv2.CV_64F, 0, 1, ksize=3)
-    texture_evidence = np.sqrt(sobel_x**2 + sobel_y**2)
-    # Normalize: min→0, max→1 so stronger edges get higher bilateral weight
-    texture_evidence = cv2.normalize(texture_evidence, None, 0.0, 1.0, cv2.NORM_MINMAX)
+    # NOTE: an earlier version computed a Sobel-magnitude "texture_evidence"
+    # tensor here and the docstring promised it would weight the bilateral
+    # term. That tensor was never actually passed to addPairwiseBilateral —
+    # the rgbim arg below uses the raw image_rgb. Removed to stop paying the
+    # ~per-tile Sobel/normalize cost for a feature that wasn't wired up.
+    # If we re-introduce texture-aware CRF, route through
+    # pydensecrf.utils.create_pairwise_bilateral + d.addPairwiseEnergy.
 
     log.debug("  [DEBUG CRF] Building per-class bilateral compat matrix...")
     # Per-class compatibility matrix: heavier penalty for class confusions that
@@ -169,17 +198,41 @@ def apply_dense_crf(
     refined_map = np.zeros_like(prob_map)
     weight_map = np.zeros((H, W), dtype=np.float32)
 
-    for i, t in enumerate(tqdm(tasks, desc="  CRF tiles")):
-        log.debug(
-            "  [DEBUG CRF] Submitting task %d/%d (r=%s, c=%s)", i + 1, len(tasks), t[-2], t[-1]
-        )
-        res, r, c, th, tw = _process_crf_tile(t)
-        log.debug(f"  [DEBUG CRF] Task {i + 1} completed")
+    def _accumulate(res, r, c, th, tw):
         r2 = r + th
         c2 = c + tw
         wind_slice = window[:th, :tw]
         refined_map[:, r:r2, c:c2] += res * wind_slice
         weight_map[r:r2, c:c2] += wind_slice
+
+    max_workers_cfg = int(getattr(_CFG, "CRF_WORKERS", 0) or 0) if _CFG is not None else 0
+    max_workers = min(max_workers_cfg or (os.cpu_count() or 1), len(tasks), 8)
+    if max_workers <= 1 or len(tasks) <= 1:
+        for i, t in enumerate(tqdm(tasks, desc="  CRF tiles")):
+            log.debug(
+                "  [DEBUG CRF] Processing task %d/%d (r=%s, c=%s)",
+                i + 1,
+                len(tasks),
+                t[-2],
+                t[-1],
+            )
+            res, r, c, th, tw = _process_crf_tile(t)
+            _accumulate(res, r, c, th, tw)
+    else:
+        log.debug("[DEBUG CRF] Launching %d workers for %d tiles", max_workers, len(tasks))
+        try:
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(_process_crf_tile, t): t for t in tasks}
+                for future in tqdm(
+                    as_completed(futures), total=len(tasks), desc="  CRF tiles"
+                ):
+                    res, r, c, th, tw = future.result()
+                    _accumulate(res, r, c, th, tw)
+        except Exception as exc:
+            log.warning("Parallel CRF failed (%s); falling back to serial", exc)
+            for t in tqdm(tasks, desc="  CRF tiles (serial)"):
+                res, r, c, th, tw = _process_crf_tile(t)
+                _accumulate(res, r, c, th, tw)
 
     log.debug("[DEBUG CRF] All tasks finished. Averaging map...")
     refined_map /= np.maximum(weight_map, 1e-6)
@@ -200,39 +253,61 @@ def clean_segmentation_mask(
     Per-class morphological operations, enhancing robustness using context-aware
     size thresholds and connectivity checks.
     """
+    if mask is None or mask.size == 0:
+        return np.zeros((256, 256), dtype=np.uint8)
+
+    mask = np.asarray(mask)
+    if mask.ndim != 2:
+        return np.zeros((256, 256), dtype=np.uint8)
+
     cleaned = mask.copy()
     min_bld = class_config.get("min_building_area_px", 100)
     min_road = class_config.get("min_road_width_px", 3)
 
+    try:
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    except Exception:
+        kernel_close = None
+    try:
+        kernel_road_close = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (min_road + 15, min_road + 15)
+        )
+    except Exception:
+        kernel_road_close = None
+    try:
+        kernel_road_open = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (min_road, min_road)
+        )
+    except Exception:
+        kernel_road_open = None
+    try:
+        kernel_water = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    except Exception:
+        kernel_water = None
+
     # --- Buildings (class 1) ---
     bld = (mask == 1).astype(np.uint8)
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    bld = cv2.morphologyEx(bld, cv2.MORPH_CLOSE, kernel_close)
+    if kernel_close is not None:
+        bld = cv2.morphologyEx(bld, cv2.MORPH_CLOSE, kernel_close)
     bld = _remove_small_blobs(bld, min_bld)
-    # Watershed: separate touching building instances before vectorisation
     bld = separate_touching_buildings(bld)
     cleaned[bld == 1] = 1
     cleaned[(mask == 1) & (bld == 0)] = 0
 
     # --- Roads (class 2) ---
     road = (mask == 2).astype(np.uint8)
-    # Aggressively bridge gaps in roads using larger kernels based on configured width
-    kernel_road_close = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (min_road + 15, min_road + 15)
-    )
-    kernel_road_open = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (min_road, min_road)
-    )
-    road = cv2.morphologyEx(road, cv2.MORPH_CLOSE, kernel_road_close, iterations=2)
-    road = cv2.morphologyEx(road, cv2.MORPH_OPEN, kernel_road_open)
+    if kernel_road_close is not None:
+        road = cv2.morphologyEx(road, cv2.MORPH_CLOSE, kernel_road_close, iterations=2)
+    if kernel_road_open is not None:
+        road = cv2.morphologyEx(road, cv2.MORPH_OPEN, kernel_road_open)
     road = _remove_small_blobs(road, min_bld // 2)
     cleaned[road == 1] = 2
     cleaned[(mask == 2) & (road == 0)] = 0
 
     # --- Waterbodies (class 3) ---
     water = (mask == 3).astype(np.uint8)
-    kernel_water = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-    water = cv2.morphologyEx(water, cv2.MORPH_CLOSE, kernel_water)
+    if kernel_water is not None:
+        water = cv2.morphologyEx(water, cv2.MORPH_CLOSE, kernel_water)
     water = _remove_small_blobs(water, min_bld * 2)
     cleaned[water == 1] = 3
     cleaned[(mask == 3) & (water == 0)] = 0
@@ -241,13 +316,28 @@ def clean_segmentation_mask(
 
 
 def _remove_small_blobs(binary: np.ndarray, min_area: int) -> np.ndarray:
-    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-        binary, connectivity=8
-    )
-    # Use int32 LUT — uint8 would silently overflow for label indices > 255
+    if binary is None or binary.size == 0:
+        return np.zeros((256, 256), dtype=np.uint8)
+
+    binary = np.asarray(binary)
+    if binary.ndim != 2:
+        return np.zeros((256, 256), dtype=np.uint8)
+
+    min_area = max(1, int(min_area))
+
+    try:
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            binary, connectivity=8
+        )
+    except Exception:
+        return binary
+
+    if n_labels <= 1:
+        return binary
+
     valid_mask = np.zeros(n_labels, dtype=np.int32)
     valid_mask[stats[:, cv2.CC_STAT_AREA] >= min_area] = 1
-    valid_mask[0] = 0  # Background is always 0
+    valid_mask[0] = 0
     return valid_mask[labels].astype(np.uint8)
 
 
@@ -308,20 +398,22 @@ def mask_to_shapefile(
 
     Requires: rasterio, shapely, geopandas, fiona
     """
-    import geopandas as gpd
-    import rasterio.features
-    from shapely.affinity import affine_transform
-    from shapely.geometry import shape
+    if mask is None or mask.size == 0:
+        log.warning("Empty mask provided to mask_to_shapefile")
+        return Path(out_dir)
+
+    mask = np.asarray(mask)
+    if mask.ndim != 2:
+        log.warning(f"Invalid mask dimensions: {mask.shape}")
+        return Path(out_dir)
+
+    if not _GEO_AVAILABLE:
+        log.warning("geopandas/shapely not available; skipping mask_to_shapefile")
+        return Path(out_dir)
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    cfg = {}
-    try:
-        import config as CFG
-
-        cfg = dict(CFG.STAGE1)
-    except Exception:
-        cfg = {}
+    cfg = dict(_CFG.STAGE1) if _CFG is not None else {}
     simplify_tol = float(cfg.get("polygon_simplify_tolerance", 0.5))
     min_area_by_class = cfg.get("polygon_min_area_px", {})
 
@@ -329,52 +421,59 @@ def mask_to_shapefile(
 
     for class_id, class_name in enumerate(class_names):
         if class_id == 0:
-            continue  # skip background
+            continue
 
         binary = (mask == class_id).astype(np.uint8)
         if binary.sum() == 0:
             continue
 
-        shapes_gen = rasterio.features.shapes(binary, mask=binary, transform=transform)
+        try:
+            shapes_gen = rasterio.features.shapes(binary, mask=binary, transform=transform)
+            shapes_list = [(shape(s), v) for s, v in shapes_gen if v == 1]
+        except Exception as e:
+            log.warning(f"Failed to extract shapes for class {class_name}: {e}")
+            continue
 
-        # Generator might be empty or valid, safely get geoms
-        shapes_list = [(shape(s), v) for s, v in shapes_gen if v == 1]
         if not shapes_list:
             continue
 
-        geoms, vals = zip(*shapes_list)
-        geoms_list = list(geoms)
+        try:
+            geoms, vals = zip(*shapes_list)
+            geoms_list = list(geoms)
 
-        gdf = gpd.GeoDataFrame(
-            {
-                "class_id": [class_id] * len(geoms_list),
-                "class_name": [class_name] * len(geoms_list),
-            },
-            geometry=geoms_list,
-            crs=crs,
-        )
-        gdf = clean_vector_geometries(
-            gdf,
-            class_name=class_name,
-            min_area=float(min_area_by_class.get(class_name, 0)),
-            simplify_tolerance=simplify_tol,
-        )
-        if len(gdf) == 0:
+            gdf = gpd.GeoDataFrame(
+                {
+                    "class_id": [class_id] * len(geoms_list),
+                    "class_name": [class_name] * len(geoms_list),
+                },
+                geometry=geoms_list,
+                crs=crs,
+            )
+            gdf = clean_vector_geometries(
+                gdf,
+                class_name=class_name,
+                min_area=float(min_area_by_class.get(class_name, 0)),
+                simplify_tolerance=simplify_tol,
+            )
+            if len(gdf) == 0:
+                continue
+
+            cls_path = out_dir / f"{prefix}_{class_name}.shp"
+            gdf.to_file(str(cls_path))
+            all_gdfs.append(gdf)
+        except Exception as e:
+            log.warning(f"Failed to process class {class_name}: {e}")
             continue
 
-        # Save per-class SHP
-        cls_path = out_dir / f"{prefix}_{class_name}.shp"
-        gdf.to_file(str(cls_path))
-        all_gdfs.append(gdf)
-
     if all_gdfs:
-        import pandas as pd
-
-        combined = pd.concat(all_gdfs, ignore_index=True)
-        combined_gdf = gpd.GeoDataFrame(combined, crs=crs)
-        combined_path = out_dir / f"{prefix}_all_features.gpkg"
-        combined_gdf.to_file(str(combined_path), driver="GPKG")
-        log.info(f"  ✓ Combined vector saved: {combined_path}")
+        try:
+            combined = pd.concat(all_gdfs, ignore_index=True)
+            combined_gdf = gpd.GeoDataFrame(combined, crs=crs)
+            combined_path = out_dir / f"{prefix}_all_features.gpkg"
+            combined_gdf.to_file(str(combined_path), driver="GPKG")
+            log.info(f"  ✓ Combined vector saved: {combined_path}")
+        except Exception as e:
+            log.warning(f"Failed to save combined shapefile: {e}")
 
     return out_dir
 
@@ -387,18 +486,11 @@ def clean_vector_geometries(
 ):
     """Fix topology, simplify polygons, explode multipart features, and filter area."""
 
-    from shapely.geometry import GeometryCollection, MultiPolygon, Polygon
-
-    try:
-        from shapely.validation import make_valid
-    except Exception:
-        make_valid = None
-
     def _fix_geom(geom):
         if geom is None or geom.is_empty:
             return None
         try:
-            fixed = make_valid(geom) if make_valid is not None else geom.buffer(0)
+            fixed = _make_valid(geom) if _make_valid is not None else geom.buffer(0)
         except Exception:
             fixed = geom.buffer(0)
         if fixed is None or fixed.is_empty:
@@ -449,8 +541,6 @@ def merge_rooftop_labels(
     Add rooftop material classification results as a new attribute
     to the building footprint shapefile.
     """
-    import geopandas as gpd
-
     gdf = gpd.read_file(building_shp_path)
     gdf["roof_pred"] = gdf.index.map(lambda i: rooftop_predictions.get(i, "Unknown"))
     gdf.to_file(out_path)
@@ -476,12 +566,6 @@ def detections_to_shapefile(
       in geo-coordinates so orientation is preserved for GIS users.
     - Standard-box detections: stored as centroid points (legacy behaviour).
     """
-    import math
-
-    import geopandas as gpd
-    from shapely.affinity import rotate, scale as shapely_scale
-    from shapely.geometry import Point, box as shapely_box
-
     rows = []
     for det in detections:
         x1, y1, x2, y2 = det["bbox_xyxy"]

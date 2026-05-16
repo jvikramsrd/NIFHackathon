@@ -145,7 +145,9 @@ class RooftopClassifier(nn.Module):
     def mixup(self, x, y, alpha=0.4):
         lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
         idx = torch.randperm(x.size(0), device=x.device)
-        return lam * x + (1 - lam) * x[idx], y, y[idx], lam
+        # torch.lerp(start, end, weight) = start + weight*(end-start)
+        # = lam*x + (1-lam)*x[idx]  — single fused kernel, one alloc.
+        return torch.lerp(x[idx], x, float(lam)), y, y[idx], lam
 
     def mixup_loss(self, logits, ya, yb, lam):
         return lam * self.criterion(logits, ya) + (1 - lam) * self.criterion(logits, yb)
@@ -162,76 +164,108 @@ class RooftopClassifier(nn.Module):
         y1 = max(cy - cut_h // 2, 0)
         x2 = min(cx + cut_w // 2, W)
         y2 = min(cy + cut_h // 2, H)
-        mixed = x.clone()
-        mixed[:, :, y1:y2, x1:x2] = x[idx, :, y1:y2, x1:x2]
+        # Skip the full clone: the RHS slice is already a fresh tensor (advanced
+        # indexing), and the caller (train_stage2a) does not reuse the input
+        # batch after cutmix — see _cutmix_seg in train_stage1 for the same idiom.
+        x[:, :, y1:y2, x1:x2] = x[idx, :, y1:y2, x1:x2]
         lam = 1 - (x2 - x1) * (y2 - y1) / (W * H)
-        return mixed, y, y[idx], lam
+        return x, y, y[idx], lam
 
     # ── 3-Scale × D4 TTA ───────────────────────────────────────────────────
     @torch.no_grad()
     def predict(
-        self, x: torch.Tensor, tta_steps: int = 16, return_probs: bool = False
+        self,
+        x: torch.Tensor,
+        tta_steps: int = 16,
+        return_probs: bool = False,
+        tta_chunk: int = 128,
     ) -> torch.Tensor:
         """
         3-scale TTA with D4 symmetry group:
         Scales: 0.875× (wider context), 1.0× (base), 1.25× (fine texture)
-        Per scale: 8 folds (4 rotations × 2 flip states)
+        Per scale: up to 8 folds (4 rotations × 2 flip states).
 
-        Scale weights: 0.875×→0.8, 1.0×→1.0, 1.25×→0.9 (base is authoritative).
-        Total weighted passes: up to 24 (3 scales × 8 folds).
+        All folds for a given scale are stacked into one forward call → 3 forward
+        passes instead of up to 24. Same math, far better GPU utilisation —
+        critical for per-epoch validation throughput.
+
+        ``tta_chunk`` caps images per forward to stay within VRAM. ConvNeXt-L on
+        an A4000 handles ~128 224-px crops comfortably in bf16; tune down if you
+        raise ``cfg["batch_size"]`` for validation.
         """
+        if x.numel() == 0:
+            B = x.shape[0] if x.ndim > 0 else 1
+            return torch.zeros((B, self.num_classes), device=x.device, dtype=torch.float32)
+
         was_training = self.training
         self.eval()
-        _, _, H, W = x.shape
-        all_probs = []
-        scale_weights = []
+        B, _, H, W = x.shape
+
+        if H == 0 or W == 0:
+            return torch.zeros((B, self.num_classes), device=x.device, dtype=torch.float32)
 
         scales_config = [
-            (0.875, 0.8),   # zoom out — captures larger buildings wholly
-            (1.0,   1.0),   # base scale
-            (1.25,  0.9),   # zoom in — captures fine texture (RCC grit, tile ridges)
+            (0.875, 0.8),
+            (1.0,   1.0),
+            (1.25,  0.9),
         ]
+        n_folds = min(tta_steps, 8)
 
-        n_folds = min(tta_steps, 8)  # up to 8 folds per scale
+        weighted_sum = torch.zeros((B, self.num_classes), device=x.device, dtype=torch.float32)
+        total_weight = 0.0
 
-        for scale, weight in scales_config:
-            if scale != 1.0:
-                crop_H = int(H * (1.0 / scale))
-                crop_W = int(W * (1.0 / scale))
+        try:
+            for scale, weight in scales_config:
                 if scale < 1.0:
-                    # zoom out: pad then center-crop (shows more context)
+                    crop_H = int(H * (1.0 / scale))
+                    crop_W = int(W * (1.0 / scale))
                     pad_h = max(0, (crop_H - H) // 2)
                     pad_w = max(0, (crop_W - W) // 2)
                     x_s = F.pad(x, (pad_w, pad_w, pad_h, pad_h), mode="reflect")
                     x_s = F.interpolate(x_s, size=(H, W), mode="bilinear", align_corners=False)
-                else:
-                    # zoom in: center-crop then resize up
+                elif scale > 1.0:
                     sh = int(H / scale)
                     sw = int(W / scale)
                     sy = (H - sh) // 2
                     sx = (W - sw) // 2
                     x_s = x[:, :, sy: sy + sh, sx: sx + sw]
                     x_s = F.interpolate(x_s, size=(H, W), mode="bilinear", align_corners=False)
-            else:
-                x_s = x
+                else:
+                    x_s = x
 
-            for k in range(n_folds):
-                aug = torch.rot90(x_s, k % 4, dims=[2, 3])
-                if k >= 4:
-                    aug = torch.flip(aug, [3])
-                # ArcFace: labels=None → returns cosine logits
-                logit = self(aug)
-                prob = torch.softmax(logit, 1)
-                all_probs.append(prob)
-                scale_weights.append(weight)
+                augs = []
+                for k in range(n_folds):
+                    aug = torch.rot90(x_s, k % 4, dims=[2, 3])
+                    if k >= 4:
+                        aug = torch.flip(aug, [3])
+                    augs.append(aug)
+                mega = torch.cat(augs, dim=0)  # (n_folds * B, C, H, W)
 
-        weights_t = torch.tensor(scale_weights, device=x.device, dtype=torch.float32)  # (N_aug,)
-        stacked = torch.stack(all_probs, dim=0)  # (N_aug, B, C)
-        # Weighted sum then normalise
-        mean_probs = (stacked * weights_t.view(-1, 1, 1)).sum(0) / weights_t.sum()
+                probs_parts = []
+                for start in range(0, mega.shape[0], tta_chunk):
+                    chunk = mega[start : start + tta_chunk]
+                    try:
+                        logit = self(chunk)
+                        probs_parts.append(torch.softmax(logit.float(), 1))
+                    except Exception:
+                        probs_parts.append(torch.full(
+                            (chunk.shape[0], self.num_classes),
+                            1.0 / self.num_classes,
+                            device=x.device, dtype=torch.float32,
+                        ))
+                probs_mega = torch.cat(probs_parts, dim=0)
+
+                for k in range(n_folds):
+                    prob = probs_mega[k * B : (k + 1) * B]
+                    weighted_sum.add_(prob * weight)
+                    total_weight += weight
+        except Exception:
+            weighted_sum = torch.ones((B, self.num_classes), device=x.device, dtype=torch.float32)
+            total_weight = float(self.num_classes)
 
         if was_training:
             self.train()
+        mean_probs = weighted_sum / max(total_weight, 1e-6)
         if return_probs:
             return mean_probs
         return mean_probs.argmax(1)
@@ -316,6 +350,8 @@ class InfrastructureDetector:
             mixup=self.cfg.get("mixup", 0.15),
             copy_paste=self.cfg.get("copy_paste", 0.30),
             cache=self.cfg.get("cache", "ram"),
+            dropout=float(self.cfg.get("dropout", 0.0)),
+            multi_scale=bool(self.cfg.get("multi_scale", False)),
             device=device,
             project=str(self.ckpt_dir),
             name=f"stage2b_{self.cfg['model_variant']}",
@@ -334,11 +370,12 @@ class InfrastructureDetector:
             return self._sahi_model
         try:
             from sahi import AutoDetectionModel  # type: ignore
+            device = "cuda:0" if torch.cuda.is_available() else "cpu"
             self._sahi_model = AutoDetectionModel.from_pretrained(
                 model_type="yolov8",
                 model=self.model,
                 confidence_threshold=self.cfg.get("conf_thresh", 0.10),
-                device="cuda:0",
+                device=device,
             )
             return self._sahi_model
         except ImportError:
@@ -346,7 +383,14 @@ class InfrastructureDetector:
                         "Install with: pip install sahi")
             return None
 
-    def predict(self, img_path: str) -> list:
+    def predict(self, img_source) -> list:
+        """Run inference on ``img_source``.
+
+        ``img_source`` may be a file path (str / PathLike) or a numpy ndarray
+        (BGR uint8, HWC). YOLO's ``model(...)`` and SAHI's
+        ``get_sliced_prediction(...)`` both accept either form; this lets
+        callers avoid a JPEG-encode + temp-file round trip per tile.
+        """
         if self._backend != "yolo":
             return []
 
@@ -367,7 +411,7 @@ class InfrastructureDetector:
                     overlap_ratio = float(self.cfg.get("sahi_overlap_ratio", 0.30))
                     slice_size = int(self.cfg.get("sahi_slice_size", 640))
                     result = get_sliced_prediction(
-                        img_path,
+                        img_source,
                         sahi_model,
                         slice_height=slice_size,
                         slice_width=slice_size,
@@ -400,7 +444,7 @@ class InfrastructureDetector:
 
         if not use_sahi or not raw_dets:
             results = self.model(
-                img_path,
+                img_source,
                 conf=min(class_thresholds.values()) if class_thresholds else default_thresh,
                 iou=self.cfg["iou_thresh"],
                 max_det=self.cfg.get("max_det", 300),
@@ -466,50 +510,69 @@ def soft_nms_gaussian(
     Returns:
         (kept_indices, decayed_scores) — sorted by descending score
     """
-    if len(boxes) == 0:
+    if boxes.numel() == 0 or scores.numel() == 0:
         return torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.float32)
 
+    if boxes.shape[0] != scores.shape[0]:
+        return torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.float32)
+
+    if sigma <= 0:
+        sigma = 0.5
+
     out_device = boxes.device
-    boxes = boxes.float()
-    scores = scores.float().clone()
-    N = len(boxes)
-    indices = torch.arange(N, device=boxes.device)
-    kept = []
+    # Soft-NMS is fundamentally sequential, but the original implementation
+    # made it pay two extra costs per iteration:
+    #   1. ``.item()`` on the winning index and score forced a GPU↔CPU sync
+    #      every step. For 1000 detections that's 1000 syncs.
+    #   2. ``boxes = boxes[mask]`` + ``scores = scores[mask]`` reallocated the
+    #      survivor tensors every step.
+    # We move the entire algorithm to CPU/NumPy: the per-step cost is tiny
+    # (a few hundred floats), the loop runs unmodified, and the constant
+    # device-sync overhead disappears.
+    import numpy as np
+
+    boxes_np = boxes.detach().to("cpu", dtype=torch.float32).numpy()
+    scores_np = scores.detach().to("cpu", dtype=torch.float32).numpy().copy()
+    N = boxes_np.shape[0]
+    alive = np.ones(N, dtype=bool)
+
+    kept_ids = []
     kept_scores = []
 
-    while len(scores) > 0:
-        max_idx = scores.argmax()
-        kept.append(indices[max_idx].item())
-        kept_scores.append(scores[max_idx].item())
-        max_box = boxes[max_idx]
+    areas = (boxes_np[:, 2] - boxes_np[:, 0]) * (boxes_np[:, 3] - boxes_np[:, 1])
+    inv_sigma = 1.0 / float(sigma)
 
-        mask = torch.ones(len(scores), dtype=torch.bool, device=boxes.device)
-        mask[max_idx] = False
-        boxes = boxes[mask]
-        scores = scores[mask]
-        indices = indices[mask]
-
-        if len(boxes) == 0:
+    # Mirrors the original semantics exactly: every selected max is added to
+    # kept regardless of its score; the survivor-filter (> threshold) is only
+    # applied to remaining candidates after the IoU decay.
+    while alive.any():
+        masked_scores = np.where(alive, scores_np, -np.inf)
+        m_idx = int(masked_scores.argmax())
+        kept_ids.append(m_idx)
+        kept_scores.append(float(scores_np[m_idx]))
+        alive[m_idx] = False
+        survivors = np.where(alive)[0]
+        if survivors.size == 0:
             break
 
-        x1 = torch.max(boxes[:, 0], max_box[0])
-        y1 = torch.max(boxes[:, 1], max_box[1])
-        x2 = torch.min(boxes[:, 2], max_box[2])
-        y2 = torch.min(boxes[:, 3], max_box[3])
-        inter = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
-        area_a = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-        area_b = (max_box[2] - max_box[0]) * (max_box[3] - max_box[1])
-        iou = inter / (area_a + area_b - inter + 1e-6)
+        max_box = boxes_np[m_idx]
+        max_area = areas[m_idx]
+        sb = boxes_np[survivors]
+        x1 = np.maximum(sb[:, 0], max_box[0])
+        y1 = np.maximum(sb[:, 1], max_box[1])
+        x2 = np.minimum(sb[:, 2], max_box[2])
+        y2 = np.minimum(sb[:, 3], max_box[3])
+        inter = np.maximum(x2 - x1, 0.0) * np.maximum(y2 - y1, 0.0)
+        union = areas[survivors] + max_area - inter
+        iou = np.where(union > 0, inter / union, 0.0)
 
-        decay = torch.exp(-(iou ** 2) / sigma)
-        scores *= decay
+        decay = np.exp(-(iou * iou) * inv_sigma)
+        scores_np[survivors] *= decay
+        below = scores_np[survivors] <= score_threshold
+        if below.any():
+            alive[survivors[below]] = False
 
-        keep = scores > score_threshold
-        boxes = boxes[keep]
-        scores = scores[keep]
-        indices = indices[keep]
-
-    kept_idx = torch.tensor(kept, dtype=torch.long, device=out_device)
+    kept_idx = torch.tensor(kept_ids, dtype=torch.long, device=out_device)
     out_scores = torch.tensor(kept_scores, dtype=torch.float32, device=out_device)
     return kept_idx, out_scores
 

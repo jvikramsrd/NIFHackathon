@@ -22,7 +22,11 @@ def export_stage1_onnx(
     out_path: Path = CFG.CKPT_DIR / "stage1.onnx",
     opset: int = 17,
 ) -> Path:
-    model = Stage1Module(CFG.STAGE1).eval()
+    # Override encoder_weights so smp doesn't try to download ImageNet weights
+    # every export call — the checkpoint we load below already contains
+    # fine-tuned weights.
+    cfg = {**CFG.STAGE1, "encoder_weights": None}
+    model = Stage1Module(cfg).eval()
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt.get("state_dict", ckpt), strict=False)
     dummy = torch.randn(1, 3, int(CFG.STAGE1["patch_size"]), int(CFG.STAGE1["patch_size"]))
@@ -45,7 +49,9 @@ def export_stage2a_onnx(
     out_path: Path = CFG.CKPT_DIR / "stage2a.onnx",
     opset: int = 17,
 ) -> Path:
-    model = RooftopClassifier(CFG.STAGE2A).eval()
+    # Skip ImageNet download — the checkpoint already supplies fine-tuned weights.
+    cfg = {**CFG.STAGE2A, "pretrained": False}
+    model = RooftopClassifier(cfg).eval()
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt.get("state_dict", ckpt), strict=False)
     crop_size = int(CFG.STAGE2A["crop_size"])

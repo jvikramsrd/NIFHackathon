@@ -49,6 +49,58 @@ log = get_logger(__name__)
 warnings.filterwarnings("ignore")
 
 
+def normalise_dbf_value(value) -> str:
+    """Normalize noisy DBF categorical values for stable config-map lookup."""
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    return text.strip("_")
+
+
+def find_attribute_column(gdf, candidates) -> Optional[str]:
+    """Return the actual GeoDataFrame column matching any candidate name."""
+    if gdf is None or not hasattr(gdf, "columns"):
+        return None
+    if isinstance(candidates, (str, bytes)):
+        candidates = [candidates]
+
+    cols = list(gdf.columns)
+    if not cols:
+        return None
+
+    for candidate in candidates:
+        if candidate in gdf.columns:
+            return str(candidate)
+
+    lower_map = {str(col).lower(): str(col) for col in cols}
+    for candidate in candidates:
+        match = lower_map.get(str(candidate).lower())
+        if match is not None:
+            return match
+
+    norm_map = {normalise_dbf_value(col): str(col) for col in cols}
+    for candidate in candidates:
+        match = norm_map.get(normalise_dbf_value(candidate))
+        if match is not None:
+            return match
+    return None
+
+
+def canonical_mapped_label(raw_value, value_map: dict, default=None):
+    """Map a raw DBF value to a canonical class label."""
+    raw = normalise_dbf_value(raw_value)
+    if not raw:
+        return default
+
+    if raw in value_map:
+        return value_map[raw]
+
+    for key, label in value_map.items():
+        key_norm = normalise_dbf_value(key)
+        if key_norm and (key_norm in raw or raw in key_norm):
+            return label
+    return default
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -513,14 +565,14 @@ def extract_infra_yolo(
             except Exception:
                 pass
 
+        actual_infra_col = find_attribute_column(
+            gdf,
+            [infra_col, "Utility_Ty", "utility_type", "Utility_Type", "type", "Type"],
+        )
+
         for _, row in gdf.iterrows():
-            raw = str(row.get(infra_col, "") or "").lower().strip()
-            cls_name = infra_type_map.get(raw, None)
-            if cls_name is None:
-                for key, val in infra_type_map.items():
-                    if key in raw:
-                        cls_name = val
-                        break
+            raw = row.get(actual_infra_col, "") if actual_infra_col else ""
+            cls_name = canonical_mapped_label(raw, infra_type_map, default=None)
             if cls_name is None:
                 continue
 
@@ -1003,7 +1055,7 @@ def _process_single_raster(raster_path, shps, built_up_shp, utility_shps):
     n_crops = _extract_crops_streaming(
         raster_path,
         built_up_shp,
-        cfg2a["shp_roof_col"],
+        cfg2a.get("shp_roof_cols", cfg2a["shp_roof_col"]),
         ROOF_TYPE_MAP,
         str(config.CROP_DIR),
         cfg2a["crop_size"],
@@ -1015,7 +1067,7 @@ def _process_single_raster(raster_path, shps, built_up_shp, utility_shps):
         n_infra = _extract_infra_streaming(
             raster_path,
             utility_shps,
-            cfg2b["shp_infra_col"],
+            cfg2b.get("shp_infra_cols", cfg2b["shp_infra_col"]),
             INFRA_TYPE_MAP,
             cfg2b["class_names"],
             str(config.YOLO_DIR / "images"),
@@ -1121,7 +1173,7 @@ def preprocess_folder(folder: str, config) -> Dict:
 def _extract_crops_streaming(
     raster_path: Path,
     built_up_shp: Optional[Path],
-    roof_col: str,
+    roof_col,
     roof_type_map: dict,
     out_dir: str,
     crop_size: int,
@@ -1160,63 +1212,101 @@ def _extract_crops_streaming(
                 except Exception:
                     pass
 
-            # Sequential reading is safe, stable, and often faster due to GDAL's block cache vs locking overhead
+            # gdf.iterrows builds a fresh Series per row — slow on 10K+ buildings.
+            # Pull the columns we need into native arrays once, then iterate.
+            geoms_arr = gdf.geometry.values
+            roof_candidates = list(roof_col) if isinstance(roof_col, (list, tuple)) else [roof_col]
+            roof_candidates.extend(["Roof_type", "roof_type", "type", "Type"])
+            actual_roof_col = find_attribute_column(gdf, roof_candidates)
+            if actual_roof_col:
+                types_arr = gdf[actual_roof_col].astype(object).values
+            else:
+                log.warning(
+                    "      [WARN crops] No rooftop type column found in %s; "
+                    "writing crops as Other", built_up_shp.name
+                )
+                types_arr = np.full(len(gdf), "other", dtype=object)
+
+            # Pre-resolve the label for every distinct raw type once. The
+            # original code re-ran the dict + substring fallback per row.
+            label_cache: dict = {}
+
+            def _label_for(raw: str) -> str:
+                norm_raw = normalise_dbf_value(raw)
+                if norm_raw in label_cache:
+                    return label_cache[norm_raw]
+                lbl = canonical_mapped_label(norm_raw, roof_type_map, default="Other")
+                lbl = lbl or "Other"
+                label_cache[norm_raw] = lbl
+                return lbl
+
+            # GDAL Dataset is not thread-safe, so reads stay on the main thread.
+            # The encode+write step (cv2.imwrite) releases the GIL, so we
+            # background it onto a small thread pool to overlap with the next
+            # tile's read.
+            from concurrent.futures import ThreadPoolExecutor
             from tqdm import tqdm
 
-            for idx, row in tqdm(
-                gdf.iterrows(), total=len(gdf), desc="      Crops", leave=False
-            ):
-                raw_type = str(row.get(roof_col, "other") or "other").lower().strip()
-                label = roof_type_map.get(raw_type)
-                if label is None:
-                    for key, val in roof_type_map.items():
-                        if key in raw_type or raw_type in key:
-                            label = val
-                            break
-                label = label or "Other"
+            pool = ThreadPoolExecutor(max_workers=4)
+            futures = []
+            label_dir_cache: dict = {}
 
-                label_dir = Path(out_dir) / label
-                label_dir.mkdir(parents=True, exist_ok=True)
-
-                geom = row.geometry
-                if geom is None or geom.is_empty:
-                    continue
-
-                try:
-                    minx, miny, maxx, maxy = geom.bounds
-                    r1, c1 = src.index(minx, maxy)
-                    r2, c2 = src.index(maxx, miny)
-                    if r1 > r2:
-                        r1, r2 = r2, r1
-                    if c1 > c2:
-                        c1, c2 = c2, c1
-                    r1, r2 = max(0, min(r1, r2)), min(H, max(r1, r2))
-                    c1, c2 = max(0, min(c1, c2)), min(W, max(c1, c2))
-                    if r2 - r1 < min_px or c2 - c1 < min_px:
+            try:
+                for idx in tqdm(range(len(geoms_arr)), desc="      Crops", leave=False):
+                    geom = geoms_arr[idx]
+                    if geom is None or geom.is_empty:
                         continue
 
-                    win = rasterio.windows.Window(c1, r1, c2 - c1, r2 - r1)
-                    n_b = src.count
-                    if n_b >= 3:
-                        crop = src.read([1, 2, 3], window=win).transpose(1, 2, 0)
-                    else:
-                        band = src.read(1, window=win)
-                        crop = np.stack([band] * 3, axis=-1)
+                    raw_type = types_arr[idx] if idx < len(types_arr) else "other"
+                    label = _label_for(raw_type)
+                    label_dir = label_dir_cache.get(label)
+                    if label_dir is None:
+                        label_dir = Path(out_dir) / label
+                        label_dir.mkdir(parents=True, exist_ok=True)
+                        label_dir_cache[label] = label_dir
 
-                    if crop.dtype != np.uint8:
-                        # Use percentile stretch (same as _to_uint8) for consistent
-                        # colour rendering across different sensor bit depths.
-                        crop = _to_uint8(crop)
+                    try:
+                        minx, miny, maxx, maxy = geom.bounds
+                        r1, c1 = src.index(minx, maxy)
+                        r2, c2 = src.index(maxx, miny)
+                        if r1 > r2:
+                            r1, r2 = r2, r1
+                        if c1 > c2:
+                            c1, c2 = c2, c1
+                        r1, r2 = max(0, min(r1, r2)), min(H, max(r1, r2))
+                        c1, c2 = max(0, min(c1, c2)), min(W, max(c1, c2))
+                        if r2 - r1 < min_px or c2 - c1 < min_px:
+                            continue
 
-                    # Better interpolation for downscaling/upscaling
-                    crop = cv2.resize(
-                        crop, (crop_size, crop_size), interpolation=cv2.INTER_AREA
-                    )
-                    out_p = label_dir / f"{stem}_{idx:06d}.png"
-                    cv2.imwrite(str(out_p), cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
-                    saved += 1
-                except Exception:
-                    pass
+                        win = rasterio.windows.Window(c1, r1, c2 - c1, r2 - r1)
+                        n_b = src.count
+                        if n_b >= 3:
+                            crop = src.read([1, 2, 3], window=win).transpose(1, 2, 0)
+                        else:
+                            band = src.read(1, window=win)
+                            crop = np.stack([band] * 3, axis=-1)
+
+                        if crop.dtype != np.uint8:
+                            crop = _to_uint8(crop)
+
+                        crop = cv2.resize(
+                            crop, (crop_size, crop_size), interpolation=cv2.INTER_AREA
+                        )
+                        out_p = str(label_dir / f"{stem}_{idx:06d}.png")
+                        bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
+                        futures.append(pool.submit(cv2.imwrite, out_p, bgr))
+                        saved += 1
+                    except Exception:
+                        pass
+
+                # Drain the write queue.
+                for f in futures:
+                    try:
+                        f.result()
+                    except Exception:
+                        pass
+            finally:
+                pool.shutdown(wait=True)
 
     except Exception as e:
         log.info(f"      [SKIP crops] Cannot open raster: {e}")
@@ -1227,7 +1317,7 @@ def _extract_crops_streaming(
 def _extract_infra_streaming(
     raster_path: Path,
     utility_shps: List[Path],
-    infra_col: str,
+    infra_col,
     infra_type_map: dict,
     class_names: List[str],
     out_img_dir: str,
@@ -1273,6 +1363,21 @@ def _extract_infra_streaming(
     # Collect all infra objects with their pixel coordinates
     infra_objects: List[Tuple[int, int, int]] = []  # (class_id, px_col, px_row)
 
+    # Inverse transform is constant for this raster — hoist out of the loop.
+    inv_t = ~geo_transform
+    # Pre-resolve every raw type to a class id once. ``infra_type_map`` lookups
+    # ran per row before, including the substring fallback.
+    _cid_cache: dict = {}
+
+    def _cid_for(raw: str) -> int:
+        norm_raw = normalise_dbf_value(raw)
+        if norm_raw in _cid_cache:
+            return _cid_cache[norm_raw]
+        cls_name = canonical_mapped_label(norm_raw, infra_type_map, default=None)
+        cid = cls_to_id.get(cls_name, -1) if cls_name else -1
+        _cid_cache[norm_raw] = cid
+        return cid
+
     for shp_path in utility_shps:
         try:
             gdf = gpd.read_file(str(shp_path))
@@ -1285,29 +1390,34 @@ def _extract_infra_streaming(
             except Exception:
                 continue
 
-        for _, row in gdf.iterrows():
-            raw = str(row.get(infra_col, "") or "").lower().strip()
-            cls_name = infra_type_map.get(raw)
-            if cls_name is None:
-                for k, v in infra_type_map.items():
-                    if k in raw:
-                        cls_name = v
-                        break
-            if cls_name is None:
-                continue
+        # iterrows materialises a Series per row; use the underlying arrays.
+        geoms_arr = gdf.geometry.values
+        infra_candidates = list(infra_col) if isinstance(infra_col, (list, tuple)) else [infra_col]
+        infra_candidates.extend(
+            ["Utility_Ty", "utility_type", "Utility_Type", "type", "Type", "name", "Name"]
+        )
+        actual_infra_col = find_attribute_column(gdf, infra_candidates)
+        if actual_infra_col:
+            raws = gdf[actual_infra_col].astype(object).fillna("").values
+        else:
+            log.warning(
+                "      [WARN infra] No infrastructure type column found in %s; "
+                "columns=%s", shp_path.name, list(gdf.columns)
+            )
+            raws = np.full(len(gdf), "", dtype=object)
 
-            cid = cls_to_id.get(cls_name, -1)
+        for k in range(len(geoms_arr)):
+            raw = str(raws[k] or "").lower().strip()
+            cid = _cid_for(raw)
             if cid < 0:
                 continue
 
-            geom = row.geometry
+            geom = geoms_arr[k]
             if geom is None or geom.is_empty:
                 continue
 
             try:
                 pt = geom.centroid
-                # Use inverse affine transform (src is closed by this point)
-                inv_t = ~geo_transform
                 pc_f, pr_f = inv_t * (pt.x, pt.y)
                 pr, pc = int(pr_f), int(pc_f)
                 if pr < 0 or pr >= H or pc < 0 or pc >= W:
@@ -1342,87 +1452,31 @@ def _extract_infra_streaming(
             tile_contents[(tr, tc)] = [(cid, pc, pr)]
 
     # ── Write positive tiles with class-specific bounding boxes ───────────
-    with rasterio.open(str(raster_path)) as src:
-        for (tr, tc), pts in tqdm(
-            tile_contents.items(), desc="      Infra+", leave=False
-        ):
-            r2, c2 = min(tr + tile_size, H), min(tc + tile_size, W)
-            ph, pw = r2 - tr, c2 - tc
-            if ph <= 0 or pw <= 0:
-                continue
+    # GDAL Dataset isn't thread-safe, so reads stay sequential; the encode+
+    # write step (cv2.imwrite + text-file write) releases the GIL, so it's
+    # safe to background it onto a small thread pool.
+    from concurrent.futures import ThreadPoolExecutor as _Pool
 
-            try:
-                win = rasterio.windows.Window(tc, tr, pw, ph)  # type: ignore
-                n_b = src.count
-                if n_b >= 3:
-                    tile = src.read([1, 2, 3], window=win).transpose(1, 2, 0)
-                else:
-                    band = src.read(1, window=win)
-                    tile = np.stack([band] * 3, axis=-1)
-                if tile.dtype != np.uint8:
-                    tile = _to_uint8(tile)
-            except Exception:
-                continue
+    write_pool = _Pool(max_workers=4)
+    write_futures = []
 
-            if tile is None or tile.size == 0 or 0 in tile.shape:
-                continue
+    def _write_tile(img_path, bgr, lbl_path, label_text):
+        cv2.imwrite(img_path, bgr)
+        Path(lbl_path).write_text(label_text)
 
-            name = f"{safe_prefix}_infra_{tr:06d}_{tc:06d}"
-            cv2.imwrite(
-                str(Path(out_img_dir) / f"{name}.png"),
-                cv2.cvtColor(tile, cv2.COLOR_RGB2BGR),
-            )
-            lines = []
-            for cid, pc, pr in pts:
-                # Use class-specific bounding box size
-                cls_name_lower = id_to_name.get(cid, "")
-                if class_buffer_px and cls_name_lower in class_buffer_px:
-                    buf = class_buffer_px[cls_name_lower]
-                else:
-                    buf = buffer_px
-
-                cx = (pc - tc) / pw
-                cy = (pr - tr) / ph
-                bw = (buf * 2) / pw
-                bh = (buf * 2) / ph
-                cx = max(0.0, min(1.0, cx))
-                cy = max(0.0, min(1.0, cy))
-                lines.append(_format_yolo_label(cid, cx, cy, bw, bh, use_obb=use_obb))
-            (Path(out_label_dir) / f"{name}.txt").write_text("\n".join(lines))
-
-        # ── Negative tile sampling ────────────────────────────────────────
-        # Sample random tiles that contain NO infrastructure objects.
-        # These teach YOLO what buildings/roads look like WITHOUT infra.
-        if neg_tile_ratio > 0:
-            import random
-
-            n_neg = max(1, int(len(tile_contents) * neg_tile_ratio))
-            occupied = set(tile_contents.keys())
-            neg_count = 0
-            attempts = 0
-            max_attempts = n_neg * 10
-
-            while neg_count < n_neg and attempts < max_attempts:
-                attempts += 1
-                rand_r = random.randint(0, max(0, H - tile_size))
-                rand_c = random.randint(0, max(0, W - tile_size))
-
-                # Skip if too close to any positive tile
-                too_close = any(
-                    abs(rand_r - etr) < tile_size and abs(rand_c - etc) < tile_size
-                    for etr, etc in occupied
-                )
-                if too_close:
-                    continue
-
-                r2, c2 = min(rand_r + tile_size, H), min(rand_c + tile_size, W)
-                ph, pw = r2 - rand_r, c2 - rand_c
+    try:
+        with rasterio.open(str(raster_path)) as src:
+            n_b = src.count
+            for (tr, tc), pts in tqdm(
+                tile_contents.items(), desc="      Infra+", leave=False
+            ):
+                r2, c2 = min(tr + tile_size, H), min(tc + tile_size, W)
+                ph, pw = r2 - tr, c2 - tc
                 if ph <= 0 or pw <= 0:
                     continue
 
                 try:
-                    win = rasterio.windows.Window(rand_c, rand_r, pw, ph)
-                    n_b = src.count
+                    win = rasterio.windows.Window(tc, tr, pw, ph)  # type: ignore
                     if n_b >= 3:
                         tile = src.read([1, 2, 3], window=win).transpose(1, 2, 0)
                     else:
@@ -1433,21 +1487,99 @@ def _extract_infra_streaming(
                 except Exception:
                     continue
 
-                # Skip blank tiles (all-zero = no-data area)
-                if tile.max() < 10:
+                if tile is None or tile.size == 0 or 0 in tile.shape:
                     continue
 
-                name = f"{safe_prefix}_infra_neg_{rand_r:06d}_{rand_c:06d}"
-                cv2.imwrite(
-                    str(Path(out_img_dir) / f"{name}.png"),
-                    cv2.cvtColor(tile, cv2.COLOR_RGB2BGR),
-                )
-                # Empty label file = no objects (negative tile)
-                (Path(out_label_dir) / f"{name}.txt").write_text("")
-                neg_count += 1
+                name = f"{safe_prefix}_infra_{tr:06d}_{tc:06d}"
+                lines = []
+                for cid, pc, pr in pts:
+                    cls_name_lower = id_to_name.get(cid, "")
+                    if class_buffer_px and cls_name_lower in class_buffer_px:
+                        buf = class_buffer_px[cls_name_lower]
+                    else:
+                        buf = buffer_px
 
-            if neg_count > 0:
-                log.info(f"      Negative tiles: {neg_count} (no-infra background)")
+                    cx = (pc - tc) / pw
+                    cy = (pr - tr) / ph
+                    bw = (buf * 2) / pw
+                    bh = (buf * 2) / ph
+                    cx = max(0.0, min(1.0, cx))
+                    cy = max(0.0, min(1.0, cy))
+                    lines.append(_format_yolo_label(cid, cx, cy, bw, bh, use_obb=use_obb))
+
+                bgr = cv2.cvtColor(tile, cv2.COLOR_RGB2BGR)
+                write_futures.append(write_pool.submit(
+                    _write_tile,
+                    str(Path(out_img_dir) / f"{name}.png"),
+                    bgr,
+                    str(Path(out_label_dir) / f"{name}.txt"),
+                    "\n".join(lines),
+                ))
+
+            # ── Negative tile sampling ────────────────────────────────────
+            if neg_tile_ratio > 0:
+                import random
+
+                n_neg = max(1, int(len(tile_contents) * neg_tile_ratio))
+                occupied = set(tile_contents.keys())
+                neg_count = 0
+                attempts = 0
+                max_attempts = n_neg * 10
+
+                while neg_count < n_neg and attempts < max_attempts:
+                    attempts += 1
+                    rand_r = random.randint(0, max(0, H - tile_size))
+                    rand_c = random.randint(0, max(0, W - tile_size))
+
+                    too_close = any(
+                        abs(rand_r - etr) < tile_size and abs(rand_c - etc) < tile_size
+                        for etr, etc in occupied
+                    )
+                    if too_close:
+                        continue
+
+                    r2, c2 = min(rand_r + tile_size, H), min(rand_c + tile_size, W)
+                    ph, pw = r2 - rand_r, c2 - rand_c
+                    if ph <= 0 or pw <= 0:
+                        continue
+
+                    try:
+                        win = rasterio.windows.Window(rand_c, rand_r, pw, ph)
+                        if n_b >= 3:
+                            tile = src.read([1, 2, 3], window=win).transpose(1, 2, 0)
+                        else:
+                            band = src.read(1, window=win)
+                            tile = np.stack([band] * 3, axis=-1)
+                        if tile.dtype != np.uint8:
+                            tile = _to_uint8(tile)
+                    except Exception:
+                        continue
+
+                    if tile.max() < 10:
+                        continue
+
+                    name = f"{safe_prefix}_infra_neg_{rand_r:06d}_{rand_c:06d}"
+                    bgr = cv2.cvtColor(tile, cv2.COLOR_RGB2BGR)
+                    write_futures.append(write_pool.submit(
+                        _write_tile,
+                        str(Path(out_img_dir) / f"{name}.png"),
+                        bgr,
+                        str(Path(out_label_dir) / f"{name}.txt"),
+                        "",
+                    ))
+                    neg_count += 1
+
+                if neg_count > 0:
+                    log.info(f"      Negative tiles: {neg_count} (no-infra background)")
+
+        # Drain queued writes before we return.
+        for f in write_futures:
+            try:
+                f.result()
+            except Exception:
+                pass
+    finally:
+        write_pool.shutdown(wait=True)
 
     log.info(
         f"      Infrastructure objects: {total}  |  Positive tiles: {len(tile_contents)}"
@@ -1474,23 +1606,40 @@ def _to_uint8(arr: np.ndarray) -> np.ndarray:
         return arr
 
     arr_f = arr.astype(np.float32)
-    out = np.empty_like(arr_f)
 
     if arr_f.ndim == 3:
-        for i in range(arr_f.shape[2]):
+        C = arr_f.shape[2]
+        # Build a (C, 2) array of (p2, p98) across non-zero pixels per channel.
+        # Vectorising over the spatial axes drops C Python iterations + C percentile
+        # calls — the per-strip cost was dominating large-raster preprocessing.
+        lo = np.zeros(C, dtype=np.float32)
+        hi = np.ones(C, dtype=np.float32)
+        for i in range(C):
             ch = arr_f[:, :, i]
-            p2, p98 = np.percentile(ch[ch > 0], [2, 98]) if ch.any() else (0.0, 1.0)
-            if p98 <= p2:
-                p2, p98 = float(ch.min()), float(ch.max())
-            if p98 == p2:
-                out[:, :, i] = 0
+            nz = ch[ch > 0]
+            if nz.size > 0:
+                p2, p98 = np.percentile(nz, [2, 98])
+                if p98 <= p2:
+                    p2, p98 = float(ch.min()), float(ch.max())
             else:
-                out[:, :, i] = np.clip((ch - p2) / (p98 - p2) * 255.0, 0, 255)
+                p2, p98 = 0.0, 1.0
+            lo[i] = p2
+            hi[i] = p98
+        denom = np.where(hi > lo, hi - lo, 1.0).astype(np.float32)
+        scaled = (arr_f - lo) / denom * 255.0
+        out = np.clip(scaled, 0, 255)
+        # Zero out channels that were degenerate (all-zero range)
+        degenerate = (hi <= lo)
+        if degenerate.any():
+            out[:, :, degenerate] = 0
     else:
         flat = arr_f[arr_f > 0]
-        p2, p98 = np.percentile(flat, [2, 98]) if flat.size > 0 else (0.0, 1.0)
-        if p98 <= p2:
-            p2, p98 = float(arr_f.min()), float(arr_f.max())
+        if flat.size > 0:
+            p2, p98 = np.percentile(flat, [2, 98])
+            if p98 <= p2:
+                p2, p98 = float(arr_f.min()), float(arr_f.max())
+        else:
+            p2, p98 = 0.0, 1.0
         if p98 == p2:
             out = np.zeros_like(arr_f)
         else:

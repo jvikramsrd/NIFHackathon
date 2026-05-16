@@ -48,33 +48,91 @@ class SAM(torch.optim.Optimizer):
 
     @torch.no_grad()
     def first_step(self, zero_grad: bool = False) -> None:
-        """Ascent step: add rho-scaled worst-case gradient perturbation."""
+        """Ascent step: add rho-scaled worst-case gradient perturbation.
+
+        Implementation note: the original per-parameter loop issued one CUDA
+        kernel per tensor. On a 64M-parameter SegFormer that's >500 kernel
+        launches per first_step. We batch the same math through
+        ``torch._foreach_*`` ops (one kernel per op total), and we keep a
+        single reusable buffer of saved weights instead of allocating a
+        fresh ``clone()`` per param per step.
+        """
         grad_norm = _grad_norm(self.param_groups)
         # Clamp scale so the perturbation cannot explode when grad_norm ≈ 0
         # (e.g. first step of a frozen backbone or after gradient zeroing).
         scale = (self.defaults["rho"] / (grad_norm + 1e-12)).clamp(max=0.2)
+        scale_f = float(scale.detach().item())
 
         for group in self.param_groups:
+            params, grads = [], []
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                p_state = self.state[p]
-                p_state["old_p"] = p.data.clone()
-                # group["adaptive"] is merged from SAM defaults via super().__init__
-                e_w = (torch.pow(p, 2) if group["adaptive"] else 1.0) * p.grad * scale
-                p.add_(e_w)  # w + epsilon
+                params.append(p)
+                grads.append(p.grad)
+            if not params:
+                continue
+
+            # Materialise (or refresh) the persistent old-weight buffers.
+            old_list = []
+            for p in params:
+                buf = self.state[p].get("old_p")
+                if buf is None or buf.shape != p.shape or buf.dtype != p.dtype:
+                    buf = torch.empty_like(p, memory_format=torch.preserve_format)
+                    self.state[p]["old_p"] = buf
+                old_list.append(buf)
+            try:
+                torch._foreach_copy_(old_list, [p.data for p in params])
+            except (AttributeError, RuntimeError):
+                for b, p in zip(old_list, params):
+                    b.copy_(p.data)
+
+            # Build perturbation tensors in batched form, then add in place.
+            if group["adaptive"]:
+                try:
+                    e_w = torch._foreach_mul(grads, [p.pow(2) for p in params])
+                    torch._foreach_mul_(e_w, scale_f)
+                except (AttributeError, RuntimeError):
+                    e_w = [(p.pow(2) * g) * scale_f for p, g in zip(params, grads)]
+            else:
+                try:
+                    e_w = torch._foreach_mul(grads, scale_f)
+                except (AttributeError, RuntimeError):
+                    e_w = [g * scale_f for g in grads]
+
+            try:
+                torch._foreach_add_([p.data for p in params], e_w)
+            except (AttributeError, RuntimeError):
+                for p, e in zip(params, e_w):
+                    p.data.add_(e)
 
         if zero_grad:
             self.zero_grad(set_to_none=True)
 
     @torch.no_grad()
     def second_step(self, zero_grad: bool = False) -> None:
-        """Descent step: restore original weights and take the real gradient step."""
+        """Descent step: restore original weights and take the real gradient step.
+
+        Batched restore via ``torch._foreach_copy_`` collapses N per-param
+        kernels into 1.
+        """
         for group in self.param_groups:
+            params, olds = [], []
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                p.data.copy_(self.state[p]["old_p"])
+                buf = self.state.get(p, {}).get("old_p")
+                if buf is None:
+                    continue
+                params.append(p)
+                olds.append(buf)
+            if not params:
+                continue
+            try:
+                torch._foreach_copy_([p.data for p in params], olds)
+            except (AttributeError, RuntimeError):
+                for p, b in zip(params, olds):
+                    p.data.copy_(b)
 
         self._base.step()
 
@@ -97,20 +155,20 @@ class SAM(torch.optim.Optimizer):
 
 
 def _grad_norm(param_groups):
-    # Find the first parameter with a gradient to get the right device
-    device = None
-    for group in param_groups:
-        for p in group["params"]:
-            if p.grad is not None:
-                device = p.grad.device
-                break
-        if device is not None:
-            break
-    if device is None:
+    """Global L2 norm of all gradients.
+
+    Batched through ``torch._foreach_norm`` + a single stack reduction so the
+    cost is one launch instead of one per parameter.
+    """
+    grads = [p.grad for group in param_groups for p in group["params"] if p.grad is not None]
+    if not grads:
         return torch.tensor(0.0)
-    norm = torch.tensor(0.0, device=device)
-    for group in param_groups:
-        for p in group["params"]:
-            if p.grad is not None:
-                norm.add_(p.grad.norm(2).pow(2))
-    return norm.sqrt()
+    device = grads[0].device
+    try:
+        norms = torch._foreach_norm(grads, 2)
+        return torch.linalg.vector_norm(torch.stack([n.to(device) for n in norms]))
+    except (AttributeError, RuntimeError):
+        sq = torch.zeros((), device=device)
+        for g in grads:
+            sq = sq + g.float().pow(2).sum()
+        return sq.sqrt()
