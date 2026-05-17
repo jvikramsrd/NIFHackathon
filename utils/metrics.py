@@ -89,42 +89,6 @@ class SegmentationMetrics:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLASSIFICATION METRICS
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-class ClassificationMetrics:
-    def __init__(self, class_names: List[str]):
-        self.class_names = class_names
-        self.n = len(class_names)
-        self.reset()
-
-    def reset(self):
-        self._cm = np.zeros((self.n, self.n), dtype=np.int64)
-
-    def update(self, preds: np.ndarray, labels: np.ndarray):
-        for p, l in zip(preds.ravel(), labels.ravel()):
-            if 0 <= l < self.n and 0 <= p < self.n:
-                self._cm[l, p] += 1
-
-    def compute(self) -> Dict:
-        cm = self._cm.astype(np.float64)
-        tp = np.diag(cm)
-        prec = tp / np.maximum(cm.sum(0), 1e-6)
-        rec = tp / np.maximum(cm.sum(1), 1e-6)
-        f1 = 2 * prec * rec / np.maximum(prec + rec, 1e-6)
-        acc = tp.sum() / np.maximum(cm.sum(), 1e-6)
-
-        return {
-            "accuracy": float(acc),
-            "class_prec": prec.tolist(),
-            "class_recall": rec.tolist(),
-            "class_f1": f1.tolist(),
-            "macro_f1": float(f1.mean()),
-        }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # DETECTION METRICS  (mAP @ IoU 0.5)
 # ─────────────────────────────────────────────────────────────────────────────
 

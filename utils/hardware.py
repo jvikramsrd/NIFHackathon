@@ -7,7 +7,6 @@ Call `setup()` at the top of every train/inference script.
 
 import os
 import platform
-import sys
 from typing import Optional
 
 import torch
@@ -73,6 +72,14 @@ def setup(seed: int = 42, verbose: bool = True) -> torch.device:
     if not torch.cuda.is_available():
         log.info("[HW] WARNING: CUDA not available — running on CPU")
         return torch.device("cpu")
+
+    # Defense-in-depth: if config.py wasn't imported first (e.g. unit tests,
+    # standalone scripts), still apply the A4000-friendly allocator policy
+    # before any CUDA allocation happens.
+    os.environ.setdefault(
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "expandable_segments:True,max_split_size_mb:256",
+    )
 
     try:
         device = torch.device("cuda:0")

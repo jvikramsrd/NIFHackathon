@@ -80,17 +80,6 @@ def get_logger(name: str = __name__) -> logging.Logger:
     return logging.getLogger(name)
 
 
-def log_event(
-    logger: logging.Logger,
-    level: int,
-    message: str,
-    **fields: Any,
-) -> None:
-    """Log a structured event without requiring every caller to know ``extra``."""
-
-    logger.log(level, message, extra={"extra_fields": fields} if fields else None)
-
-
 @contextmanager
 def crash_logged(
     logger: logging.Logger,

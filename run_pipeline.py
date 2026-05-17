@@ -298,8 +298,12 @@ def _run_cli(argv=None):
         train_stage1()
     elif mode == "train_stage2":
         from train.train_stage2 import train_stage2a, train_stage2b
+        from utils.hardware import clear_cuda_cache
 
         train_stage2a()
+        # Match train_all: release ConvNeXt-L's cached blocks before YOLO grabs
+        # its own 1280-px tensors, so Stage 2B starts on a defragmented heap.
+        clear_cuda_cache()
         train_stage2b()
     elif mode == "train_all":
         train_all()

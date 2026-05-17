@@ -52,8 +52,16 @@ for d in [
 if torch.cuda.is_available():
     # Covers both NVIDIA (CUDA) and AMD (ROCm — reports as cuda in PyTorch).
     DEVICE = torch.device("cuda")
-    # Reduce fragmentation on 16 GB cards; harmless on other VRAM sizes.
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:256")
+    # A4000 (16 GB) fragmentation control. expandable_segments=True is the
+    # PyTorch 2.1+ Ampere-friendly allocator that grows segments on demand
+    # rather than carving fixed slabs — it virtually eliminates the long-run
+    # fragmentation that hurts ConvNeXt-L + bf16 + TTA mega-batches. We keep
+    # max_split_size_mb as a defensive cap for legacy paths. setdefault is
+    # critical so a user-set value via env wins.
+    os.environ.setdefault(
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "expandable_segments:True,max_split_size_mb:256",
+    )
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True

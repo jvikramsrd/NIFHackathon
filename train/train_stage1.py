@@ -16,19 +16,18 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 import math
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, cast
+from typing import Any, Dict, cast
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import config as CFG
 from data.dataset import split_dataset
 from models.stage1_segmentation import Stage1Module
 from utils.checkpointing import atomic_torch_save
-from utils.ddp import cleanup_ddp, is_main_process, make_loader, set_epoch, setup_ddp, wrap_ddp
+from utils.ddp import is_main_process, make_loader, set_epoch, setup_ddp, wrap_ddp
 from utils.hardware import (
     EMA, compile_model, get_amp_context, maybe_backward, maybe_step, setup,
     to_channels_last, vram_stats, worker_init_fn,
@@ -345,17 +344,29 @@ def train_stage1(resume: bool = True):
             ema.apply_shadow(module)
         val_tta_every = max(1, int(getattr(CFG, "VAL_TTA_EVERY", 1)))
         use_val_tta = (epoch % val_tta_every) == 0
-        val_miou, val_loss = _validate(
-            module,
-            val_loader,
-            device,
-            metrics,
-            amp_ctx,
-            epoch=epoch,
-            use_tta=use_val_tta,
-        )
-        if ema:
-            ema.restore(module)
+        try:
+            val_miou, val_loss = _validate(
+                module,
+                val_loader,
+                device,
+                metrics,
+                amp_ctx,
+                epoch=epoch,
+                use_tta=use_val_tta,
+            )
+        finally:
+            # Critical: if _validate raises (OOM, CUDA error, etc.), the model
+            # would be left with EMA shadow weights swapped in. The next training
+            # step would then `optimiser.step()` on EMA weights and feed those
+            # right back into the next ema.update — silently corrupting training.
+            if ema:
+                ema.restore(module)
+
+        # TTA mega-batches (n_augs × B per scale) blow up the cached allocator
+        # on the A4000's 16 GB heap. Release reserved-but-unused blocks before
+        # the next training epoch so peak fragmentation doesn't compound.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         if swa_model and epoch >= swa_start:
             swa_model.update_parameters(module)

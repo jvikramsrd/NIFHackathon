@@ -16,11 +16,9 @@ Stage 2B: YOLOv9 infrastructure detector
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import argparse
-import math
-import os
 import time
 import typing
 
@@ -37,7 +35,9 @@ from data.dataset import split_clf_dataset
 from models.stage2_models import InfrastructureDetector, RooftopClassifier
 from utils.checkpointing import atomic_torch_save
 from utils.hardware import (
+    EMA,
     cl_input,
+    clear_cuda_cache,
     compile_model,
     get_amp_context,
     maybe_backward,
@@ -80,6 +80,26 @@ def train_stage2a(resume: bool = True):
     )
     log.info(f"  Rooftop crops — Train: {len(train_ds)} | Val: {len(val_ds)}")
 
+    # ── VRAM auto-guard for SAM (parity with Stage 1) ────────────────────────
+    # SAM does TWO forward+backward passes per step. ConvNeXt-L at 224px in
+    # bf16 sits around 8-10 GB activation peak at batch=32; doubling it puts
+    # us over the A4000's 16 GB budget. Halve the batch on small-VRAM cards
+    # so the run actually starts instead of OOMing on step 2. Use a LOCAL
+    # variable — mutating cfg here would persist into CFG.STAGE2A globally.
+    batch_size = int(cfg["batch_size"])
+    if bool(cfg.get("use_sam", False)):
+        try:
+            vram_total = torch.cuda.get_device_properties(device).total_memory / 1024**3
+            if vram_total <= 16.5 and batch_size > 8:
+                new_bs = max(8, batch_size // 2)
+                log.warning(
+                    "Stage 2A SAM on %.0fGB GPU — auto-reducing batch %d→%d",
+                    vram_total, batch_size, new_bs,
+                )
+                batch_size = new_bs
+        except Exception:
+            pass
+
     n_workers = CFG.NUM_WORKERS
     base_kw = dict(
         num_workers=n_workers,
@@ -92,14 +112,14 @@ def train_stage2a(resume: bool = True):
     try:
         train_loader = DataLoader(
             train_ds,
-            batch_size=int(cfg["batch_size"]),  # type: ignore
+            batch_size=batch_size,
             shuffle=True,
             drop_last=True,
             **loader_kw,  # type: ignore
         )
         val_loader = DataLoader(
             val_ds,
-            batch_size=int(cfg["batch_size"]),
+            batch_size=batch_size,
             shuffle=False,
             **loader_kw,  # type: ignore
         )
@@ -112,14 +132,14 @@ def train_stage2a(resume: bool = True):
         loader_kw = dict(num_workers=0, pin_memory=CFG.PIN_MEMORY)
         train_loader = DataLoader(
             train_ds,
-            batch_size=int(cfg["batch_size"]),  # type: ignore
+            batch_size=batch_size,
             shuffle=True,
             drop_last=True,
             **loader_kw,  # type: ignore
         )
         val_loader = DataLoader(
             val_ds,
-            batch_size=int(cfg["batch_size"]),
+            batch_size=batch_size,
             shuffle=False,
             **loader_kw,  # type: ignore
         )
@@ -197,8 +217,6 @@ def train_stage2a(resume: bool = True):
     last_ckpt_path = CFG.CKPT_DIR / "stage2a_last.pth"
     start_epoch = 1
 
-    from utils.hardware import EMA
-
     ema = EMA(model, decay=float(cfg.get("ema_decay", 0.9995)))
 
     if resume and last_ckpt_path.exists():
@@ -257,19 +275,29 @@ def train_stage2a(resume: bool = True):
 
     log.info(f"\n[Stage 2A] {cfg['arch']}  |  {vram_stats()}\n")
 
+    # Mirror Stage 1's MAX_STEPS_PER_EPOCH cap. On a 30 GB dataset the rooftop
+    # split can have tens of thousands of crops; capping makes epochs a fixed
+    # wall-clock budget and avoids OneCycle-style schedulers overshooting.
+    max_steps_per_epoch = int(getattr(CFG, "MAX_STEPS_PER_EPOCH", len(train_loader)))
+
     for epoch in range(start_epoch, int(cfg["epochs"]) + 1):  # type: ignore
         model.train()
         ep_loss = correct = total = 0
+        actual_steps = 0
         t0 = time.time()
 
+        capped_steps = min(len(train_loader), max_steps_per_epoch)
         train_pbar = tqdm(
-            train_loader,
-            total=len(train_loader),
+            enumerate(train_loader),
+            total=capped_steps,
             desc=f"Stage2A Train Ep {epoch:03d}",
             leave=False,
             dynamic_ncols=True,
         )
-        for imgs, labels in train_pbar:
+        for step, (imgs, labels) in train_pbar:
+            if step >= max_steps_per_epoch:
+                break
+            actual_steps += 1
             # pin_memory is on, so non_blocking=True lets the H2D DMA overlap
             # with the previous batch's backward — otherwise the .to() syncs.
             imgs = imgs.to(device, non_blocking=True)
@@ -294,6 +322,7 @@ def train_stage2a(resume: bool = True):
                 return logits_local, loss_a * lam_local + loss_b * (1.0 - lam_local)
 
             optimiser.zero_grad(set_to_none=True)
+            did_step = True  # SAM always steps via second_step; non-SAM may skip on spike
             if use_sam:
                 # SAM + bf16 path (scaler is None here, guarded above).
                 with amp_ctx:
@@ -309,16 +338,32 @@ def train_stage2a(resume: bool = True):
                 with amp_ctx:
                     logits, loss = _mixed_loss()
                 maybe_backward(loss, scaler)
+                # Parity with Stage 1: peek at grad norm and skip the step on a
+                # spike instead of stepping with garbage gradients. clip_grad_norm_
+                # already returns the pre-clip norm, so this is one extra .item().
                 if scaler is not None:
                     scaler.unscale_(optimiser)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    scaler.step(optimiser)
-                    scaler.update()
+                total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                if total_norm.item() > 10.0:
+                    log.warning(
+                        f"Stage 2A gradient norm spike ({total_norm.item():.2f}) — skipping step"
+                    )
+                    did_step = False
+                    if scaler is not None:
+                        # Advance scaler bookkeeping (it reacts to inf/nan grads detected
+                        # during unscale_ and grows/shrinks the loss scale accordingly).
+                        scaler.update()
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimiser.step()
-            scheduler.step()
-            ema.update(model)
+                    if scaler is not None:
+                        scaler.step(optimiser)
+                        scaler.update()
+                    else:
+                        optimiser.step()
+            # Only advance scheduler / EMA when the optimizer actually stepped —
+            # otherwise a spike-skipped batch silently consumes a scheduler tick.
+            if did_step:
+                scheduler.step()
+                ema.update(model)
 
             ep_loss += loss.item()
             correct += (logits.argmax(1) == ya).sum().item()
@@ -340,8 +385,8 @@ def train_stage2a(resume: bool = True):
         elapsed = time.time() - t0
         log.info(
             f"Ep {epoch:03d}/{cfg['epochs']:03d}  "
-            f"loss={ep_loss / len(train_loader):.4f}  "
-            f"train_acc={correct / total:.4f}  val_acc={val_acc:.4f}  {elapsed:.0f}s"
+            f"loss={ep_loss / max(actual_steps, 1):.4f}  "
+            f"train_acc={correct / max(total, 1):.4f}  val_acc={val_acc:.4f}  {elapsed:.0f}s"
         )
 
         if val_acc > best_acc:
@@ -623,16 +668,6 @@ def _write_yolo_yaml() -> str:
     return str(yaml_path)
 
 
-def _cosine_warmup(optimizer, warmup_steps, total_steps):
-    def lr_fn(step):
-        if step < warmup_steps:
-            return step / max(1, warmup_steps)
-        p = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return 0.5 * (1 + math.cos(math.pi * p))
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_fn)
-
-
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", choices=["2a", "2b", "both"], default="both")
@@ -640,5 +675,10 @@ if __name__ == "__main__":
     with crash_logged(log, f"Stage {args.stage} training"):
         if args.stage in ("2a", "both"):
             train_stage2a()
+            # ConvNeXt-L's cached blocks would otherwise sit in the allocator
+            # while YOLO tries to grab its own 1280-px tensors — release them
+            # so Stage 2B starts on a defragmented heap.
+            if args.stage == "both":
+                clear_cuda_cache()
         if args.stage in ("2b", "both"):
             train_stage2b()

@@ -165,7 +165,13 @@ def _grad_norm(param_groups):
         return torch.tensor(0.0)
     device = grads[0].device
     try:
+        # _foreach_norm returns scalar tensors on the same device as their input
+        # gradient, so when all params live on one GPU the .to(device) round-trip
+        # is a no-op kernel launch per scalar. Drop it on the fast path; fall
+        # back to the explicit copy only when the user actually mixed devices.
         norms = torch._foreach_norm(grads, 2)
+        if all(n.device == device for n in norms):
+            return torch.linalg.vector_norm(torch.stack(norms))
         return torch.linalg.vector_norm(torch.stack([n.to(device) for n in norms]))
     except (AttributeError, RuntimeError):
         sq = torch.zeros((), device=device)
