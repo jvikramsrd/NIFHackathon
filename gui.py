@@ -20,12 +20,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PyQt6.QtCore import (
-    Qt, QProcess, QProcessEnvironment, QTimer, QPropertyAnimation, QEasingCurve,
-    pyqtSignal, pyqtProperty, QObject, QRectF,
+    Qt, QProcess, QProcessEnvironment, QTimer,
+    pyqtSignal, QObject,
 )
 from PyQt6.QtGui import (
     QFont, QFontDatabase, QImage, QPixmap, QColor, QPalette,
-    QTextCursor, QTextCharFormat, QPainter, QPainterPath,
+    QTextCursor, QTextCharFormat,
 )
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel,
@@ -80,53 +80,74 @@ def _find_pipeline_python() -> str:
 # DESIGN SYSTEM PALETTE
 # ─────────────────────────────────────────────────────────────────────────────
 
-DARK_PAL = {
-    "bg_app":      "#080C15",
-    "bg_panel":    "#0D1420",
-    "bg_surface":  "#131C2C",
-    "bg_input":    "#192233",
-    "border":      "#253347",
-    "fg_primary":  "#F2F6FC",
-    "fg_secondary":"#C2CDE0",
-    "fg_tertiary": "#7A90A8",
-    "fg_quart":    "#4D6070",
-    "accent":      "#F59E0B",
-    "ok":          "#34D399",
-    "running":     "#38BDF8",
-    "warn":        "#FBBF24",
-    "err":         "#F87171",
-    "info":        "#60A5FA",
-    # class colours (sacred — never reassign)
-    "cls_building":"#EF4444",
-    "cls_road":    "#94A3B8",
-    "cls_water":   "#3B82F6",
-    "cls_bg":      "#253347",
-}
+# ─────────────────────────────────────────────────────────────────────────────
+# WINDOWS 11 FLUENT PALETTES
+#
+# Colours sampled from the WinUI 3 / Fluent Design System v2 spec:
+#   • Light: Mica-light surfaces (#F3F3F3 → #FBFBFB elevated card), the
+#     standard Windows 11 system accent #005FB8, subtle black-alpha borders,
+#     #1F1F1F primary text on white.
+#   • Dark:  Mica-dark surfaces (#202020 base, #2B2B2B elevated card), the
+#     paired accent #60CDFF (the lighter sibling that Win11 uses on dark
+#     backgrounds for AA contrast), white-alpha borders, white primary text.
+#
+# Naming is kept in lockstep with the existing PAL keys so every existing
+# _apply_theme handler across the GUI keeps working without changes.
+# ─────────────────────────────────────────────────────────────────────────────
 
 LIGHT_PAL = {
-    "bg_app":      "#F2F5FA",
-    "bg_panel":    "#FFFFFF",
-    "bg_surface":  "#EAF0F8",
-    "bg_input":    "#DDE6F2",
-    "border":      "#BCC8DC",
-    "fg_primary":  "#0F1929",
-    "fg_secondary":"#253348",
-    "fg_tertiary": "#4E6070",
-    "fg_quart":    "#7A90A8",
-    "accent":      "#D97706",
-    "ok":          "#059669",
-    "running":     "#0284C7",
-    "warn":        "#B45309",
-    "err":         "#DC2626",
-    "info":        "#2563EB",
-    # class colours (sacred — never reassign)
+    "bg_app":      "#F3F3F3",   # mica light — the Win11 window background
+    "bg_panel":    "#FBFBFB",   # elevated card (1 layer up)
+    "bg_surface":  "#FFFFFF",   # innermost surface (input fields, table cells)
+    "bg_input":    "#FFFFFF",
+    "border":      "#E5E5E5",   # opaque sibling of rgba(0,0,0,0.06)
+    "fg_primary":  "#1F1F1F",   # ~93 % black — Fluent text primary
+    "fg_secondary":"#5F5F5F",   # ~63 % black — text secondary
+    "fg_tertiary": "#8A8A8A",   # ~46 % black — text tertiary
+    "fg_quart":    "#B0B0B0",   # ~30 % black — disabled / hint
+    "accent":      "#005FB8",   # Windows 11 system accent (default)
+    "accent_hov":  "#1A6FC4",   # accent · slight lighten on hover
+    "accent_prs":  "#3A82CC",   # accent · pressed
+    "ok":          "#107C10",
+    "running":     "#005FB8",
+    "warn":        "#9D5D00",
+    "err":         "#C42B1C",
+    "info":        "#005FB8",
     "cls_building":"#EF4444",
     "cls_road":    "#94A3B8",
     "cls_water":   "#3B82F6",
     "cls_bg":      "#253347",
 }
 
-PAL: dict[str, str] = dict(DARK_PAL)  # mutable current palette
+DARK_PAL = {
+    "bg_app":      "#202020",   # mica dark
+    "bg_panel":    "#2B2B2B",   # elevated card
+    "bg_surface":  "#323232",   # innermost surface
+    "bg_input":    "#2D2D2D",   # input fields slightly different
+    "border":      "#3D3D3D",   # opaque sibling of rgba(255,255,255,0.08)
+    "fg_primary":  "#FFFFFF",
+    "fg_secondary":"#C5C5C5",
+    "fg_tertiary": "#9A9A9A",
+    "fg_quart":    "#6B6B6B",
+    "accent":      "#60CDFF",   # Windows 11 dark-mode default accent
+    "accent_hov":  "#7FD8FF",
+    "accent_prs":  "#46B5E8",
+    "ok":          "#6CCB5F",
+    "running":     "#60CDFF",
+    "warn":        "#FCE100",
+    "err":         "#FF99A4",
+    "info":        "#60CDFF",
+    "cls_building":"#EF4444",
+    "cls_road":    "#94A3B8",
+    "cls_water":   "#3B82F6",
+    "cls_bg":      "#3D3D3D",
+}
+
+# Legacy alias — `WIN3_PAL` is kept as a name so anything that imports the
+# module by that name still works, but it now points at the light theme.
+WIN3_PAL = LIGHT_PAL
+
+PAL: dict[str, str] = dict(LIGHT_PAL)  # mutable current palette — defaults to Win11 Light
 
 # Class overlay colours as uint8 RGB arrays (for numpy blending)
 _CLASS_COLORS = np.array([
@@ -138,251 +159,306 @@ _CLASS_COLORS = np.array([
 
 
 def build_qss() -> str:
-    """Build and return the full application QSS, reading from the global PAL dict."""
+    """Windows 11 / Fluent Design stylesheet, generated from the active PAL.
+
+    Works for both light and dark Win11 modes — the PAL dict swaps but the
+    stylesheet structure stays identical. Design choices follow WinUI 3:
+      * 4 px radius on buttons & inputs (tight corners on interactive controls),
+        8 px on cards / surfaces.
+      * Standard buttons are "subtle" (1 px border, light hover overlay).
+        Accent buttons (#run_btn / #check_btn / default-marked) are filled
+        with the system accent and pair with white text.
+      * Inputs show a 1 px border that thickens to 2 px on focus, with the
+        bottom border using the accent colour — the Fluent focus underline.
+      * Tabs use a 2 px accent underline indicator instead of the whole tab
+        being raised — matches Edge / Settings / WinUI 3 nav.
+      * Status & semantic colours come from PAL so dark-mode swap just works.
+      * Segoe UI Variable (preferred) -> Segoe UI fallback -> cross-platform.
+        Cascadia Mono for monospace areas.
+    """
     return f"""
 QWidget {{
     background-color: {PAL['bg_app']};
     color: {PAL['fg_primary']};
-    font-family: "Inter", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
-    font-size: 14px;
-    font-weight: 450;
+    font-family: "Segoe UI Variable", "Segoe UI", "SF Pro Text", "Inter", system-ui, sans-serif;
+    font-size: 13px;
+    font-weight: 400;
 }}
 QMainWindow, QDialog {{
     background-color: {PAL['bg_app']};
 }}
+
+/* Tabs: Fluent underline indicator */
 QTabWidget::pane {{
+    background-color: {PAL['bg_panel']};
     border: 1px solid {PAL['border']};
     border-top: none;
-    background-color: {PAL['bg_panel']};
+    border-radius: 0 0 8px 8px;
 }}
-QTabBar {{
-    background: transparent;
-}}
+QTabBar {{ background: transparent; }}
 QTabBar::tab {{
-    background: {PAL['bg_surface']};
+    background: transparent;
     color: {PAL['fg_tertiary']};
-    padding: 11px 26px;
-    border: 1px solid {PAL['border']};
-    border-bottom: none;
-    min-width: 130px;
+    padding: 10px 22px;
+    min-width: 100px;
+    border: none;
+    margin: 0 2px;
     font-size: 13px;
     font-weight: 500;
 }}
-QTabBar::tab:selected {{
-    background: {PAL['bg_panel']};
-    color: {PAL['fg_primary']};
-    border-top: 3px solid {PAL['accent']};
-    font-weight: 650;
-}}
 QTabBar::tab:hover:!selected {{
     color: {PAL['fg_secondary']};
-    background: {PAL['bg_input']};
+    background: {PAL['bg_surface']};
+    border-radius: 4px;
 }}
+QTabBar::tab:selected {{
+    color: {PAL['fg_primary']};
+    border-bottom: 2px solid {PAL['accent']};
+    font-weight: 600;
+}}
+
+/* Buttons: subtle by default, accent for primary actions */
 QPushButton {{
-    background-color: {PAL['bg_surface']};
+    background-color: {PAL['bg_panel']};
     color: {PAL['fg_primary']};
     border: 1px solid {PAL['border']};
-    border-radius: 8px;
-    padding: 8px 18px;
+    border-radius: 4px;
+    padding: 6px 16px;
+    min-width: 70px;
+    min-height: 24px;
     font-size: 13px;
-    font-weight: 550;
+    font-weight: 500;
 }}
 QPushButton:hover {{
-    background-color: {PAL['bg_input']};
-    border-color: {PAL['fg_tertiary']};
+    background-color: {PAL['bg_surface']};
+    border-color: {PAL['fg_quart']};
 }}
 QPushButton:pressed {{
     background-color: {PAL['border']};
 }}
 QPushButton:disabled {{
     color: {PAL['fg_quart']};
-    border-color: {PAL['bg_surface']};
-    background-color: {PAL['bg_surface']};
+    background-color: {PAL['bg_app']};
+    border-color: {PAL['border']};
 }}
-QPushButton#run_btn {{
+QPushButton:focus {{
+    outline: none;
+    border: 2px solid {PAL['accent']};
+    padding: 5px 15px;
+}}
+
+QPushButton#run_btn,
+QPushButton#check_btn,
+QPushButton:default {{
     background-color: {PAL['accent']};
-    color: #080C15;
-    font-size: 14px;
-    font-weight: 700;
-    border: none;
-    letter-spacing: 0.4px;
-}}
-QPushButton#run_btn:hover {{
-    background-color: #FBBF24;
-}}
-QPushButton#run_btn:disabled {{
-    background-color: {PAL['border']};
-    color: {PAL['fg_quart']};
-}}
-QPushButton#stop_btn {{
-    background-color: transparent;
-    color: {PAL['err']};
-    border: 1.5px solid {PAL['err']};
+    color: #FFFFFF;
+    border: 1px solid {PAL['accent']};
     font-weight: 600;
 }}
-QPushButton#stop_btn:hover {{
-    background-color: rgba(248,113,113,0.14);
+QPushButton#run_btn:hover,
+QPushButton#check_btn:hover,
+QPushButton:default:hover {{
+    background-color: {PAL.get('accent_hov', PAL['accent'])};
+    border-color: {PAL.get('accent_hov', PAL['accent'])};
 }}
-QPushButton#check_btn {{
-    background-color: {PAL['info']};
-    color: #080C15;
-    font-size: 14px;
-    font-weight: 700;
-    border: none;
-    letter-spacing: 0.4px;
+QPushButton#run_btn:pressed,
+QPushButton#check_btn:pressed,
+QPushButton:default:pressed {{
+    background-color: {PAL.get('accent_prs', PAL['accent'])};
+    border-color: {PAL.get('accent_prs', PAL['accent'])};
 }}
-QPushButton#check_btn:hover {{
-    background-color: #82BAFF;
-}}
+QPushButton#run_btn:disabled,
 QPushButton#check_btn:disabled {{
     background-color: {PAL['border']};
     color: {PAL['fg_quart']};
+    border-color: {PAL['border']};
 }}
+
+QPushButton#stop_btn {{
+    background-color: transparent;
+    color: {PAL['err']};
+    border: 1px solid {PAL['err']};
+    font-weight: 600;
+}}
+QPushButton#stop_btn:hover {{
+    background-color: {PAL['err']};
+    color: #FFFFFF;
+}}
+
 QPushButton#dir_btn {{
+    min-width: 28px;
+    min-height: 22px;
+    padding: 2px 8px;
     font-size: 11px;
-    font-weight: 550;
-    padding: 3px 9px;
-    border: 1px solid {PAL['border']};
-    background: {PAL['bg_surface']};
-    color: {PAL['fg_tertiary']};
-    border-radius: 6px;
+    font-weight: 500;
 }}
+
+/* Combos & inputs */
 QComboBox {{
     background-color: {PAL['bg_input']};
     color: {PAL['fg_primary']};
     border: 1px solid {PAL['border']};
-    border-radius: 8px;
-    padding: 7px 12px;
+    border-radius: 4px;
+    padding: 5px 12px;
+    min-height: 22px;
     min-width: 160px;
     font-size: 13px;
-    font-weight: 500;
+}}
+QComboBox:hover {{ border-color: {PAL['fg_quart']}; }}
+QComboBox:focus, QComboBox:on {{
+    border: 1px solid {PAL['accent']};
+    border-bottom: 2px solid {PAL['accent']};
 }}
 QComboBox::drop-down {{
+    subcontrol-origin: padding;
+    subcontrol-position: right;
+    width: 24px;
     border: none;
-    width: 28px;
 }}
 QComboBox QAbstractItemView {{
-    background-color: {PAL['bg_surface']};
+    background-color: {PAL['bg_panel']};
     color: {PAL['fg_primary']};
-    selection-background-color: {PAL['border']};
+    selection-background-color: {PAL['accent']};
+    selection-color: #FFFFFF;
     border: 1px solid {PAL['border']};
+    border-radius: 4px;
     padding: 4px;
+    outline: none;
 }}
+
+/* Labels */
 QLabel {{
     color: {PAL['fg_secondary']};
     background: transparent;
-    font-size: 14px;
+    font-size: 13px;
 }}
 QLabel#label_heading {{
     color: {PAL['fg_primary']};
-    font-size: 17px;
+    font-size: 18px;
     font-weight: 700;
 }}
 QLabel#label_mono {{
     color: {PAL['fg_primary']};
-    font-family: "JetBrains Mono", "Consolas", "Courier New", monospace;
+    font-family: "Cascadia Mono", "Cascadia Code", "JetBrains Mono", "Consolas", "Courier New", monospace;
     font-variant-numeric: tabular-nums;
 }}
 QLabel#path_label {{
     background-color: {PAL['bg_input']};
     color: {PAL['fg_secondary']};
     border: 1px solid {PAL['border']};
-    border-radius: 6px;
+    border-radius: 4px;
     padding: 6px 10px;
-    font-family: "JetBrains Mono", "Consolas", "Courier New", monospace;
+    font-family: "Cascadia Mono", "Cascadia Code", "JetBrains Mono", "Consolas", "Courier New", monospace;
     font-size: 12px;
 }}
 QLabel#section_lbl {{
-    color: {PAL['fg_quart']};
+    color: {PAL['fg_tertiary']};
     font-size: 11px;
     font-weight: 700;
-    letter-spacing: 2px;
-    padding: 10px 0 6px 0;
+    letter-spacing: 1.4px;
+    padding: 12px 0 6px 0;
 }}
 QLabel#op_label {{
     color: {PAL['fg_secondary']};
     font-size: 13px;
-    font-weight: 500;
-    font-family: "JetBrains Mono", "Consolas", "Courier New", monospace;
+    font-family: "Cascadia Mono", "Cascadia Code", "JetBrains Mono", "Consolas", monospace;
 }}
 QLabel#metric_key {{
-    color: {PAL['fg_quart']};
+    color: {PAL['fg_tertiary']};
     font-size: 11px;
-    font-weight: 650;
-    letter-spacing: 0.8px;
+    font-weight: 600;
+    letter-spacing: 0.6px;
 }}
 QLabel#img_placeholder {{
     background: {PAL['bg_panel']};
     color: {PAL['fg_quart']};
     border: 1px solid {PAL['border']};
     border-radius: 8px;
-    font-size: 14px;
+    font-size: 13px;
 }}
 QLabel#img_panel_title {{
-    color: {PAL['fg_quart']};
+    color: {PAL['fg_tertiary']};
     font-size: 11px;
     font-weight: 700;
-    letter-spacing: 2px;
+    letter-spacing: 1.4px;
 }}
 QLabel#legend_lbl {{
-    color: {PAL['fg_tertiary']};
+    color: {PAL['fg_secondary']};
     font-size: 12px;
-    font-weight: 500;
 }}
+
+/* Cards: elevated rounded surface */
 QFrame#info_card {{
     background: {PAL['bg_panel']};
     border: 1px solid {PAL['border']};
-    border-radius: 10px;
+    border-radius: 8px;
 }}
 QLabel#info_key {{
-    color: {PAL['fg_quart']};
+    color: {PAL['fg_tertiary']};
     font-size: 12px;
-    font-weight: 650;
+    font-weight: 600;
     min-width: 60px;
 }}
 QLabel#info_val {{
     color: {PAL['fg_secondary']};
     font-size: 12px;
-    font-weight: 500;
 }}
-QTextEdit {{
-    background-color: {PAL['bg_app']};
+
+/* Text edits / log */
+QTextEdit, QPlainTextEdit {{
+    background-color: {PAL['bg_input']};
     color: {PAL['fg_secondary']};
     border: 1px solid {PAL['border']};
-    border-radius: 8px;
-    font-family: "JetBrains Mono", "Consolas", "Courier New", monospace;
+    border-radius: 6px;
+    font-family: "Cascadia Mono", "Cascadia Code", "JetBrains Mono", "Consolas", monospace;
     font-size: 12px;
-    selection-background-color: {PAL['border']};
+    selection-background-color: {PAL['accent']};
+    selection-color: #FFFFFF;
 }}
+QTextEdit:focus, QPlainTextEdit:focus {{
+    border: 1px solid {PAL['accent']};
+}}
+
+/* Progress bar */
 QProgressBar {{
-    background-color: {PAL['bg_input']};
+    background-color: {PAL['bg_surface']};
     border: none;
-    border-radius: 5px;
-    height: 10px;
+    border-radius: 3px;
+    height: 6px;
     text-align: center;
     color: transparent;
 }}
 QProgressBar::chunk {{
     background-color: {PAL['accent']};
-    border-radius: 5px;
-}}
-QSlider::groove:horizontal {{
-    background: {PAL['bg_input']};
-    height: 5px;
     border-radius: 3px;
-    border: 1px solid {PAL['border']};
+}}
+
+/* Slider */
+QSlider::groove:horizontal {{
+    background: {PAL['border']};
+    height: 4px;
+    border-radius: 2px;
 }}
 QSlider::handle:horizontal {{
     background: {PAL['accent']};
-    width: 17px;
-    height: 17px;
-    margin: -6px 0;
+    width: 18px;
+    height: 18px;
+    margin: -7px 0;
     border-radius: 9px;
+    border: 3px solid {PAL['bg_panel']};
+}}
+QSlider::handle:horizontal:hover {{
+    width: 20px;
+    height: 20px;
+    margin: -8px 0;
+    border-radius: 10px;
 }}
 QSlider::sub-page:horizontal {{
     background: {PAL['accent']};
-    border-radius: 3px;
+    border-radius: 2px;
 }}
+
+/* Tables */
 QTableWidget {{
     background-color: {PAL['bg_panel']};
     alternate-background-color: {PAL['bg_surface']};
@@ -391,72 +467,128 @@ QTableWidget {{
     border-radius: 8px;
     gridline-color: {PAL['border']};
     font-size: 13px;
-    font-weight: 450;
+    selection-background-color: {PAL['accent']};
+    selection-color: #FFFFFF;
 }}
-QTableWidget::item {{
-    padding: 7px 10px;
-}}
-QTableWidget::item:selected {{
-    background-color: {PAL['border']};
-    color: {PAL['fg_primary']};
-}}
+QTableWidget::item {{ padding: 8px 12px; }}
 QHeaderView::section {{
     background-color: {PAL['bg_surface']};
     color: {PAL['fg_tertiary']};
     border: none;
     border-bottom: 1px solid {PAL['border']};
-    border-right: 1px solid {PAL['border']};
-    padding: 9px 12px;
+    padding: 10px 12px;
     font-size: 11px;
     font-weight: 700;
-    letter-spacing: 1.2px;
+    letter-spacing: 1.0px;
 }}
+
+/* Scrollbars: thin overlay */
 QScrollBar:vertical {{
-    background: {PAL['bg_app']};
-    width: 10px;
+    background: transparent;
+    width: 12px;
     border: none;
-    border-radius: 5px;
-}}
-QScrollBar::handle:vertical {{
-    background: {PAL['border']};
-    border-radius: 5px;
-    min-height: 28px;
-    margin: 2px;
-}}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
-    height: 0;
+    margin: 0;
 }}
 QScrollBar:horizontal {{
-    background: {PAL['bg_app']};
-    height: 10px;
+    background: transparent;
+    height: 12px;
     border: none;
-    border-radius: 5px;
+    margin: 0;
 }}
-QScrollBar::handle:horizontal {{
+QScrollBar::handle {{
     background: {PAL['border']};
     border-radius: 5px;
-    margin: 2px;
+    border: 2px solid transparent;
 }}
-QSplitter::handle {{
-    background: {PAL['border']};
-    width: 1px;
+QScrollBar::handle:hover {{ background: {PAL['fg_quart']}; }}
+QScrollBar::handle:vertical {{ min-height: 30px; }}
+QScrollBar::handle:horizontal {{ min-width: 30px; }}
+QScrollBar::add-line, QScrollBar::sub-line {{
+    background: transparent;
+    border: none;
+    width: 0;
+    height: 0;
 }}
+QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+
+/* Splitters */
+QSplitter::handle {{ background: transparent; }}
+QSplitter::handle:horizontal {{ width: 6px; }}
+QSplitter::handle:vertical {{ height: 6px; }}
 QFrame#divider {{
     background: {PAL['border']};
     max-height: 1px;
 }}
+
+/* Status bar */
 QStatusBar {{
     background: {PAL['bg_panel']};
     color: {PAL['fg_tertiary']};
     border-top: 1px solid {PAL['border']};
     font-size: 12px;
-    font-weight: 500;
 }}
+
+/* Checkpoint side panel */
 QWidget#checkpoint_panel {{
     background: {PAL['bg_panel']};
     border-left: 1px solid {PAL['border']};
 }}
+
+/* Tooltips: Fluent elevated card */
+QToolTip {{
+    background-color: {PAL['bg_panel']};
+    color: {PAL['fg_primary']};
+    border: 1px solid {PAL['border']};
+    border-radius: 4px;
+    padding: 6px 10px;
+    font-size: 12px;
+}}
+
+/* Menus */
+QMenuBar {{
+    background: {PAL['bg_app']};
+    color: {PAL['fg_primary']};
+    border-bottom: 1px solid {PAL['border']};
+}}
+QMenuBar::item {{
+    background: transparent;
+    padding: 6px 12px;
+}}
+QMenuBar::item:selected {{ background-color: {PAL['bg_surface']}; }}
+QMenu {{
+    background-color: {PAL['bg_panel']};
+    color: {PAL['fg_primary']};
+    border: 1px solid {PAL['border']};
+    border-radius: 6px;
+    padding: 4px;
+}}
+QMenu::item {{
+    padding: 6px 24px 6px 12px;
+    border-radius: 4px;
+}}
+QMenu::item:selected {{
+    background-color: {PAL['accent']};
+    color: #FFFFFF;
+}}
+
+/* Theme cycle button: small secondary */
+QPushButton#theme_cycle {{
+    background-color: transparent;
+    color: {PAL['fg_secondary']};
+    border: 1px solid {PAL['border']};
+    border-radius: 4px;
+    padding: 3px 12px;
+    min-width: 70px;
+    min-height: 20px;
+    font-size: 11px;
+    font-weight: 600;
+}}
+QPushButton#theme_cycle:hover {{
+    background-color: {PAL['bg_surface']};
+    color: {PAL['fg_primary']};
+}}
 """
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -467,27 +599,45 @@ _THEME_FILE = ROOT / ".geo_intel_theme"
 
 
 def _apply_app_palette(app: QApplication):
-    """Set the Qt QPalette on the app, reading from the current global PAL."""
+    """Set the Qt QPalette on the app, reading from the current global PAL.
+
+    Both Win11 modes (light / dark) use the system accent as the Highlight
+    colour with white text — same as Windows 11 native widgets (selected
+    list items, focused tabs, etc.).
+    """
     palette = QPalette()
     palette.setColor(QPalette.ColorRole.Window,          QColor(PAL["bg_app"]))
     palette.setColor(QPalette.ColorRole.WindowText,      QColor(PAL["fg_primary"]))
     palette.setColor(QPalette.ColorRole.Base,            QColor(PAL["bg_input"]))
     palette.setColor(QPalette.ColorRole.AlternateBase,   QColor(PAL["bg_surface"]))
     palette.setColor(QPalette.ColorRole.Text,            QColor(PAL["fg_primary"]))
-    palette.setColor(QPalette.ColorRole.Button,          QColor(PAL["bg_surface"]))
+    palette.setColor(QPalette.ColorRole.Button,          QColor(PAL["bg_panel"]))
     palette.setColor(QPalette.ColorRole.ButtonText,      QColor(PAL["fg_primary"]))
-    palette.setColor(QPalette.ColorRole.Highlight,       QColor(PAL["border"]))
-    palette.setColor(QPalette.ColorRole.HighlightedText, QColor(PAL["fg_primary"]))
+    palette.setColor(QPalette.ColorRole.Highlight,       QColor(PAL["accent"]))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#FFFFFF"))
+    palette.setColor(QPalette.ColorRole.ToolTipBase,     QColor(PAL["bg_panel"]))
+    palette.setColor(QPalette.ColorRole.ToolTipText,     QColor(PAL["fg_primary"]))
     app.setPalette(palette)
 
 
 class ThemeManager(QObject):
+    """Two-mode theme manager: Windows 11 'light' (default) ↔ 'dark'.
+
+    Both modes share the same Fluent QSS structure — only the PAL dict swaps.
+    `is_dark` is the canonical state, exposed as a property; `theme` is an
+    alias for any caller that prefers the string form. Both setters route
+    through `set_theme` so a single repaint path covers every call site.
+    """
+
+    THEMES = ("light", "dark")
+    _PAL_FOR = {"light": LIGHT_PAL, "dark": DARK_PAL}
+
     changed = pyqtSignal()
     _inst: "ThemeManager | None" = None
 
     def __init__(self):
         super().__init__()
-        self.is_dark = True
+        self._theme: str = "light"
 
     @classmethod
     def get(cls) -> "ThemeManager":
@@ -495,103 +645,79 @@ class ThemeManager(QObject):
             cls._inst = cls()
         return cls._inst
 
-    def set_dark(self, dark: bool):
-        if dark == self.is_dark:
+    @property
+    def theme(self) -> str:
+        return self._theme
+
+    @theme.setter
+    def theme(self, value: str):
+        if value in self.THEMES:
+            self._theme = value
+
+    @property
+    def is_dark(self) -> bool:
+        return self._theme == "dark"
+
+    @is_dark.setter
+    def is_dark(self, dark: bool):
+        # Pre-QApplication assignment path (called from main() before the
+        # first stylesheet build). Just store the state; the actual repaint
+        # happens when app.setStyleSheet() is called.
+        self._theme = "dark" if dark else "light"
+
+    def set_theme(self, theme: str):
+        if theme not in self.THEMES or theme == self._theme:
             return
-        self.is_dark = dark
-        PAL.update(DARK_PAL if dark else LIGHT_PAL)
+        self._theme = theme
+        PAL.update(self._PAL_FOR[theme])
         app = QApplication.instance()
         if app:
             app.setStyleSheet(build_qss())
             _apply_app_palette(app)
         try:
-            _THEME_FILE.write_text("dark" if dark else "light")
+            _THEME_FILE.write_text(theme)
         except OSError:
             pass
         self.changed.emit()
+
+    def cycle(self):
+        self.set_theme("dark" if self._theme == "light" else "light")
+
+    # Kept for backwards compatibility with any caller that pre-dated cycle().
+    def set_dark(self, dark: bool):
+        self.set_theme("dark" if dark else "light")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # THEME TOGGLE WIDGET
 # ─────────────────────────────────────────────────────────────────────────────
 
-class ThemeToggle(QWidget):
-    """Animated pill toggle — left=dark, right=light."""
-    W, H, D, PAD = 52, 28, 20, 4
+class ThemeToggle(QPushButton):
+    """Tri-mode theme cycler styled to match the active QSS.
+
+    Replaced the animated dark/light pill — Win3 mode wouldn't make sense
+    inside a rounded sliding-thumb control. Now this is a plain QPushButton
+    that displays the current theme name and cycles on click. In Win3 mode it
+    inherits the standard 3D beveled button; in modern modes it's a flat pill
+    via the dynamic style applied below.
+    """
+
+    # Sun glyph for Light → indicates "currently Light, click for Dark";
+    # Moon glyph for Dark → "currently Dark, click for Light".
+    _LABELS = {"light": "☀  Light", "dark": "☾  Dark"}
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(self.W, self.H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("Toggle dark / light theme")
-        self._pos = 0.0  # 0.0=dark/left, 1.0=light/right
-
-        self._anim = QPropertyAnimation(self, b"pos_val", self)
-        self._anim.setDuration(240)
-        self._anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
-
+        self.setToolTip("Toggle Windows 11 Light / Dark theme")
+        self.setObjectName("theme_cycle")
+        self.setMinimumWidth(78)
+        self._sync()
+        self.clicked.connect(ThemeManager.get().cycle)
         ThemeManager.get().changed.connect(self._sync)
 
-    def get_pos(self) -> float:
-        return self._pos
-
-    def set_pos(self, v: float):
-        self._pos = max(0.0, min(1.0, v))
-        self.update()
-
-    pos_val = pyqtProperty(float, get_pos, set_pos)
-
     def _sync(self):
-        target = 0.0 if ThemeManager.get().is_dark else 1.0
-        self._anim.stop()
-        self._anim.setStartValue(self._pos)
-        self._anim.setEndValue(target)
-        self._anim.start()
-
-    def mousePressEvent(self, e):
-        ThemeManager.get().set_dark(not ThemeManager.get().is_dark)
-
-    def paintEvent(self, e):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        w, h, pos = self.W, self.H, self._pos
-
-        # Interpolate track color: amber (dark) ↔ steel blue (light)
-        ca = QColor("#FFB547")
-        cb = QColor("#60A5FA")
-        tr = int(ca.red()   + (cb.red()   - ca.red())   * pos)
-        tg = int(ca.green() + (cb.green() - ca.green()) * pos)
-        tb = int(ca.blue()  + (cb.blue()  - ca.blue())  * pos)
-        track_color = QColor(tr, tg, tb)
-
-        # Track pill
-        track_h = h * 0.75
-        track_y = (h - track_h) / 2
-        path = QPainterPath()
-        path.addRoundedRect(QRectF(0, track_y, w, track_h), track_h / 2, track_h / 2)
-        p.fillPath(path, track_color)
-
-        # White thumb circle
-        travel = w - self.PAD * 2 - self.D
-        tx = self.PAD + pos * travel
-        ty = (h - self.D) / 2
-        # Subtle shadow
-        p.setBrush(QColor(0, 0, 0, 30))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawEllipse(QRectF(tx + 0.5, ty + 1.0, self.D, self.D))
-        # Thumb
-        p.setBrush(QColor(255, 255, 255))
-        p.drawEllipse(QRectF(tx, ty, self.D, self.D))
-
-        # Icon on thumb: moon (dark) or sun (light)
-        icon = "☀" if pos >= 0.5 else "\U0001F319"
-        icon_color = QColor(30, 80, 160) if pos >= 0.5 else QColor(90, 60, 0)
-        p.setPen(icon_color)
-        f = QFont()
-        f.setPixelSize(10)
-        p.setFont(f)
-        p.drawText(QRectF(tx, ty, self.D, self.D), Qt.AlignmentFlag.AlignCenter, icon)
+        self.setText(self._LABELS.get(ThemeManager.get().theme, "Theme"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2055,7 +2181,7 @@ class MainWindow(QMainWindow):
         cl = QHBoxLayout(corner)
         cl.setContentsMargins(0, 0, 10, 0)
         cl.setSpacing(6)
-        self._mode_lbl = QLabel("Dark")
+        self._mode_lbl = QLabel("Theme:")
         self._mode_lbl.setStyleSheet(
             f"color:{PAL['fg_tertiary']}; font-size:11px; background:transparent;"
         )
@@ -2069,8 +2195,8 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(tabs)
 
     def _on_theme_changed(self):
-        dark = ThemeManager.get().is_dark
-        self._mode_lbl.setText("Dark" if dark else "Light")
+        # Restyle the static "Theme:" label so its colour tracks the active
+        # palette. The cycle button text itself is repainted by ThemeToggle._sync.
         self._mode_lbl.setStyleSheet(
             f"color:{PAL['fg_tertiary']}; font-size:11px; background:transparent;"
         )
@@ -2085,14 +2211,25 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
-    # Load saved theme before building QSS
+    # Load saved theme before building QSS. Two-state: "light" (default)
+    # or "dark". Anything else (including the legacy "win3" value from
+    # earlier sessions) falls through to Light.
     try:
-        saved = _THEME_FILE.read_text().strip()
-        if saved == "light":
-            PAL.update(LIGHT_PAL)
-            ThemeManager.get().is_dark = False
+        saved = _THEME_FILE.read_text().strip().lower()
     except (OSError, ValueError):
-        pass
+        saved = ""
+    if saved in ThemeManager.THEMES:
+        ThemeManager.get().theme = saved
+        PAL.update(ThemeManager._PAL_FOR[saved])
+
+    # Force the app-level font to Segoe UI Variable (Windows 11) → Segoe UI
+    # fallback. The QSS font-family rule only takes effect on widgets that
+    # haven't already had a font set by the platform plugin, so this guarantees
+    # consistent Fluent typography across every native control.
+    base_font = QFont("Segoe UI Variable", 10)
+    if not base_font.exactMatch():
+        base_font = QFont("Segoe UI", 10)
+    app.setFont(base_font)
 
     app.setStyleSheet(build_qss())
     _apply_app_palette(app)

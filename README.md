@@ -29,7 +29,7 @@ INPUT: SVAMITVA drone orthophoto (GeoTIFF / ECW) + Annotation Shapefiles
 ┌────────────────────────┐     ┌──────────────────────────────┐
 │  STAGE 2A              │     │  STAGE 2B                    │
 │  Rooftop Classifier    │     │  Infrastructure Detector     │
-│  ConvNeXt-Large        │     │  YOLOv9e + OBB               │
+│  ConvNeXt-Large        │     │  YOLOv11l (AABB)             │
 │  + ArcFace Head        │     │  + SAHI Sliced Inference     │
 │  224×224 crops         │     │  1280×1280 tiles             │
 │                        │     │                              │
@@ -186,7 +186,7 @@ This installs two console commands:
 |-------|-------|-------|-------|--------------|-------------------------------|
 | 1 — Segmentation | Unet mit_b4 | 512×512 | 8 | ~12 GB | ~16 GB unified |
 | 2A — Classification | ConvNeXt-Large | 224×224 | 32 | ~7.8 GB | ~8 GB unified |
-| 2B — Detection | YOLOv9e | 1280×1280 | 2 | ~7.2 GB | ~9 GB unified |
+| 2B — Detection | YOLOv11l | 1280×1280 | 4 | ~5.5 GB | ~7 GB unified |
 
 ---
 
@@ -304,7 +304,7 @@ NIFHackathon/
 │
 ├── models/
 │   ├── stage1_segmentation.py     # Unet + scSE + TriLoss + Lovász + TTA
-│   └── stage2_models.py           # ConvNeXt-Large + ArcFace + YOLOv9 + SAHI
+│   └── stage2_models.py           # ConvNeXt-Large + ArcFace + YOLOv11l + SAHI
 │
 ├── train/
 │   ├── train_stage1.py            # EMA, SWA, grad checkpointing (SAM available, off by default)

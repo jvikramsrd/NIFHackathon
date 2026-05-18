@@ -2,12 +2,16 @@
 run_stage2b.py  —  Standalone Stage 2B: Infrastructure Detection
 ═══════════════════════════════════════════════════════════════════
 Extracts infrastructure data from shapefiles → YOLO format,
-then trains YOLOv9 with all the accuracy improvements:
+then trains the configured Ultralytics detector (default: YOLOv11l) with
+all the accuracy improvements:
 
-  • Class-specific bounding box sizes (transformer=60px, tank=50px, well=25px)
+  • Class-specific bounding box sizes (driven by config.STAGE2B["class_buffer_px"];
+    currently transformer=100px, overhead_tank=80px, well=40px)
   • Object-centered tiles (no edge cropping)
   • Negative tile sampling for false-positive reduction
   • Copy-paste augmentation, cosine LR, early stopping
+  • Full aerial-augmentation suite (HSV jitter, ±degrees rotation,
+    horizontal+vertical flips, mixup) — same hyperparams as train/train_stage2.py
 
 Usage:
   python run_stage2b.py                        # extract + train
@@ -192,7 +196,8 @@ def prepare_yolo_dataset():
 
 def train_stage2b(data_yaml: str, resume: bool = True):
     """
-    Train YOLOv9 infrastructure detector with tuned hyperparams.
+    Train the configured Ultralytics detector (model_variant in config.STAGE2B)
+    with tuned hyperparams.
     """
     from models.stage2_models import InfrastructureDetector
 
@@ -228,12 +233,18 @@ def train_stage2b(data_yaml: str, resume: bool = True):
         log.info(f"  Fine-tuning from: {finetune_from}")
         from ultralytics import YOLO
         model = YOLO(finetune_from)
+        # Keep this arg dict in lockstep with train/train_stage2.py:train_stage2b.
+        # The earlier version of this file omitted mosaic/close_mosaic, all HSV
+        # knobs, degrees/translate/scale/fliplr/flipud, mixup, amp, and verbose
+        # — Ultralytics silently fell back to library defaults (e.g. degrees=0,
+        # flipud=0, mixup=0, close_mosaic=10), which produced materially worse
+        # aerial-imagery training than the canonical train_stage2.py path. All
+        # values now flow from cfg2b with the same fallbacks.
         train_args = dict(
             data=data_yaml,
             epochs=cfg2b["epochs"],
             imgsz=cfg2b["img_size"],
             batch=cfg2b["batch_size"],
-            workers=int(cfg2b.get("workers", 0)),
             device="0",
             project=str(CFG.CKPT_DIR),
             name=f"stage2b_{variant}",
@@ -244,17 +255,33 @@ def train_stage2b(data_yaml: str, resume: bool = True):
             warmup_epochs=float(cfg2b.get("warmup_epochs", 3)),
             patience=int(cfg2b.get("patience", 20)),
             cos_lr=bool(cfg2b.get("cos_lr", True)),
-            copy_paste=float(cfg2b.get("copy_paste", 0)),
+            mosaic=float(cfg2b.get("mosaic", 1.0)),
+            close_mosaic=int(cfg2b.get("close_mosaic", 20)),
+            hsv_h=float(cfg2b.get("hsv_h", 0.015)),
+            hsv_s=float(cfg2b.get("hsv_s", 0.5)),
+            hsv_v=float(cfg2b.get("hsv_v", 0.3)),
+            degrees=float(cfg2b.get("degrees", 15.0)),
+            translate=float(cfg2b.get("translate", 0.1)),
+            scale=float(cfg2b.get("scale", 0.5)),
+            fliplr=float(cfg2b.get("fliplr", 0.5)),
+            flipud=float(cfg2b.get("flipud", 0.0)),
+            mixup=float(cfg2b.get("mixup", 0.15)),
+            copy_paste=float(cfg2b.get("copy_paste", 0.30)),
             cache=cfg2b.get("cache", "disk"),
-            # Keep parity with train_stage2.py: accuracy lifts shared with the
-            # other entry point. Light head dropout + multi-scale training.
             dropout=float(cfg2b.get("dropout", 0.0)),
             multi_scale=bool(cfg2b.get("multi_scale", False)),
+            workers=int(cfg2b.get("workers", CFG.NUM_WORKERS)),
+            amp=True,
+            verbose=True,
         )
         if cfg2b.get("use_obb"):
             train_args["task"] = "obb"
         model.train(**train_args)
+        # Attach the trained model so callers that use the return value get the
+        # weights that just trained, not a fresh pretrained model from disk.
         detector = InfrastructureDetector(cfg2b, str(CFG.CKPT_DIR))
+        detector.model = model
+        detector._backend = "yolo"
     else:
         if last_ckpt.exists() or best_ckpt.exists():
             log.info(f"  [INFO] Previous checkpoint found but --no-resume specified, training from scratch")
@@ -376,7 +403,7 @@ Examples:
 
     # ── Train ────────────────────────────────────────────────────────────
     log.info("\n" + "─" * 60)
-    log.info("  PHASE 3: Training YOLOv9")
+    log.info(f"  PHASE 3: Training {CFG.STAGE2B['model_variant']}")
     log.info("─" * 60)
     train_stage2b(data_yaml, resume=not args.no_resume)
 

@@ -306,12 +306,27 @@ STAGE2B = dict(
     shp_infra_col='Utility_Ty',
     shp_infra_cols=('Utility_Ty', 'utility_type', 'Utility_Type', 'type', 'Type', 'name', 'Name'),
     infra_type_map=INFRA_TYPE_MAP,
-    model_variant='yolov9e',
-    use_obb=True,
-    obb_model_variant='yolov9e-obb',
+    # YOLOv11l chosen over YOLOv9e:
+    #   • ~2× faster at parity accuracy on small aerial objects (~25M vs 58M params)
+    #   • C2PSA attention gives a small but consistent recall bump on tiny objects
+    #     (wells ~15px, transformers ~30px)
+    #   • Active Ultralytics maintenance branch; yolov9e-obb isn't a first-party
+    #     release and silently fell back to AABB anyway
+    #   • Frees ~2.5 GB VRAM at imgsz=1280 → batch can double from 2 to 4
+    model_variant='yolo11l',
+    # OBB disabled: transformer/overhead_tank/well are rotationally symmetric
+    # (circles) or near-square from a top-down drone view, so the angle target
+    # is undefined or ambiguous. AABB outputs Point centroids in
+    # detections_to_shapefile, which is what surveyors actually want for an
+    # infrastructure inventory layer. obb_model_variant is kept as a no-op
+    # fallback path in case OBB is ever re-enabled.
+    use_obb=False,
+    obb_model_variant='yolo11l-obb',
     img_size=1280,
     cache='ram',
-    batch_size=2,
+    # Bumped from 2 → 4: YOLOv11l uses ~4.5 GB at 1280px (vs 7.2 GB for yolov9e),
+    # leaving room for batch=4 on the A4000. Bigger gradient signal per step.
+    batch_size=4,
     # Use the same parallel-loader budget as Stage 1/2A. workers=0 made YOLO
     # decode + Mosaic happen serially on the main thread, leaving the GPU idle
     # between batches.

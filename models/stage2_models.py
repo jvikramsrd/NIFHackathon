@@ -300,7 +300,7 @@ class InfrastructureDetector:
         try:
             from ultralytics import YOLO  # type: ignore
 
-            variant = self.cfg.get("model_variant", "yolov9e")
+            variant = self.cfg.get("model_variant", "yolo11l")
             if self.cfg.get("use_obb"):
                 variant = self.cfg.get("obb_model_variant", f"{variant}-obb")
             try:
@@ -308,7 +308,7 @@ class InfrastructureDetector:
             except Exception as exc:
                 if not self.cfg.get("use_obb"):
                     raise
-                fallback = self.cfg.get("model_variant", "yolov9e")
+                fallback = self.cfg.get("model_variant", "yolo11l")
                 log.warning(
                     "Could not load OBB model %s.pt (%s); falling back to %s.pt",
                     variant, exc, fallback,

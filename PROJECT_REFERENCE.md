@@ -1,883 +1,1247 @@
 # GeoIntel Pipeline — Complete Project Reference
 
-> This document covers every component of the codebase: purpose, architecture, data flow, all files, every improvement made across the full git history, and current configuration values. Read this to understand the project from scratch.
+> Every component, every knob, every "why." Read this end-to-end to understand
+> the project from scratch. Values quoted below are the **live values** in
+> `config.py` as of this document (cross-checked against the source — if the
+> code ever drifts from this document, the code is authoritative).
 
 ---
 
 ## Table of Contents
 
 1. [What This Project Does](#1-what-this-project-does)
-2. [Dataset — SVAMITVA](#2-dataset--svamitva)
-3. [Directory Layout](#3-directory-layout)
-4. [High-Level Architecture](#4-high-level-architecture)
-5. [Stage 1 — Semantic Segmentation](#5-stage-1--semantic-segmentation)
-6. [Stage 2A — Rooftop Material Classification](#6-stage-2a--rooftop-material-classification)
-7. [Stage 2B — Infrastructure Detection](#7-stage-2b--infrastructure-detection)
-8. [Data Preprocessing Pipeline](#8-data-preprocessing-pipeline)
-9. [Training Pipeline](#9-training-pipeline)
-10. [Inference Pipeline](#10-inference-pipeline)
-11. [Post-Processing](#11-post-processing)
-12. [Utilities Reference](#12-utilities-reference)
-13. [Entry Points](#13-entry-points)
-14. [GUI — Operator Console](#14-gui--operator-console)
-15. [Configuration Reference](#15-configuration-reference)
-16. [Complete History of Improvements](#16-complete-history-of-improvements)
+2. [Why a Three-Stage Pipeline](#2-why-a-three-stage-pipeline)
+3. [Dataset — SVAMITVA](#3-dataset--svamitva)
+4. [Directory Layout](#4-directory-layout)
+5. [High-Level Architecture](#5-high-level-architecture)
+6. [Stage 1 — Semantic Segmentation](#6-stage-1--semantic-segmentation)
+7. [Stage 2A — Rooftop Material Classification](#7-stage-2a--rooftop-material-classification)
+8. [Stage 2B — Infrastructure Detection](#8-stage-2b--infrastructure-detection)
+9. [Data Preprocessing](#9-data-preprocessing)
+10. [Training Pipeline](#10-training-pipeline)
+11. [Inference Pipeline](#11-inference-pipeline)
+12. [Post-Processing](#12-post-processing)
+13. [Utilities Reference](#13-utilities-reference)
+14. [Entry Points](#14-entry-points)
+15. [GUI — Operator Console](#15-gui--operator-console)
+16. [Configuration Reference (live values + why)](#16-configuration-reference)
+17. [A4000-Specific Optimization Notes](#17-a4000-specific-optimization-notes)
+18. [Improvement History (recent → older)](#18-improvement-history)
 
 ---
 
 ## 1. What This Project Does
 
-This is an **AI-powered geospatial analysis pipeline** built for the **SVAMITVA (Survey of Villages and Mapping with Improvised Technology in Village Areas)** scheme — India's drone-based village land mapping programme.
+**GeoIntel** is an AI pipeline for the **SVAMITVA** scheme (Survey of Villages
+and Mapping with Improvised Technology in Village Areas), India's drone-based
+village land-mapping programme.
 
-Given a high-resolution drone orthophoto (GeoTIFF), the pipeline:
+Given a high-resolution drone orthophoto (GeoTIFF or ECW) of a village, it
+produces GIS-ready vector outputs:
 
-1. **Segments** the image into buildings, roads, waterbodies, and background.
-2. **Classifies** each building's rooftop material (RCC, Tiled, Tin, Other).
-3. **Detects** small infrastructure objects (electric transformers, overhead water tanks, hand pumps/wells).
+1. **Segmentation** — pixel-level mask of buildings / roads / waterbodies / background.
+2. **Rooftop classification** — material of every detected building (RCC / Tiled / Tin / Other).
+3. **Infrastructure detection** — bounding boxes for small features (transformers, overhead water tanks, hand pumps / wells).
 
-Outputs are GIS-ready vector shapefiles (`.shp`) and GeoPackages (`.gpkg`) — ready to open in QGIS or ArcGIS.
+Outputs are `.shp` (per-class) and a combined `.gpkg` — load straight into QGIS or ArcGIS.
 
-**Target hardware:** Windows 11, RTX A4000 16 GB, i9-13900K, 32 GB RAM.
+**Target hardware:** Windows 11, NVIDIA **RTX A4000 16 GB** (Ampere, CC 8.6),
+i9-13900K, 32 GB RAM. The code also runs on AMD ROCm, Apple Silicon MPS, and CPU
+with graceful AMP-dtype fallback (`bfloat16` → `float16` → `float32`).
 
 ---
 
-## 2. Dataset — SVAMITVA
+## 2. Why a Three-Stage Pipeline
 
-### Folder structure (two sub-datasets)
+A single end-to-end network would have to learn three very different tasks at
+three very different scales: pixel-accurate boundary regression (segmentation),
+fine-grained texture classification (rooftop material), and small-object
+detection (well pumps ≈ 15 px wide). Splitting the problem lets each stage use
+the right architecture, the right input size, and the right loss:
+
+| Stage | Task | Why a dedicated model |
+|---|---|---|
+| 1 | Pixel segmentation | Needs full-image context + dense per-pixel output → an encoder-decoder (MAnet/MiT-B4) at 512 px |
+| 2A | Building-level classification | Needs only the cropped rooftop + tight angular margin → ConvNeXt-Large + ArcFace at 224 px |
+| 2B | Small-object detection | Needs high-resolution sliding-window inference → YOLOv9e-OBB at 1280 px with SAHI |
+
+**Stage 2A is *gated* by Stage 1's building polygons** — it never sees the full
+ortho, only the 224 px crops Stage 1 identified as buildings. This is roughly
+two orders of magnitude less compute than running the classifier on every
+pixel, and it makes the "Other" class meaningful (it only fires on things we
+already believe are buildings).
+
+**Stage 2B is *gated* by Stage 1's context polygons** — tiles that don't
+intersect a building/road/waterbody (with a 128 px buffer) are skipped entirely
+before they reach YOLO. On rural orthos this skips 40–70% of tiles.
+
+---
+
+## 3. Dataset — SVAMITVA
+
+### Folder layout (two sub-datasets)
+
 ```
 dataset/
   cg/   ← Chhattisgarh villages (5 TIF orthos + 1 ECW)
-  pb/   ← Punjab villages (5 TIF orthos + 2 ECW)
+  pb/   ← Punjab villages         (5 TIF orthos + 2 ECW)
 ```
 
-Each folder contains:
-- One or more large GeoTIFF orthorasters (some exceed 70 GB uncompressed)
-- ECW duplicates of TIFs → **automatically skipped** (TIF preferred)
-- `.tif.pyrx` pyramid files → **skipped**
+Each sub-folder contains:
+- One or more giant GeoTIFFs (up to ~72 GB uncompressed RGB)
+- ECW duplicates of TIFs → **automatically skipped** (TIF preferred when both exist)
+- `.tif.pyrx` pyramid files → **skipped** (they're index caches, not imagery)
 - ArcGIS `.lock` files → **skipped**
-- Shared shapefiles that annotate **all** rasters in the folder:
+- Shared shapefiles that annotate **all** rasters in the folder
 
-| Shapefile | Role | Config key |
+### Shapefile → class mapping (`config.SHP_LAYER_ROLES`)
+
+| Shapefile stem | Maps to | Attribute column |
 |---|---|---|
-| `Built_Up_Area_type.shp` / `Built_Up_Area_typ.shp` | Buildings + roof type | class_id=1 |
-| `Road.shp` / `Road_Centre_Line.shp` | Roads | class_id=2 |
-| `Water_Body.shp` / `Water_Body_Line.shp` | Waterbodies | class_id=3 |
-| `Utility.shp` / `Utility_Poly.shp` | Infrastructure points/polygons | Stage 2B |
-| `Bridge.shp` / `Railway.shp` | Treated as road class | class_id=2 |
+| `Built_Up_Area_type` / `Built_Up_Area_typ` (PB-truncated) | class 1 (Building) | `type` |
+| `Road` / `Road_Centre_Line` | class 2 (Road) | `road_type` |
+| `Water_Body` / `Water_Body_Line` / `Waterbody_Point` | class 3 (Waterbody) | `water_type` |
+| `Bridge` | class 2 (Road) | `bridge_type` |
+| `Railway` | class 2 (Road) | `railway_type` |
+| `Utility` / `Utility_Poly` / `Utility_Poly_` (PB) | (no seg class) — Stage 2B only | `utility_type` |
 
-### Segmentation classes
-| ID | Name | Color |
+Bridges and railways are merged into "Road" because all three serve the same
+role in connectivity-based downstream tasks, and their footprints are visually
+indistinguishable from drone altitude.
+
+### Segmentation classes (Stage 1)
+
+| ID | Name | Render colour |
 |---|---|---|
-| 0 | Background | Black |
-| 1 | Building | Red |
-| 2 | Road | Grey |
-| 3 | Waterbody | Blue |
+| 0 | background | black |
+| 1 | building | red |
+| 2 | road | grey |
+| 3 | waterbody | blue |
 
-### Rooftop material classes (Stage 2A)
-`RCC`, `Tiled`, `Tin`, `Other`
+### Rooftop classes (Stage 2A) — `config.ROOF_TYPE_MAP`
 
-Map from raw DBF values (e.g. `Pucca_RCC` → `RCC`, `Pucca_Tiled` → `Tiled`) is in `config.ROOF_TYPE_MAP`.
+Raw SVAMITVA DBF values normalise to four canonical classes:
 
-### Infrastructure classes (Stage 2B)
-`transformer`, `overhead_tank`, `well`
+| Canonical | Raw value examples |
+|---|---|
+| `RCC` | `Pucca_RCC`, `Pucca_RCC_Slab`, `concrete`, `concrete_roof` |
+| `Tiled` | `Pucca_Tiled`, `mangalore_tile`, `tile` |
+| `Tin` | `Pucca_Tin`, `tin_roof`, `metal_roof`, `galvanized`, `pucca_asbestos` |
+| `Other` | `semi_pucca`, `kuccha`, `other`, `others` |
 
-Map from raw DBF values (e.g. `electric_transformer` → `transformer`) is in `config.INFRA_TYPE_MAP`.
+Asbestos is mapped to `Tin` because both classes show identical metallic-sheen
+textures at drone GSD and the downstream usefulness is the same (non-permanent
+roof material).
+
+### Infrastructure classes (Stage 2B) — `config.INFRA_TYPE_MAP`
+
+| Canonical | Raw value examples |
+|---|---|
+| `transformer` | `electric_transformer`, `dt`, `distribution_transformer` |
+| `overhead_tank` | `overhead_water_tank`, `OHT`, `OHSR`, `water_tank` |
+| `well` | `hand_pump`, `well`, `tube_well`, `tubewell` |
 
 ---
 
-## 3. Directory Layout
+## 4. Directory Layout
 
 ```
 NIFHackathon/
-├── config.py                   ← All hyperparameters and paths
+├── config.py                   ← Single source of truth for hyperparameters & paths
 ├── gui.py                      ← PyQt6 desktop operator console
+├── run_pipeline.py             ← Master CLI (preprocess / train / evaluate / infer / all)
 ├── infer_folder.py             ← Batch inference entry point
 ├── run_stage2b.py              ← Stage 2B standalone training runner
 ├── export_models.py            ← ONNX / TorchScript export
+├── _setup_verify.py            ← Post-install smoke test
+├── build.py                    ← PyInstaller binary builder
 │
 ├── data/
-│   ├── dataset.py              ← Dataset classes + augmentation pipelines
-│   └── preprocessing.py        ← Raw TIF → patches/crops/YOLO labels
+│   ├── dataset.py              ← Dataset classes + Albumentations augmentation
+│   └── preprocessing.py        ← Raw TIF → patches/crops/YOLO labels (strip-streamed)
 │
 ├── models/
-│   ├── stage1_segmentation.py  ← Unet/MiT-B4 model, losses, TTA
-│   └── stage2_models.py        ← ConvNeXt+ArcFace classifier, YOLO detector
+│   ├── stage1_segmentation.py  ← MAnet/MiT-B4 + TriLoss + TTA
+│   └── stage2_models.py        ← ConvNeXt+ArcFace + YOLOv9 wrapper + Soft-NMS
 │
 ├── inference/
 │   └── pipeline.py             ← Full 3-stage inference orchestration
 │
 ├── train/
-│   ├── train_stage1.py         ← Stage 1 training loop
+│   ├── train_stage1.py         ← Stage 1 training loop (DDP-aware)
 │   ├── train_stage2.py         ← Stage 2A + 2B training loops
-│   └── launch_ddp.py           ← Multi-GPU DDP launcher
+│   └── launch_ddp.py           ← Multi-GPU torchrun launcher
 │
 ├── utils/
-│   ├── checkpointing.py        ← Atomic checkpoint save
-│   ├── ddp.py                  ← Distributed training helpers
-│   ├── hardware.py             ← Device setup, EMA, compile wrappers
-│   ├── logger.py               ← Structured logging + crash reporter
-│   ├── metrics.py              ← IoU, F1, confusion matrix
-│   ├── postprocess.py          ← CRF, morphology, vectorization, SHPs
-│   ├── sam.py                  ← Sharpness-Aware Minimization optimizer
+│   ├── checkpointing.py        ← Atomic checkpoint save (.tmp + replace)
+│   ├── ddp.py                  ← DistributedDataParallel helpers
+│   ├── ecw_compat.py           ← ECW → GeoTIFF auto-conversion
+│   ├── hardware.py             ← Device setup, EMA, channels_last, AMP, VRAM stats
+│   ├── logger.py               ← Structured logging + crash_logged context manager
+│   ├── metrics.py              ← Segmentation mIoU + detection mAP
+│   ├── postprocess.py          ← CRF, morphology, vectorization, SHP writers
+│   ├── sam.py                  ← Sharpness-Aware Minimisation (batched _foreach_*)
 │   └── window.py               ← Cosine blending window for tile overlap
 │
-├── dataset/                    ← Raw SVAMITVA data (not in git)
-│   ├── patches/                ← 512px segmentation training tiles
+├── tests/
+│   ├── test_config_values.py   ← Config invariants
+│   ├── test_core_components.py ← Component-level unit tests
+│   └── test_optimizations.py   ← Regression tests for vectorised paths
+│
+├── dataset/                    ← Raw SVAMITVA data (gitignored)
+│   ├── patches/                ← 512 px segmentation training tiles
 │   ├── patch_masks/            ← Corresponding class masks
 │   ├── building_crops/         ← Per-class rooftop image crops
 │   ├── yolo_infra/             ← YOLO-format infrastructure tiles
 │   └── masks/                  ← Full-raster segmentation masks
 │
-├── checkpoints/                ← Saved model weights (not in git)
-│   ├── stage1_best.pth
-│   ├── stage1_last.pth
-│   ├── stage1_swa.pth
+├── checkpoints/                ← Saved model weights (gitignored)
+│   ├── stage1_best.pth         ← EMA weights at best val mIoU
+│   ├── stage1_last.pth         ← Resumable training state (model + opt + sched)
+│   ├── stage1_swa.pth          ← SWA-averaged weights (after epoch 60)
 │   ├── stage2a_best.pth
-│   └── stage2b_yolov9e/weights/best.pt
+│   ├── stage2a_last.pth
+│   └── stage2b_yolo11l/weights/best.pt
 │
-└── outputs/vectorized/         ← Pipeline outputs (shapefiles, gpkg)
+└── outputs/vectorized/         ← Inference outputs (.shp, .gpkg)
 ```
 
 ---
 
-## 4. High-Level Architecture
+## 5. High-Level Architecture
 
 ```
-GeoTIFF ortho
+GeoTIFF / ECW ortho (potentially 70 GB+ uncompressed)
       │
       ▼
-[_to_uint8]  ← percentile normalisation (2nd–98th per channel)
+[_to_uint8]   ← 2nd–98th percentile per-channel stretch, zero-pixel excluded
       │
-      ├─────────────────────────────────────────────────────────┐
-      ▼                                                         │
-[STAGE 1]  Unet / MiT-B4                                        │
-  Tiled inference (512px patches, 192px overlap)                │
-  3-scale × 8-fold TTA (24 passes, controlled by FAST_TTA)      │
-  Dense CRF refinement (10 iterations)                          │
-  Morphological cleanup + watershed building separation         │
-  ↓                                                             │
-  Segmentation mask (H×W uint8, 4 classes)                      │
-  Vectorised → building.shp, road.shp, waterbody.shp            │
-      │                                                         │
-      ▼                                                         │
-[STAGE 2A]  ConvNeXt-Large / ArcFace                            │
-  Constrained to building polygons from Stage 1                 │
-  Per-building bbox crop (224×224, 15% padding)                 │
-  3-scale × 8-fold TTA (24 passes)                              │
-  Per-class confidence thresholds                               │
-  ↓                                                             │
-  Roof material per building → building_rooftop.shp             │
-      │                                                         │
-      ▼                                                         │
-[STAGE 2B]  YOLOv9-OBB / SAHI                                   │
-  Context-gated tiling (skip tiles far from buildings/roads)    │
-  1280px tiles, 512px overlap                                    │
-  SAHI sliced inference (640px slices, 40% overlap)             │
-  Per-class confidence thresholds                               │
-  Soft-NMS Gaussian (σ=0.5) deduplication                       │
-  ↓                                                             │
-  Infrastructure detections → infrastructure.shp                │
-      └───────────── all_features.gpkg ───────────────────────┘
+      ▼
+[STAGE 1]  MAnet decoder + MiT-B4 encoder, bf16 + channels_last
+      • Tiled inference: 512 px patches, 128 px overlap (cosine blend)
+      • TTA: 3-scale × D4 symmetry = 24 forward passes (or 8 via FAST_TTA)
+      • DenseCRF: 10 iterations, per-class compatibility matrix
+      • Morphological cleanup + watershed building separation
+      ↓
+      Segmentation mask (H × W uint8)
+      Vectorised → {prefix}_building.shp, _road.shp, _waterbody.shp, _all_features.gpkg
+      │
+      ▼
+[STAGE 2A]  ConvNeXt-Large + ArcFace head, bf16 + channels_last
+      • Constrained to building polygons from Stage 1
+      • 224 px crops with 15 % padding, INTER_LINEAR resize
+      • Per-class confidence thresholds (RCC/Tiled/Tin/Other)
+      • 8-fold TTA per scale × 3 scales = up to 24 passes
+      ↓
+      → {prefix}_building_rooftop.shp
+      │
+      ▼
+[STAGE 2B]  YOLOv9e-OBB + SAHI sliced inference
+      • Context-gated tiling (skip tiles >128 px from any building/road)
+      • 1280 px tiles, 512 px overlap
+      • SAHI slices: 512 px sub-tiles, 45 % overlap, NMM merge
+      • Per-class confidence thresholds + Soft-NMS Gaussian (σ=0.40)
+      ↓
+      → {prefix}_infrastructure.shp
 ```
 
 ---
 
-## 5. Stage 1 — Semantic Segmentation
+## 6. Stage 1 — Semantic Segmentation
 
-### Model: `models/stage1_segmentation.py`
+### Architecture (`models/stage1_segmentation.py`)
 
-**Architecture:** Unet with:
-- Encoder: **MiT-B4** (Mix Transformer) — pretrained on ImageNet
-- Decoder: **scSE attention** (channel + spatial squeeze-excitation) on every decoder block
-- Activation: `None` (raw logits, softmax applied at loss/inference time)
+**Decoder: `MAnet`** (Multi-scale Attention Network) from `segmentation-models-pytorch`.
 
-**Why Unet:** It is the most stable SMP decoder with MiT encoders, trains faster than UNet++/MAnet variants, and keeps clean skip-feature detail for building, road, and water boundaries.
+*Why MAnet over Unet:* MAnet's Position-wise Attention Block + Multi-scale Feature
+Aggregation block sharpens irregular boundaries. The SVAMITVA villages have
+non-rectangular building outlines, variable-width dirt roads, and irregular lake
+edges — exactly the case where a plain Unet decoder smears edges. MAnet
+preserves them.
 
-**Why MiT-B4:** Hierarchical Vision Transformer. It captures fine-grained texture and settlement context while cutting VRAM and iteration time versus MiT-B5.
+*Note on UnetPlusPlus:* `smp.UnetPlusPlus` has a hardcoded rejection of MiT
+encoders (`decoders/unetplusplus/model.py`). If you ever want `UnetPlusPlus`
+you must switch to `efficientnet-b4` or similar.
 
-### Loss: `TriLoss`
+**Encoder: `mit_b4`** (Mix Transformer, ~62 M params), ImageNet-pretrained.
 
-A weighted sum of six losses:
+*Why MiT-B4 over MiT-B5 or a ResNet:* B4 is ~20 % faster than B5 and gives
+nearly the same mIoU on this task. SegFormer-family transformer features
+are strong for rooftop / road / water texture. ResNet encoders are faster but
+lose 1–2 mIoU on the boundary classes.
 
-| Loss | Weight | Purpose |
-|---|---|---|
-| Cosine-log Dice | 0.40 | Directly optimises overlap ratio; smoother gradients than standard Dice near 0/1 |
-| Cross-Entropy (label smooth 0.05) | 0.15 | Stable pixel-level supervision |
-| Focal (γ=2.0) | 0.15 | Down-weights easy background pixels, focuses on hard boundaries |
-| Boundary / Hausdorff | 0.15 | Penalises distance between predicted and GT edges |
-| Lovász-Softmax | 0.15 | Directly optimises mIoU (the actual evaluation metric) |
-| Instance-touching separation | 0.10 | Penalises high building probability at inter-building gaps; separates touching buildings |
+**Decoder attention: `scse`** (concurrent Spatial + channel Squeeze-Excite) on every
+decoder block.
 
-**Class weights:** `[0.30, 1.80, 4.50, 2.20]` for background/building/road/waterbody.  
-Road gets the highest weight (4.5×) because it is narrow and easily confused with shadows.
+*Why scSE:* free recalibration of skip-features at minimal compute cost.
 
-**Auxiliary-output ready:** The loss still supports auxiliary logits if a future architecture returns them, but the production Unet path uses a single main head.
+**Channels-last layout:** the whole model is converted to NHWC before training
+via `to_channels_last(module)`. On Ampere tensor cores, NHWC convolutions are
+15–30 % faster than the default NCHW.
 
-### TTA: `tta_predict`
+**Gradient checkpointing:** the training loop attempts
+`module.model.encoder.set_grad_checkpointing(True)`. MiT encoders in `smp`
+don't expose this hook, so it silently falls through. At 512 px in bf16, the
+activation peak is ~10–11 GB at `batch_size=4`, which fits well inside the
+A4000's 16 GB budget without checkpointing.
 
-**Full TTA** (default, `FAST_TTA=False`):
-- 3 scales: 0.875× (wider context), 1.0× (base), 1.25× (fine detail)
-- 8 folds per scale: 4 rotations × 2 flip states (D4 symmetry group)
-- Total: **24 forward passes** per batch
-- Scale weights: 0.875→0.8, 1.0→1.0, 1.25→0.9
+### Loss — `TriLoss`
 
-**Fast TTA** (`FAST_TTA=True`):
-- 2 scales: 1.0×, 1.25×
-- 4 folds per scale
-- Total: **8 forward passes** — ~3× faster, lower accuracy
+Weighted sum of six terms (current config):
+
+| Term | Weight | What it does | Why |
+|---|---|---|---|
+| Cosine-log Dice | 0.40 | `1 − (2·intersect+ε)/(union+ε)`, then `log(cosh(·))` | Directly targets overlap; `log(cosh)` smooths the gradient near 0 and 1 where Dice is normally degenerate |
+| Cross-Entropy (label-smooth 0.08) | 0.15 | Standard per-pixel CE | Stable supervisory signal that anchors training when other losses are saturated |
+| Focal (γ=2.0) | 0.15 | `(1−p_t)^γ · CE` per pixel | Down-weights easy background pixels — the bulk of every patch — so optimisation focuses on hard boundaries |
+| Boundary / Hausdorff | 0.15 | Edge-map Dice + erosion-based Hausdorff approximation | Penalises distance between predicted and GT edges, not just overlap |
+| Lovász-Softmax | 0.15 | Vectorised over classes via one sort + one cumsum | Directly optimises mIoU, which is what we report |
+| Instance-touching separation | 0.10 | Penalises high building prob at inter-building gaps | Stops adjacent buildings from merging into one polygon |
+
+**Class weights: `[0.20, 2.00, 5.00, 2.50]`** (background/building/road/waterbody)
+and **label smoothing 0.08**.
+
+*Why road = 5.0×:* roads are thin (≤ 3 m wide → 6 px at 50 cm GSD), so they
+are massively under-represented in pixel-count vs buildings. Without
+re-weighting, the model learns to predict "not road" everywhere and still
+scores >95 % pixel accuracy. The 5× weight makes the loss notice.
+
+*Why background = 0.2×:* background dominates pixel count; without
+down-weighting the loss is mostly background CE.
+
+### TTA — `tta_predict`
+
+| Mode | Scales | Folds | Total forwards | Use case |
+|---|---|---|---|---|
+| Full (`FAST_TTA=False`, default) | 0.875 ×, 1.0 ×, 1.25 × | 8 (D4 symmetry: 4 rotations × 2 flip states) | **24** | Final inference, val every Nth epoch |
+| Fast (`FAST_TTA=True`) | 1.0 ×, 1.25 × | 4 | **8** | Quick iteration / dev |
+
+All augmented views for one scale are stacked into a single batched forward
+(`mega = torch.cat(augs, dim=0)`) and chunked at `tta_chunk=256` for safety —
+cutting kernel launches from N per scale to 1.
 
 ### Tiled inference
 
-- Patch size: **512px**
-- Overlap: **192px** (was incorrectly capped at 128px — now uses the configured value)
-- Blending: **spline window** (power=2 cosine taper) — smooth cross-fade at tile boundaries, no seams
-- Batch size: 16 tiles per GPU forward pass
+- Patch size **512**, overlap **128**, stride = 384.
+- Blending: shared cosine window (`utils/window.cosine_window`, `power=2`) so
+  there are no visible seams at tile boundaries.
+- Batch size = 16 tiles per GPU forward.
 
-### Dense CRF refinement
+### DenseCRF refinement
 
-Applied after tiled inference to sharpen boundaries. Uses `pydensecrf`:
-- Pairwise Gaussian (position): `sxy=3.0`, weight=3.0
-- Pairwise Bilateral (position + colour): `sxy=80`, `srgb=13`, weight=10
-- Expert per-class compatibility matrix: building↔waterbody confusion penalised 3×, building↔road penalised 1.5×
-- Texture-aware bilateral: Sobel gradient magnitude modulates the bilateral weight
-- **Iterations: 10** (was 5 — insufficient for convergence)
-- Tiled to avoid OOM on large orthos (2048px tiles, 256px overlap)
+Applied to the prob-map after tiled inference, before argmax. Uses `pydensecrf`:
+
+| Parameter | Value | Why |
+|---|---|---|
+| Pairwise Gaussian (position) | `sxy=3.0`, weight=3.0 | Local smoothness |
+| Pairwise Bilateral (position + colour) | `sxy=80`, `srgb=13`, weight=10 | Long-range colour-aware smoothing |
+| **Per-class compatibility matrix** | `building↔waterbody = 3×`, `building↔road = 1.5×`, diag=0 | The most damaging confusions get explicit extra penalty |
+| Iterations | **10** | Krähenbühl & Koltun show 10 is needed for boundary convergence; 5 (older default) was insufficient |
+| Tile size / overlap | 1024 / 128 | CRF is O(n²); smaller tiles are 4× faster with bounded bilateral kernels |
+| Workers | `CFG.CRF_WORKERS = 4` | `ProcessPoolExecutor` parallelism over tiles |
 
 ### Morphological cleanup
 
-After CRF, applied per class:
-- **Buildings:** close (7px ellipse) → remove blobs < 80px → **watershed separation** of touching buildings
-- **Roads:** close (18px ellipse, 2 iterations) → open (3px ellipse) → remove small blobs
-- **Waterbodies:** close (11px ellipse) → remove blobs < 160px
+Per class, before vectorisation:
 
-**Watershed building separation:**  
-Distance transform → `peak_local_max` (min 10px between seeds) → marker-controlled `watershed`. Inserts 1-px gap between adjacent building instances before vectorisation.
+- **Buildings (class 1):** close (7 px ellipse) → drop blobs < `min_building_area_px = 80 px` → **watershed instance separation** (distance transform → `peak_local_max` with min 10 px between seeds → marker-controlled `watershed`).
+- **Roads (class 2):** close (`min_road_width_px + 15 = 18 px`, 2 iterations) → open (`min_road_width_px = 3 px`) → drop blobs < 40 px.
+- **Waterbodies (class 3):** close (11 px) → drop blobs < 160 px.
+
+Watershed separation is critical: without it, adjacent row-houses merge into
+single polygons that the downstream rooftop classifier can't crop
+individually.
+
+### Vectorisation
+
+`utils/postprocess.mask_to_shapefile` rasterises each class layer, fixes
+topology with `shapely.make_valid` (falls back to `buffer(0)`), simplifies
+with `polygon_simplify_tolerance = 0.5`, explodes multipart features, and
+filters by per-class minimum area: `{building: 80, road: 120, waterbody: 160}`.
 
 ---
 
-## 6. Stage 2A — Rooftop Material Classification
+## 7. Stage 2A — Rooftop Material Classification
 
-### Model: `models/stage2_models.py → RooftopClassifier`
+### Architecture (`models/stage2_models.py → RooftopClassifier`)
 
-**Architecture:** ConvNeXt-Large backbone (timm) with:
-- Global average pooling (`num_classes=0`)
-- Feature projection trunk: `LayerNorm → Dropout(0.5) → Linear(1536→768) → GELU → LayerNorm → Dropout(0.3)`
-- **ArcFace head** (Deng et al., 2019): angular margin loss for tighter inter-class separation
-  - `s=30.0`, `m=0.55` (margin; was hardcoded to 0.50, ignoring config — now reads from config)
-  - Pushes class embeddings further apart in cosine space, reducing RCC↔Tiled confusion
+```
+ConvNeXt-Large (timm, ImageNet pretrained, drop_path_rate=0.4)
+  → Global Avg Pool (num_classes=0)
+  → LayerNorm(1536)
+  → Dropout(0.50)
+  → Linear(1536 → 768)
+  → GELU
+  → LayerNorm(768)
+  → Dropout(0.30)
+  → ArcFaceHead(768 → 4, s=30.0, m=0.55)    [or nn.Linear if use_arcface=False]
+```
 
-**Why ConvNeXt-Large:** Better than ViT-based models for fine-grained texture classification at small crop sizes (224px). ConvNeXt is optimised for `channels_last` memory layout → 15–25% throughput gain on Ampere.
+**Why ConvNeXt-Large over ViT:** large-kernel depthwise convolutions in
+ConvNeXt are the best fit for fine-grained texture classification at small
+input sizes (224 px). ViTs need bigger inputs to be competitive on texture.
+ConvNeXt is also one of the best `channels_last`-friendly architectures —
+on Ampere it gains 15–25 %.
 
-**Why ArcFace:** Rooftop materials (RCC vs Tiled) are visually similar. Standard softmax produces overlapping class clusters in embedding space. ArcFace enforces an angular margin that makes decision boundaries crisper without needing more training data.
+**Why ArcFace:** RCC and Tiled rooftops share visual statistics (both are
+hard, often grey, broken into rectangular cells). Standard softmax produces
+overlapping class clusters in embedding space. ArcFace enforces an additive
+angular margin `m` between the target class and all others — decision
+boundaries get crisp without needing more data. We use `s=30.0`, `m=0.55`.
 
-### TTA at inference
+**Why `m=0.55` not 0.50:** 0.55 gives the tightest margin we could push
+without instability on this dataset. The original code hardcoded `m=0.50`
+and ignored the config value for 11 commits; the bug was fixed and 0.55 is
+now actually in effect.
 
-3-scale × 8-fold = 24 passes (same D4 group as Stage 1):
-- Scale 0.875×: pad then resize → shows wider context around the building
-- Scale 1.0×: base crop
-- Scale 1.25×: center-crop then resize → zooms into fine texture (RCC grit, tile ridges)
+**Why `drop_path_rate=0.4`:** ConvNeXt-Large is ~200 M params on a small
+rooftop dataset. Aggressive stochastic depth is the main regulariser.
+
+### Training loop highlights
+
+- **Optimiser:** AdamW + SAM (`use_sam=True`, `rho=0.05`, `adaptive=True`).
+- **Scheduler:** `SequentialLR(LinearLR warmup 10 % of epochs, CosineAnnealingWarmRestarts)`.
+  Warm restarts are explicitly chosen over plain cosine to prevent
+  catastrophic forgetting of high-confidence early decisions.
+- **Augmentation:** RandAugment (n=2, m=7) + ColorJitter + MixUp (α=0.4) +
+  CutMix (α=1.0). MixUp/CutMix picked randomly per batch.
+- **Class weights:** `RooftopDataset.class_weights()` returns
+  inverse-frequency normalised weights, computed via `np.bincount` (the
+  earlier per-sample Python loop was the second-biggest startup cost).
+- **EMA:** decay 0.9995. EMA shadow is applied for validation each epoch
+  (then restored for training inside a try/finally). Best checkpoint saves EMA weights.
+- **VRAM auto-guard for SAM:** if the GPU has ≤16.5 GB total VRAM and
+  `batch_size > 8`, batch is halved (with `max(8, ...)` floor) at training
+  start. Uses a *local* variable, not `cfg["batch_size"]`, so the global
+  `CFG.STAGE2A` dict isn't mutated.
+- **`MAX_STEPS_PER_EPOCH` cap:** mirrored from Stage 1 so a 30 GB dataset
+  doesn't make individual epochs unbounded.
+- **Gradient-norm spike skip:** if the pre-clip grad norm exceeds 10, the
+  optimizer step is skipped (and the scheduler/EMA tick is also skipped via
+  a `did_step` flag — otherwise a spike-skipped batch would silently consume
+  a scheduler tick).
+
+### Inference TTA — `RooftopClassifier.predict`
+
+3 scales × up to 8 folds = up to 24 passes:
+
+| Scale | Crop behaviour | Why |
+|---|---|---|
+| 0.875 × | Reflect-pad then resize to 224 × 224 | Shows wider context around the building (eaves, surroundings) |
+| 1.0 × | Base crop | Reference view |
+| 1.25 × | Centre-crop then resize | Zooms into fine texture (RCC grit, tile ridges) |
+
+All folds for a scale are stacked into one forward; `tta_chunk=128` caps
+images per kernel call.
 
 ### Per-class confidence thresholds
 
-If the model's max-probability falls below the threshold for the predicted class, the prediction is overridden to "Other":
+If the predicted-class probability is below its class threshold, the
+prediction is overridden to **`Other`**:
 
 | Class | Threshold | Reasoning |
 |---|---|---|
-| RCC | 0.45 | Most visually distinctive — concrete slab is unambiguous |
-| Tiled | 0.55 | Commonly confused with Tin at glancing angles |
-| Tin | 0.50 | Moderate — metallic sheen is usually clear |
-| Other | 0.40 | Catch-all; being permissive here reduces missed buildings |
-
-*(Was a single blanket 0.55 for all classes — now per-class)*
+| RCC | 0.45 | Most visually distinctive (slab) — confidence is reliable |
+| Tiled | 0.55 | Often confused with Tin at glancing angles — be strict |
+| Tin | 0.50 | Metallic sheen usually clear — moderate threshold |
+| Other | 0.40 | Catch-all; permissive to reduce missed buildings |
 
 ### Inference flow
 
-1. Load `building.shp` produced by Stage 1
-2. For each polygon: compute bbox in pixel space, add 15% padding, crop from ortho
-3. Skip polygons smaller than `min_crop_px=40` px
-4. Resize crop to 224×224, apply val transforms
-5. Batch in groups of 64, run through classifier with 24-fold TTA
-6. Apply per-class threshold
-7. Write results back to `building_rooftop.shp`
+1. Load `{prefix}_building.shp` produced by Stage 1.
+2. For each polygon: bbox in pixel space, add 15 % padding, crop from ortho.
+3. Skip polygons smaller than `min_crop_px = 40 px`.
+4. Resize crop to 224 × 224 with `INTER_LINEAR`, apply val transforms.
+5. Batch in groups of 64; run with up to 24-fold TTA.
+6. Apply per-class threshold; write `{prefix}_building_rooftop.shp`.
 
 ---
 
-## 7. Stage 2B — Infrastructure Detection
+## 8. Stage 2B — Infrastructure Detection
 
-### Model: `models/stage2_models.py → InfrastructureDetector`
+### Backend (`models/stage2_models.py → InfrastructureDetector`)
 
-**Backend:** **YOLOv9e-OBB** (Oriented Bounding Box variant) via `ultralytics`.
-Falls back to standard YOLOv9e if OBB weights unavailable.
-Falls back to Faster R-CNN (torchvision) if ultralytics not installed.
+**Primary:** `YOLOv11l` (axis-aligned) via `ultralytics`.
+Falls back to torchvision `fasterrcnn_resnet50_fpn_v2` if `ultralytics` is
+missing.
 
-**Why OBB:** Infrastructure objects (transformers on poles, tanks) have irregular orientations. OBB preserves orientation, avoids the large enclosing-rectangle problem of axis-aligned boxes.
+**Why YOLOv11l over YOLOv9e (previous choice):**
+- ~2× faster at parity COCO accuracy (25 M params vs 58 M)
+- C2PSA attention block gives a small but consistent recall lift on small
+  objects (wells ~15 px, transformers ~30 px)
+- Frees ~2.5 GB VRAM at imgsz=1280 → `batch_size` doubled from 2 to 4 on the A4000
+- Actively maintained in `ultralytics`; YOLOv9-OBB was never a first-party
+  release and we were silently falling back to AABB anyway
 
-**SAHI (Slicing Aided Hyper Inference):**
-- Input tiles are 1280px; SAHI additionally slices into 640px sub-tiles with 40% overlap
-- Sub-tile results merged with `NMM` (Non-Maximum Merging, threshold 0.50)
-- Also runs standard full-tile prediction alongside sliced prediction
-- Critical for detecting small objects (well pumps, ~1m diameter at 5cm/px GSD)
+**Why AABB, not OBB:** the three target classes are rotationally symmetric
+(circular wells, circular/square tanks) or near-square from a top-down drone
+view. The angle parameter is mathematically undefined for circles and
+4-way ambiguous for squares, so OBB regression on these objects is wasted
+capacity at best and noisy at worst. AABB outputs Point centroids via
+`detections_to_shapefile`, which is what GIS users actually want for an
+infrastructure inventory layer. `cfg["obb_model_variant"]` is retained as a
+no-op fallback in case OBB is ever re-enabled for a different class set.
 
-**Per-class confidence thresholds:**
+### SAHI — Slicing Aided Hyper Inference
 
-| Class | Threshold | Notes |
+| Knob | Value | Why |
 |---|---|---|
-| transformer | 0.20 | Electric transformers are large and distinctive |
-| overhead_tank | 0.12 | Tanks vary in size; moderate threshold |
-| well | 0.10 | Very small objects; was 0.03 (extreme false positive rate) |
+| Tile size (outer) | 1280 px | Matches YOLO training resolution |
+| Tile overlap | 512 px | Big enough that any 100 px object sits fully inside at least one tile |
+| Slice size (SAHI inner) | **512 px** | Smaller slices = better small-object recall at the cost of more forward passes |
+| Slice overlap | **45 %** | High overlap so transformer-on-edge / well-on-edge is fully seen by at least one slice |
+| Postprocess | `NMM` (Non-Maximum Merging, threshold 0.50) | Merges duplicates from overlapping slices instead of suppressing |
+| Standard pred too | `True` | Runs full-tile pred *alongside* sliced pred; ensemble |
 
-**Soft-NMS Gaussian (σ=0.5):**  
-Instead of hard-suppressing overlapping boxes, decays their scores: `score *= exp(-IoU²/σ)`.  
-Preserves two legitimate transformers on adjacent poles (which hard NMS would drop).  
-σ=0.5 is the paper's recommended value. Was σ=0.9 (barely any suppression).
+### Per-class confidence thresholds
 
-**Context-gated tiling:**  
-Before running detection on a 1280px tile, checks if that tile intersects any building or road polygon (with a 64px buffer). Tiles with no nearby structures are skipped entirely. On village orthos this skips 40–70% of tiles.
+| Class | Threshold | Why |
+|---|---|---|
+| transformer | 0.20 | Large, distinctive — confidence is high; threshold high to suppress lookalikes (boxes/junction-boxes) |
+| overhead_tank | 0.12 | Tank sizes vary widely; moderate threshold |
+| well | 0.10 | Tiny objects (~15–30 px); a too-strict threshold misses them all |
+
+The minimum of these is what's actually passed to YOLO as `conf=`, then the
+per-class threshold is applied as a post-filter.
+
+### Soft-NMS Gaussian
+
+Hard NMS would drop a legitimate second transformer if it overlapped IoU > 0.45
+with the first one — common in dense settlements with cluster-mounted DTs.
+Soft-NMS decays the score instead: `score *= exp(−IoU² · (1/σ))`.
+
+**`soft_nms_sigma = 0.40`** — sharper Gaussian decay than the paper default
+0.5, which we found helps closely-spaced small objects (wells, transformers)
+keep their score against neighbours. Implemented in numpy on CPU because the
+algorithm is sequential and per-step costs are tiny — a GPU implementation
+adds one `.item()` sync per step (one per detection) for no gain.
+
+### Context-gated tiling
+
+Before running YOLO on a 1280 px tile, the tile bbox is intersected with the
+pre-built `STRtree` of building/road polygons (from Stage 1, buffered by
+`context_buffer_px = 128 px`). If no intersection, the tile is skipped
+entirely. STRtree gives O(log N) per query vs O(N) for naive intersection.
+
+In a rural village ortho this skips 40–70 % of tiles — the largest single
+inference-time saving across the pipeline.
+
+### YOLO training (Stage 2B)
+
+`train_stage2b()` in `train/train_stage2.py` calls `YOLO.train(...)` with:
+
+| Setting | Value | Reason |
+|---|---|---|
+| `imgsz` | 1280 | Matches inference tile size |
+| `batch` | 4 | YOLOv11l at 1280 px fits batch=4 on the A4000 with `cache='ram'` (vs 2 with the older YOLOv9e) |
+| `cache` | `ram` | Pre-decodes images once; trades RAM for I/O |
+| `epochs` | 120 | Empirically converges between 80 and 110 |
+| `cos_lr` | True | Cosine LR; smoother convergence |
+| `mosaic` | 1.0 | Always-on mosaic |
+| `close_mosaic` | 20 | Disables mosaic for the last 20 epochs so the model sees clean images before convergence (avoids mosaic-conditioned features) |
+| `mixup` | 0.15 | Light mixup |
+| `copy_paste` | 0.30 | Strong copy-paste — proven mAP lift for sparse small-object datasets |
+| `flipud` | 0.5 | Aerial imagery is rotation-invariant; vertical flips are fine |
+| `multi_scale` | True | YOLO resizes within ±50 % each batch |
+| `dropout` | 0.1 | Light head dropout |
+| `amp` | True | Auto-mixed precision |
+| `workers` | `CFG.NUM_WORKERS` | Was 0 in an earlier version → serial dataloader → idle GPU |
+
+If a checkpoint exists, the script does **not** use YOLO's built-in `resume`
+because that reloads the *original* config (e.g. `coco.yaml`) instead of our
+SVAMITVA YAML. It loads the weights manually and trains fresh.
 
 ---
 
-## 8. Data Preprocessing Pipeline
+## 9. Data Preprocessing
 
 ### Entry: `data/preprocessing.py → preprocess_folder()`
 
-Handles the entire raw-data-to-training-data conversion. Key design:
+Converts raw SVAMITVA rasters + shapefiles into the training artefacts. Key
+design choices:
 
-**Memory-safe strip processing:**  
-Giant TIFs (up to 213,734 × 112,836 px = ~72 GB RGB) are never loaded in full. Instead:
-1. Read 4096-row horizontal strip RGB (~2.6 GB)
-2. Burn SHP mask for that strip (~0.9 GB)
-3. Tile the strip → save patches to disk
-4. Discard both arrays (GC)
-5. Advance to next strip
+**Strip-based memory-safe processing.** A typical SVAMITVA TIF is up to
+213 734 × 112 836 px (~72 GB RGB). Loading it whole would OOM a 32 GB box.
+Instead, per raster:
 
-Peak RAM per raster: **~3.5 GB** (safe on 32 GB).
+1. Read 4096-row horizontal strip RGB (~2.6 GB).
+2. Burn the SHP mask for that strip (~0.9 GB).
+3. Tile the strip → save 512 px patches.
+4. Discard both arrays (GC).
+5. Advance to the next strip.
 
-**STRtree spatial index:**  
-SHP geometries are loaded once per raster into a `shapely.STRtree`. Per strip, only geometries that intersect the strip bounding box are rasterised — no brute-force iteration.
+**Peak RAM per raster: ~3.5 GB.**
 
-**Parallelism:**  
-Multiple rasters processed in parallel via `ProcessPoolExecutor` (up to 5 workers, ~17 GB RAM total). Within each raster, tile writes use `ThreadPoolExecutor` (P-core count − 2).
+**STRtree spatial index.** Each raster loads its SHPs once into a `shapely.STRtree`.
+Per strip, only geometries that intersect the strip's bounding box are
+rasterised — no brute-force iteration over thousands of polygons.
 
-**Patch filtering:**  
-Tiles where foreground pixels / total pixels < `min_fg_ratio` (currently **0.01**) are dropped. This prevents training on near-empty background patches.
+**Process-level parallelism.** Multiple rasters in parallel via
+`ProcessPoolExecutor` (≤ 5 workers, ~17 GB RAM total). Within each raster,
+tile writes use a `ThreadPoolExecutor` sized to `P-cores − 2`.
 
-**Building crops (Stage 2A):**  
-Uses `rasterio.windows.Window` to read only the building bbox from the raster — never loads the full strip for crop extraction. Uses `cv2.INTER_AREA` (correct for downscaling) instead of `INTER_LINEAR`.
+**Patch filtering.** Tiles where `foreground / total < min_fg_ratio (= 0.01)`
+are dropped. Without this the training set is dominated by 99 % background
+tiles that add noise without signal.
 
-**YOLO label generation (Stage 2B):**  
-Object-centered tile strategy: each tile is centered on an infrastructure object cluster rather than grid-snapped. Class-specific bounding box sizes: transformer=100px, tank=80px, well=40px. Negative tile sampling (30% of positive count) teaches YOLO what non-infrastructure looks like.
+**Building crops (Stage 2A).** Uses `rasterio.windows.Window` to read only the
+building's bounding box from disk — never loads the full strip just to extract
+one crop. Uses `cv2.INTER_AREA` for downscaling (the only correct OpenCV
+interpolation when shrinking).
 
-**Normalisation (`_to_uint8`):**  
-Preprocessing's `_to_uint8` also uses percentile stretch (2nd–98th, excluding zero pixels). Zero pixels are excluded from percentile computation to avoid no-data areas compressing the valid range.
+**YOLO label generation (Stage 2B).** Object-centred tile strategy — each tile
+is centred on an infrastructure cluster rather than grid-snapped. Class-specific
+half-widths: `transformer=100`, `tank=80`, `well=40` px. **Negative tile
+sampling** at 30 % of positive count teaches YOLO what non-infrastructure
+looks like.
 
----
-
-## 9. Training Pipeline
-
-### Stage 1: `train/train_stage1.py`
-
-**Optimiser:** **SAM (Sharpness-Aware Minimization)** wrapping AdamW.  
-SAM finds flatter loss minima, which generalise better. It does two forward+backward passes per step. With Unet/MiT-B4, the code keeps the encoder fixed and only reduces batch size on low-VRAM GPUs.
-
-**Layer-wise learning rates:**
-- Encoder (MiT-B4): `lr × 0.1 = 2e-5` — fine-tunes pretrained features gently
-- Decoder: `lr = 2e-4` — trains from scratch aggressively
-
-**Scheduler:** OneCycleLR (`pct_start=0.1`, `div_factor=25`, `final_div_factor=1e4`)
-
-**SWA (Stochastic Weight Averaging):**  
-Starts at epoch 75% of total. Maintains a running average of model weights. At the end of training, SWA BN statistics are updated with one pass over the training data. SWA checkpoint saved separately as `stage1_swa.pth`. SWA typically gives +0.5–1.5 mIoU over the best single checkpoint.
-
-**EMA (Exponential Moving Average):**  
-`decay=0.9998`. EMA shadow is applied for validation each epoch (then restored for training). Best checkpoint saves EMA weights, not raw weights.
-
-**Multi-scale training:**  
-50% of batches are randomly resized to one of `(0.5×, 1.0×, 1.5×)` then resized back to 512px. Builds scale invariance without storing multiple patch sizes.
-
-**CutMix augmentation:**  
-20% probability per batch. Applied at the image+mask level (mask is cut simultaneously with the image region).
-
-**Data augmentation (Albumentations):**
-- Multi-scale crop (256/512/768px → resize to 512px)
-- D4 symmetry (H-flip, V-flip, rot90, transpose)
-- Random brightness/contrast, HSV jitter, CLAHE, gamma
-- Random fog (simulate haze): 15% probability
-- Gaussian noise, blur, motion blur, median blur: 35%
-- Elastic transform, perspective, grid distortion: 40%
-- Coarse dropout (tree canopy occlusion): 35%
-- ImageNet normalisation (mean/std)
-
-**Stratified train/val split:**  
-Patches are sorted by foreground ratio into 4 quartile strata, then each stratum is split 85/15. This ensures the validation set reflects the full difficulty distribution (not just easy low-foreground tiles).
-
-**Early stopping:** patience=18 epochs. Decision broadcast from rank-0 in DDP mode.
-
-**DDP support:** Fully implemented via `utils/ddp.py`. Launch with `train/launch_ddp.py`. Single-GPU falls through to standard training with no code changes.
-
-**Gradient checkpointing:** Enabled on MiT-B4 encoder if supported (`model.encoder.set_grad_checkpointing(True)`).
-
-**Gradient clipping:** `clip_grad_norm_(1.0)`. Skips optimizer step if norm > 10.0 (spike guard).
-
-### Stage 2A: `train/train_stage2.py`
-
-**Optimiser:** SAM + AdamW, `lr=5e-5`.  
-**Augmentation:** RandAugment (n=2, m=7) + ColorJitter + shadow + fog + sun flare.  
-**MixUp + CutMix:** Applied during training to reduce overfitting on small rooftop datasets.  
-**ArcFace training:** `forward_train()` passes labels to the ArcFace head so the angular margin is applied during training; `forward()` (inference) passes `labels=None` → returns scaled cosine logits.
-
-### Stage 2B: `run_stage2b.py`
-
-Wraps `InfrastructureDetector.train()` which calls `YOLO.train()` with all config parameters. Supports OBB mode. Uses YOLOv9e-OBB with aggressive copy-paste (0.30), mosaic (1.0), and HSV augmentation.
+**`_to_uint8` normalisation.** 2nd–98th percentile per-channel stretch, with
+**zero pixels excluded from percentile computation** so no-data regions don't
+compress the valid radiometric range.
 
 ---
 
-## 10. Inference Pipeline
+## 10. Training Pipeline
+
+### Stage 1 — `train/train_stage1.py`
+
+**Optimiser stack:**
+- `AdamW(parameter_groups, lr=2e-4, weight_decay=1e-4)`
+- Parameter groups: encoder (`lr × 0.1 = 2e-5`) vs decoder (`lr = 2e-4`),
+  each split into `weight_decay` / `no_decay` for biases & norm weights.
+- **SAM** wrapper available but **`use_sam=False`** by default for Stage 1.
+  SAM is disabled because (a) it doubles per-step cost, (b) it forces
+  `grad_accum=1`, which on the current 4 × 8 = 32 effective batch would
+  drop us to a 4-sample effective batch unless `batch_size` is also raised.
+  Enable only after Stage 1 training has stabilised and you have budget
+  for a final SAM polish pass.
+
+**Schedule:** `OneCycleLR(max_lr=per-group, pct_start=0.15, div_factor=25, final_div_factor=1e4)`.
+`steps_per_epoch` is computed from `min(len(train_loader), MAX_STEPS_PER_EPOCH) / grad_accum`
+so the schedule still terminates correctly when the cap is active.
+
+**Effective batch:** `batch_size × grad_accum = 4 × 8 = 32`.
+*Why 4×8 and not 8×4?* Same effective batch, but 4×8 halves the peak
+activation memory — leaving headroom for SAM later and tolerating the
+absence of `set_grad_checkpointing` on MiT encoders in `smp`.
+
+**Multi-scale training:** 50 % of batches are randomly resized to one of
+`ms_scales = (0.75, 1.0, 1.25)`. The resize is done with `F.interpolate`
+*outside* the autocast context — the original wrapped it inside, forcing a
+needless downcast/upcast through the bf16 pipeline.
+
+**CutMix:** 20 % per-batch probability, applied at image+mask level. The mask
+gets cut simultaneously. Skipped the unnecessary B×C×H×W clones — advanced
+indexing already materialises a fresh tensor for the source slice.
+
+**EMA:** decay 0.9998, on-GPU shadow buffers updated via
+`torch._foreach_lerp_` (one fused kernel instead of N per parameter).
+**Validation is wrapped in `try/finally`** so a `_validate` crash can't leave
+the model swapped to EMA weights — the next training step would otherwise
+`optimiser.step()` on EMA weights and feed those right back through `ema.update`.
+
+**SWA:** `use_swa=True` from epoch `int(80 × 0.75) = 60`. At end of training,
+SWA BN statistics are updated with one pass over the train loader. Final
+SWA checkpoint saved as `stage1_swa.pth`. SWA typically gives +0.5–1.5 mIoU
+over the single best checkpoint.
+
+**Stratified train/val split.** Patches are sorted by foreground ratio into 4
+quartile strata, then each stratum is split 85/15. This guarantees the
+validation set reflects the full difficulty distribution rather than only easy
+near-empty tiles. Mask reads use a `ThreadPoolExecutor` because they are
+I/O-bound and OpenCV releases the GIL.
+
+**Gradient clipping + spike guard:** `clip_grad_norm_(1.0)`; if the pre-clip
+norm exceeds 10, the optimizer step is *skipped* and the scaler is updated
+defensively. With bf16 the scaler is `None` so this is just `torch.*` ops.
+
+**Validation TTA cadence:** `VAL_TTA_EVERY = 2` — full TTA every other epoch.
+On non-TTA epochs validation uses a single forward (5–6× faster). The
+best-checkpoint picker still sees high-fidelity signal half the time.
+
+**GPU-side confusion matrix.** Validation accumulates a `(C, C)` int64 tensor
+on the device via `torch.bincount(C·t + p, minlength=C²).reshape(C, C)`, then
+does **one** CPU transfer at the end. The earlier code did a per-batch
+`.cpu().numpy()` round-trip.
+
+**Best/last checkpoint policy.**
+- **Best**: only EMA weights + tiny metadata. Tiny file.
+- **Last**: full model state + EMA + scheduler state every epoch, but the
+  heavy optimizer state (~2× model size) only every 5 epochs. AdamW moments
+  re-warm in a few steps, so this is a fair I/O tradeoff. Scheduler state is
+  ~1.7 KB and is **always** saved — losing it would reset OneCycleLR back to
+  warmup on resume.
+
+**Early stop:** `patience = 18`. Decision broadcast from rank-0 in DDP so
+worker ranks don't hang waiting for a step that won't come.
+
+**DDP:** `utils/ddp.setup_ddp()` checks `WORLD_SIZE`; single-GPU is a no-op.
+`make_loader` injects `DistributedSampler` automatically when DDP is on.
+`set_epoch` is called every epoch for proper per-epoch shuffle.
+
+**Post-validation `empty_cache()`:** TTA mega-batches (n_augs × B per scale)
+leave the cached allocator full of large blocks that don't fit the next
+training batch's shape. We release reserved-but-unused blocks before the
+next epoch so peak fragmentation doesn't compound.
+
+### Stage 2A — `train_stage2a()` in `train/train_stage2.py`
+
+Same overall structure as Stage 1, with these specifics:
+
+- **Optimiser:** AdamW + SAM (`use_sam=True`, `rho=0.05`, `adaptive=True`).
+- **Schedule:** `SequentialLR(LinearLR warmup, CosineAnnealingWarmRestarts(T_0=⅓ of remaining))`.
+- **Augmentation:** RandAugment, ColorJitter, RandomShadow, RandomFog,
+  RandomSunFlare. Per-crop instance normalisation in `RooftopDataset` equalises
+  brightness across villages with different sun angles.
+- **MixUp + CutMix:** randomly chosen per batch (50/50). The combined-loss
+  trick (one forward pass, two CE evaluations against `ya` and `yb`) keeps
+  activation memory low.
+- **VRAM auto-guard (NEW):** matches Stage 1's behaviour on ≤16.5 GB cards.
+- **MAX_STEPS_PER_EPOCH cap (NEW):** parity with Stage 1.
+- **Gradient-norm spike skip (NEW):** parity with Stage 1; the `did_step`
+  flag prevents scheduler/EMA from advancing on a skipped step.
+
+### Stage 2B — `train_stage2b()` in `train/train_stage2.py`
+
+Thin wrapper around `YOLO.train(...)` (see Stage 2B section above).
+`_write_yolo_yaml()` dynamically scans the dataset for present infrastructure
+classes; it **keeps the configured class-name order** because YOLO label ids
+were generated against `cfg["class_names"]` — sorting detected classes would
+silently swap class ids.
+
+### DDP
+
+```bash
+torchrun --nproc_per_node=2 train/launch_ddp.py
+```
+
+Only Stage 1 is DDP-aware in the current code. Stage 2A and 2B run on a
+single GPU.
+
+---
+
+## 11. Inference Pipeline
 
 ### Entry: `inference/pipeline.py → GeoIntelPipeline`
 
-**Constructor:** Loads all three models once. Applies `channels_last` memory format to ConvNeXt (15–25% NHWC throughput gain on Ampere). torch.compile disabled on Windows (no Triton).
+**Constructor:**
+- Loads all three models once.
+- `channels_last` applied to both Stage 1 and Stage 2A (15–25 % NHWC gain on Ampere).
+- `torch.compile` disabled by default (`COMPILE_ENABLED=False` because Triton is unavailable on Windows).
+- Caches the cosine blending window once (originally recomputed every call).
 
-**`run(tif_path, out_dir)`** orchestrates the full pipeline:
+**`run(tif_path, out_dir)`:**
 
 ```
-1. Open TIF → read RGB bands → _to_uint8 (percentile normalise)
-2. Stage 1: _segment() → prob_map (C, H, W) float32
-3. Optional CRF refinement on prob_map
+1. Open TIF (or ECW → auto-convert to TIF) → read RGB → _to_uint8
+2. _segment() → prob_map (C, H, W) float32
+3. Optional DenseCRF refinement
 4. argmax → seg_mask (H, W) uint8
-5. Morphological cleanup → seg_mask
-6. Save seg_mask → {prefix}_segmask.tif
-7. Vectorise → {prefix}_building.shp, _road.shp, _waterbody.shp, _all_features.gpkg
-8. Stage 2A: _classify_rooftops() using building.shp
-   → merge labels → {prefix}_building_rooftop.shp
-9. Stage 2B: _gather_context_polygons() → _detect()
-   → {prefix}_infrastructure.shp
+5. Morphological cleanup
+6. Write {prefix}_segmask.tif (fallback to timestamped path if QGIS holds the file)
+7. mask_to_shapefile → per-class .shp + combined .gpkg
+8. _classify_rooftops() using building.shp → merge → _building_rooftop.shp
+9. _gather_context_polygons() → _detect() → _infrastructure.shp
 ```
 
-**Fallback on file lock:** If `_segmask.tif` can't be written (e.g. open in QGIS), writes to a timestamped fallback path rather than crashing.
+**ECW handling:** `utils/ecw_compat.is_ecw / ecw_to_tif` runs at the start. It
+tries (in order): the native rasterio ECW driver → OSGeo4W `gdal_translate` →
+QGIS-bundled `gdal_translate` → `osgeo.gdal` Python bindings. Result is
+written to a `tempfile.TemporaryDirectory` that's cleaned up at the end.
 
-**Batch inference:** `infer_folder.py` loads models once, then runs `.run()` on every `.tif`/`.tiff` in a directory tree.
+**`_segment()` tiling:**
+- 512 px patches, 128 px overlap, batch=16.
+- Edge patches reflect-padded via `cv2.copyMakeBorder` before transform (a small
+  redundancy: the val transform also pads via `A.PadIfNeeded`, but with
+  identical reflect semantics, so it's a no-op).
+- Output blended via the cached cosine window; final divide by `count_map`.
+
+**`_classify_rooftops()`:**
+- Reuses the building GDF the caller already loaded (the original ignored the
+  passed argument and re-read the SHP per call — non-trivial on 10K+
+  buildings).
+- Iterates with `gdf.geometry.values + index.to_numpy()` instead of
+  `iterrows()` to avoid building a fresh Series per row.
+
+**`_detect()` (Stage 2B):**
+- Builds the STRtree once.
+- Hands YOLO the BGR ndarray directly. The earlier path JPEG-encoded the
+  patch, wrote it to a temp file, made YOLO re-read it, then deleted the
+  file — per tile. Three disk I/Os + a lossy round-trip in the inference
+  path, removed.
+- Soft-NMS applied per class at the end.
+
+**`clear_cuda_cache()` between stages** — Stage 2A's ConvNeXt-L blocks would
+otherwise sit in the allocator while YOLO tries to grab its own 1280 px
+tensors. Released so Stage 2B starts on a defragmented heap.
 
 ---
 
-## 11. Post-Processing
+## 12. Post-Processing
 
-### File: `utils/postprocess.py`
+### `utils/postprocess.py`
 
-**`apply_dense_crf()`:** Tiled CRF (2048px tiles, 256px overlap, cosine blending). Runs serially (one tile at a time) to avoid multiprocessing issues on Windows with pydensecrf.
-
-**`clean_segmentation_mask()`:** Per-class morphological pipeline + watershed building separation (detailed in Stage 1 section).
-
-**`mask_to_shapefile()`:** Rasterises each class layer, fixes topology with `shapely.make_valid`, simplifies polygons (`tolerance=0.5`), explodes multi-part features, filters by minimum area per class (building: 80px, road: 120px, waterbody: 160px). Saves per-class SHP and combined GeoPackage.
-
-**`merge_rooftop_labels()`:** Joins Stage 2A predictions back to the building GeoDataFrame as a `roof_pred` attribute column.
-
-**`detections_to_shapefile()`:** OBB detections → rotated rectangle polygons in geo-space. Standard-box detections → centroid points. Preserves the orientation angle from the YOLO OBB output.
-
-**`clean_vector_geometries()`:** Fixes invalid geometries, simplifies, explodes multipart, filters by area, removes invalid results.
+| Function | What it does | Notes |
+|---|---|---|
+| `apply_dense_crf` | Tiled CRF (1024 px tiles, 128 px overlap, cosine blend, up to `CRF_WORKERS` processes) | Falls back to identity if `pydensecrf` unavailable; falls back to serial if multiprocessing fails (Windows + pydensecrf can be flaky) |
+| `clean_segmentation_mask` | Per-class morphology + watershed building separation | Detailed in Stage 1 section |
+| `separate_touching_buildings` | Distance transform → `peak_local_max` → marker-controlled watershed | Falls back to identity if scipy/skimage missing |
+| `mask_to_shapefile` | Rasterise each class layer → fix topology → simplify → explode → area-filter → write `.shp` per class + combined `.gpkg` | Skips background (class 0) |
+| `clean_vector_geometries` | `make_valid` → simplify → explode multipart → drop sub-area polygons → drop invalid | Used by `mask_to_shapefile` internally |
+| `merge_rooftop_labels` | Join Stage 2A predictions into the building GDF as `roof_pred` attribute | Output: `_building_rooftop.shp` |
+| `detections_to_shapefile` | OBB → rotated rectangle polygons in geo-space; axis-aligned → centroid Points | Preserves YOLO OBB angle (clockwise pixel space → counter-clockwise geo space) |
 
 ---
 
-## 12. Utilities Reference
+## 13. Utilities Reference
 
 ### `utils/hardware.py`
 
-- `setup()`: Configures CUDA, TF32, cuDNN benchmark, Flash Attention (SDPA), OMP/MKL thread counts for i9-13900K (8 P-cores pinned).
-- `EMA`: Exponential Moving Average. `apply_shadow()` swaps model to EMA weights; `restore()` swaps back.
-- `compile_model()`: Wraps `torch.compile` with try/except. Disabled on Windows.
-- `to_channels_last()`: Converts a module to NHWC memory layout (for ConvNeXt).
-- `cl_input()`: Converts an input tensor to `channels_last` contiguous.
-- `get_amp_context()`: Returns appropriate `torch.amp.autocast` context for the dtype (bfloat16/float16/float32).
-- `vram_stats()`: Returns GPU name + allocated/reserved VRAM string.
+| Symbol | Purpose |
+|---|---|
+| `setup(seed)` | Configures CUDA flags (TF32, cudnn.benchmark, Flash SDPA), thread counts for i9-13900K (8 P-cores), GDAL env vars, allocator config, RNG seeds. Idempotent. |
+| `worker_init_fn(worker_id)` | DataLoader worker initialiser: caps PyTorch threads to 1, disables OpenCV's internal threading, pins each worker to a specific P-core (0–15). |
+| `compile_model(model, mode, fullgraph)` | `torch.compile()` with graceful fallback. `fullgraph=True` is safe for ConvNeXt (no dynamic control flow); use `False` for transformers that have conditional ops. |
+| `to_channels_last(model)` | Converts model to NHWC memory layout. |
+| `cl_input(tensor)` | Converts a 4D input tensor to `channels_last` before forward. |
+| `get_amp_context(dtype)` | Returns `(autocast_ctx, scaler)`. `scaler` is `None` for bf16 (no underflow) and a real `GradScaler` for fp16. |
+| `maybe_backward(loss, scaler)` | Safe `loss.backward()` that handles both scaler-present and scaler-absent paths. |
+| `maybe_step(opt, scaler, max_grad_norm, params)` | Optimizer step with optional grad-norm clipping; returns pre-clip norm for spike checks. |
+| `EMA` | Exponential Moving Average. Shadow weights kept on GPU. `update()` uses `torch._foreach_lerp_` (one fused kernel). `apply_shadow()` / `restore()` swap for validation. |
+| `vram_stats()` | One-liner GPU VRAM string (allocated / reserved / total). |
+| `get_cuda_streams()` | Returns two `torch.cuda.Stream` objects for H2D/compute overlap (currently unused in the live training loop). |
+| `clear_cuda_cache()` | `torch.cuda.empty_cache() + gc.collect()`. Called between stages. |
 
-### `utils/sam.py`
+### `utils/sam.py` — Sharpness-Aware Minimisation
 
-**SAM optimizer** (Sharpness-Aware Minimisation, Foret et al. 2021). Wraps any base optimizer.
+Wraps any base optimiser. Two phases per step:
 
-- `first_step()`: Perturbs weights in gradient direction (finds sharper neighborhood).
-- `second_step()`: Computes gradient at perturbed point, takes actual optimizer step.
-- Fixed for PyTorch 2.x: uses `param_groups[i]["defaults"]` pattern (replaced old `_defaults` access).
+1. **`first_step`** — compute gradient norm, scale a worst-case perturbation by
+   `rho / (grad_norm + ε)`, add to weights. Persistent `old_p` buffers per
+   parameter (allocated once, reused) and `torch._foreach_*` ops fold N
+   per-parameter kernel launches into 1.
+2. **`second_step`** — restore original weights, take the real optimizer step.
+
+Incompatibilities (enforced at config-load time):
+- **SAM + fp16 GradScaler** is forbidden — SAM's two-step protocol needs
+  mid-step unscale + rescale which `GradScaler`'s public API doesn't
+  expose. Use bf16 (default).
+- **SAM forces `grad_accum=1`** — both forwards must be over the same batch.
 
 ### `utils/ddp.py`
 
-Distributed Data Parallel helpers:
-- `setup_ddp()`: Initialises `dist.init_process_group` if `WORLD_SIZE > 1`.
-- `wrap_ddp()`: Wraps module in `DistributedDataParallel` if enabled.
-- `make_loader()`: Adds `DistributedSampler` automatically when DDP is active.
-- `is_main_process()`: True only on rank 0 (controls logging/checkpointing).
-- `set_epoch()`: Calls `sampler.set_epoch()` for proper per-epoch shuffle in DDP.
-- `cleanup_ddp()`: Calls `dist.destroy_process_group()`.
+| Symbol | Purpose |
+|---|---|
+| `setup_ddp(seed)` | Initialises `dist.init_process_group` if `WORLD_SIZE > 1`; backend = `nccl` on Linux/CUDA, else `gloo`. Returns a `DDPState`. |
+| `wrap_ddp(model, state)` | `DistributedDataParallel` with `device_ids=[local_rank]` when CUDA. No-op when DDP off. |
+| `make_sampler` | Returns `DistributedSampler` or `None`. |
+| `make_loader` | DataLoader factory that wires the sampler in automatically. |
+| `set_epoch(loader, epoch)` | Calls `sampler.set_epoch()` for proper per-epoch shuffle. |
+| `is_main_process(state)` | True only on rank 0 (gates logging / checkpoint writes). |
+| `cleanup_ddp()` | `dist.destroy_process_group()` if initialised. |
 
 ### `utils/checkpointing.py`
 
-**`atomic_torch_save()`:** Saves to a `.tmp` file first, then `os.replace()`. Prevents corrupt checkpoints on crash mid-write.
+**`atomic_torch_save(payload, path)`** — writes to `path.tmp`, `fsync`s, then
+`os.replace`s. Prevents corrupt half-written checkpoints on crash mid-save.
 
 ### `utils/metrics.py`
 
-**`SegmentationMetrics`:** Accumulates confusion matrix, computes per-class IoU, F1, mean IoU, pixel accuracy.  
-**`ClassificationMetrics`:** Accuracy, macro F1, per-class precision/recall/F1.
+| Symbol | Purpose |
+|---|---|
+| `SegmentationMetrics` | Accumulates confusion matrix; computes per-class IoU/F1, mean IoU (foreground only, excludes class 0), pixel accuracy, foreground pixel accuracy |
+| `compute_map` | VOC/COCO mAP: per class, per IoU threshold (default 0.5:0.05:0.95 + 0.5 separately) |
+| `_box_iou`, `_voc_ap` | Helpers |
+
+(`ClassificationMetrics` was removed — `_val_clf` uses `sklearn.metrics.classification_report` directly, the class had no callers.)
 
 ### `utils/logger.py`
 
-- `get_logger(name)`: Returns a configured logger with timestamps.
-- `crash_logged(log, context)`: Context manager; catches all exceptions, logs traceback + context, re-raises.
+| Symbol | Purpose |
+|---|---|
+| `configure_logging` | One-time configure: stdout handler, optional `LOG_FORMAT=json` for structured logs, optional file handler |
+| `get_logger(name)` | Configured logger; idempotent |
+| `crash_logged(log, action)` | Context manager: catches all exceptions, logs traceback + action context, re-raises. Optional `on_crash` recovery callback |
+| `JsonFormatter` | Stable-key JSON output for downstream parsing |
+| `format_exception` | One-line traceback formatter |
+
+(`log_event` was removed — never called anywhere.)
 
 ### `utils/window.py`
 
-**`cosine_window(size, overlap, power)`:** Shared cosine taper utility used by both `_segment()` (Stage 1 tile blending) and `apply_dense_crf()` (CRF tile blending). Power=2 gives smooth C¹-continuous taper.
+**`cosine_window(size, overlap, power)`** — single source of truth for the
+2-D cosine taper. Used by both Stage 1's `_segment()` and the DenseCRF tiler.
+`power=2` gives a smooth C¹-continuous taper; no visible tile seams.
+
+### `utils/ecw_compat.py`
+
+ECW → GeoTIFF auto-conversion. Cascade of strategies:
+
+1. Native rasterio ECW driver (rare — requires Hexagon-SDK-licensed GDAL build).
+2. OSGeo4W `gdal_translate.exe` (recommended on Windows).
+3. QGIS bundled `gdal_translate.exe`.
+4. `osgeo.gdal` Python bindings.
+
+Raises a clear `RuntimeError` with install instructions if all four fail.
 
 ---
 
-## 13. Entry Points
+## 14. Entry Points
 
 | Script | Purpose | Usage |
 |---|---|---|
-| `inference/pipeline.py` | Single-image inference | `python inference/pipeline.py --tif path.tif --out ./out` |
-| `infer_folder.py` | Batch inference on a directory | `python infer_folder.py --test_folder ./test_images --out_folder ./results` |
-| `train/train_stage1.py` | Train Stage 1 segmentation | `python train/train_stage1.py` |
-| `train/train_stage2.py` | Train Stage 2A classifier | `python train/train_stage2.py` |
-| `run_stage2b.py` | Train Stage 2B YOLO detector | `python run_stage2b.py` |
-| `train/launch_ddp.py` | Multi-GPU training launcher | `torchrun --nproc_per_node=N train/launch_ddp.py` |
-| `export_models.py` | Export to ONNX / TorchScript | `python export_models.py` |
-| `gui.py` | Desktop operator console | `python gui.py` |
+| `run_pipeline.py` | Master CLI | `python run_pipeline.py --mode {preprocess,train_stage1,train_stage2,train_all,evaluate,infer,all} [--data_root DIR] [--tif FILE] [--out DIR]` |
+| `inference/pipeline.py` | Single-image inference | `python inference/pipeline.py --tif file.tif --out ./out` |
+| `infer_folder.py` | Batch inference on a folder | `python infer_folder.py --test_folder ./test --out_folder ./results` |
+| `train/train_stage1.py` | Stage 1 training (standalone) | `python train/train_stage1.py` |
+| `train/train_stage2.py` | Stage 2A / 2B training | `python train/train_stage2.py --stage {2a,2b,both}` |
+| `train/launch_ddp.py` | Multi-GPU launcher | `torchrun --nproc_per_node=N train/launch_ddp.py` |
+| `run_stage2b.py` | Stage 2B standalone runner | `python run_stage2b.py` |
+| `export_models.py` | ONNX / TorchScript export | `python export_models.py` |
+| `gui.py` | Desktop operator console | `python gui.py` (or `launch_gui.bat`) |
+| `_setup_verify.py` | Post-install smoke test | `python _setup_verify.py` |
+| `build.py` | PyInstaller binary build | `python build.py` |
 
 ---
 
-## 14. GUI — Operator Console
+## 15. GUI — Operator Console
 
-**File:** `gui.py`  
-**Framework:** PyQt6 + Matplotlib  
-**Theme:** Custom Geo-Intel dark/light palette with animated elements
+**File:** `gui.py` (~2100 LOC)
+**Framework:** PyQt6 + Matplotlib + OpenCV
+**Theme:** custom dark/light palette with animated indicators
 
-### Tabs
+**Tabs:**
 
-**Pipeline Runner tab:**
-- Checkpoint file pickers (Stage 1/2A/2B)
-- Input TIF picker
-- Output directory picker
-- Run button → launches `inference/pipeline.py` as a `QProcess` subprocess
-- Live log output with ANSI colour stripping and scrolling
-- Progress bar driven by log line patterns
+- **Pipeline Runner** — checkpoint pickers (S1/S2A/S2B), input TIF/ECW picker,
+  output dir picker. Run button launches `inference/pipeline.py` as a
+  `QProcess` subprocess (so the GUI itself doesn't need CUDA). Live log
+  output with ANSI stripping; progress bar driven by log patterns.
+- **Map Viewer** — opens the output segmentation mask TIF, renders with the
+  4-class colour overlay (background black, building red, road grey, water
+  blue). OpenCV decoded into a Matplotlib canvas; zoom/pan.
+- **Results** — reads the `_all_features.gpkg` and displays per-class feature
+  counts and class-distribution table.
+- **Requirements** — checks Python deps and reports what's missing.
 
-**Map Viewer tab:**
-- Opens the output segmentation mask TIF
-- Displays with colour-coded overlay (building=red, road=grey, water=blue)
-- OpenCV-based rendering in a Matplotlib canvas
-- Zoom/pan controls
-
-**Results tab:**
-- Shapefile statistics table (feature counts, class distributions)
-- Reads the `_all_features.gpkg` GeoPackage from the output directory
-
-The GUI calls `infer_folder.py` or `inference/pipeline.py` as a subprocess, so it does not need GPU resources itself and can run on any machine.
+The GUI is decoupled from GPU resources: it calls `inference/pipeline.py` or
+`infer_folder.py` via `QProcess` so it can run on any machine while training
+runs elsewhere.
 
 ---
 
-## 15. Configuration Reference
+## 16. Configuration Reference
 
-All configuration lives in `config.py`. Below are the current values with explanations.
+All values below are from the **current `config.py`**. Sections in the same
+order as the source file.
 
 ### Paths
-```python
-ROOT        = Path(__file__).parent
-DATA_ROOT   = ROOT / "dataset"
-PATCH_DIR   = DATA_ROOT / "patches"          # 512px seg training tiles
-MASK_DIR    = DATA_ROOT / "patch_masks"       # class masks
-CROP_DIR    = DATA_ROOT / "building_crops"    # Stage 2A crops
-YOLO_DIR    = DATA_ROOT / "yolo_infra"        # Stage 2B tiles
-CKPT_DIR    = ROOT / "checkpoints"
-LOG_DIR     = ROOT / "logs"
-OUT_DIR     = ROOT / "outputs/vectorized"
-TRAIN_MASKS = DATA_ROOT / "masks"
-```
 
-### Hardware
-```python
-DEVICE         = cuda / mps / cpu   # auto-detected
-AMP_DTYPE      = bfloat16           # bf16 on CUDA/ROCm Ampere+, fp16 on MPS
-COMPILE_ENABLED= False              # torch.compile disabled on Windows (no Triton)
-COMPILE_MODE   = "reduce-overhead"
-FAST_TTA       = False              # True=8 passes, False=24 passes (more accurate)
-NUM_WORKERS    = 10
-PIN_MEMORY     = True
-PREFETCH_FACTOR= 3
-```
+| Constant | Value | Purpose |
+|---|---|---|
+| `ROOT` | `<repo>` | Project root |
+| `DATA_ROOT` | `ROOT/dataset` | Raw SVAMITVA root |
+| `PATCH_DIR` | `DATA_ROOT/patches` | 512 px segmentation training tiles |
+| `MASK_DIR` | `DATA_ROOT/patch_masks` | Corresponding class masks |
+| `CROP_DIR` | `DATA_ROOT/building_crops` | Stage 2A rooftop crops, organised by class |
+| `YOLO_DIR` | `DATA_ROOT/yolo_infra` | Stage 2B tiles + YOLO labels |
+| `CKPT_DIR` | `ROOT/checkpoints` | Model checkpoints |
+| `LOG_DIR` | `ROOT/logs` | Training logs |
+| `OUT_DIR` | `ROOT/outputs/vectorized` | Inference outputs |
+| `TRAIN_MASKS` | `DATA_ROOT/masks` | Full-raster masks (preprocessing intermediate) |
 
-### Stage 1 — Segmentation
-```python
-num_classes        = 4
-class_names        = ['background', 'building', 'road', 'waterbody']
-arch               = 'Unet'
-encoder            = 'mit_b4'
-encoder_weights    = 'imagenet'
-patch_size         = 512
-patch_sizes        = (512,)
-overlap            = 128
-batch_size         = 8                 # auto-reduced on low-VRAM GPUs
-grad_accum         = 4
-lr                 = 2e-4
-encoder_lr_mult    = 0.1               # encoder LR = lr * 0.1
-weight_decay       = 1e-4
-epochs             = 80
-warmup_epochs      = 3
-# Loss weights
-dice_weight        = 0.40
-bce_weight         = 0.15
-focal_weight       = 0.15
-boundary_weight    = 0.15
-lovasz_weight      = 0.15
-touching_weight    = 0.10
-focal_gamma        = 2.0
-class_weights      = [0.30, 1.80, 4.50, 2.20]
-label_smoothing    = 0.05
-# Training tricks
-use_sam            = True
-sam_rho            = 0.05
-sam_adaptive       = True
-ms_training        = True
-ms_scales          = (0.5, 1.0, 1.5)
-use_swa            = True
-swa_lr             = 2e-5
-swa_start_frac     = 0.75
-use_ema            = True
-ema_decay          = 0.9998
-cutmix_alpha       = 1.0
-drop_path_rate     = 0.2
-val_fraction       = 0.15
-# Inference
-crf_inference      = True
-crf_iter           = 10               # iterations (was 5)
-# Data filtering
-min_fg_ratio       = 0.01             # minimum foreground fraction per patch (was 0.003)
-neg_tile_ratio     = 0.15
-# Vectorisation
-min_building_area_px          = 80
-polygon_min_area_px           = {building:80, road:120, waterbody:160}
-polygon_simplify_tolerance    = 0.5
-```
+All directories are created on import via `d.mkdir(parents=True, exist_ok=True)`.
 
-### Stage 2A — Rooftop Classification
-```python
-num_classes        = 4
-class_names        = ['RCC', 'Tiled', 'Tin', 'Other']
-arch               = 'convnext_large'
-crop_size          = 224
-min_crop_px        = 40
-batch_size         = 32
-lr                 = 5e-5
-epochs             = 150
-tta_steps          = 24
-use_arcface        = True
-arcface_s          = 30.0
-arcface_m          = 0.55            # now correctly read from config (was hardcoded 0.50)
-drop_path_rate     = 0.4
-use_ema            = True
-ema_decay          = 0.9995
-stage2a_conf_thresh= {RCC:0.45, Tiled:0.55, Tin:0.50, Other:0.40}  # per-class
-```
+### Hardware / runtime
 
-### Stage 2B — Infrastructure Detection
-```python
-class_names        = ['transformer', 'overhead_tank', 'well']
-model_variant      = 'yolov9e'
-use_obb            = True
-obb_model_variant  = 'yolov9e-obb'
-img_size           = 1280
-epochs             = 200
-conf_thresh        = 0.10
-iou_thresh         = 0.60
-max_det            = 1000
-overlap            = 512
-class_buffer_px    = {transformer:100, overhead_tank:80, well:40}
-soft_nms_sigma     = 0.5             # Gaussian decay bandwidth (was 0.9)
-agnostic_nms       = True
-use_sahi           = True
-sahi_slice_size    = 640
-sahi_overlap_ratio = 0.40
-class_conf_thresh  = {transformer:0.20, overhead_tank:0.12, well:0.10}  # well was 0.03
-neg_tile_ratio     = 0.3
-```
+| Constant | Value | Why |
+|---|---|---|
+| `DEVICE` | `cuda` / `mps` / `cpu` | Auto-detect; CUDA covers both NVIDIA and AMD ROCm (PyTorch reports both as `cuda`) |
+| `AMP_DTYPE` | `bfloat16` (CUDA) · `float16` (MPS) · `float32` (CPU) | bf16 is lossless for this workload on Ampere; MPS doesn't support bf16 in all ops |
+| `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True,max_split_size_mb:256` | Ampere-friendly allocator that grows segments on demand; eliminates long-run fragmentation from bf16 + ConvNeXt-L + TTA mega-batches. `max_split_size_mb` retained as defensive cap. |
+| TF32 matmul + cudnn | `True` | Tensor-core fast path |
+| cudnn.benchmark | `True` | Picks fastest kernel per input shape (we have fixed shapes) |
+| `COMPILE_ENABLED` | `False` | `torch.compile` needs Triton, which isn't available on Windows |
+| `COMPILE_MODE` | `"reduce-overhead"` | Lowest compile time; "max-autotune" gains ~5 % runtime at ~20 min compile cost |
+| `FAST_TTA` | `False` | Full 24-pass TTA by default; flip for dev iteration |
+| `NUM_WORKERS` | `8` | DataLoader workers (matches P-core count) |
+| `PIN_MEMORY` | `True` | Enables non-blocking H2D DMA |
+| `PREFETCH_FACTOR` | `4` | Batches prefetched per worker |
+| `PERSISTENT_WORKERS` | `True` | Workers survive across epochs (saves spawn overhead) |
+| `MAX_STEPS_PER_EPOCH` | `2000` | Caps epoch wall-clock on 30 GB+ datasets |
+| `MAX_VAL_STEPS` | `300` | Caps val time per epoch; with `shuffle=False` it's a stable signal |
+| `VAL_TTA_EVERY` | `2` | Full TTA every other epoch; faster single-forward val on the others |
+| `CRF_WORKERS` | `4` | CRF tile parallelism (CPU heavy, RAM bounded) |
 
----
+### Stage 1 — `STAGE1` dict
 
-## 16. Complete History of Improvements
+| Key | Value | Why |
+|---|---|---|
+| `num_classes` | `4` | Background + 3 foreground |
+| `class_names` | `['background', 'building', 'road', 'waterbody']` | |
+| `class_colors` | `[(0,0,0),(255,0,0),(128,128,128),(0,0,255)]` | Render palette |
+| `arch` | `'MAnet'` | Sharper boundaries than Unet on this dataset (see Stage 1 section) |
+| `encoder` | `'mit_b4'` | Strong texture features; 20 % faster than MiT-B5 |
+| `encoder_weights` | `'imagenet'` | Standard pretraining |
+| `in_channels` | `3` | RGB |
+| `decoder_attention_type` | `'scse'` | Free attention boost on skip features |
+| `patch_size` | `512` | Training and inference patch size |
+| `patch_sizes` | `(512,)` | Multi-scale training pool (currently single scale; multi-scale handled via `ms_training` instead) |
+| `overlap` | `128` | Inference tile overlap (25 % of patch) |
+| `batch_size` | `4` | With 4×8 grad-accum = effective 32 (see Stage 1 section for why 4×8 over 8×4) |
+| `grad_accum` | `8` | |
+| `lr` | `2e-4` | Decoder learning rate |
+| `encoder_lr_mult` | `0.1` | Encoder fine-tuned 10× more gently |
+| `weight_decay` | `1e-4` | AdamW WD |
+| `epochs` | `80` | Empirical convergence ≤ 60 with early stop |
+| `warmup_epochs` | `3` | (Not directly used — OneCycleLR has its own warmup via `pct_start=0.15`) |
+| `scheduler` | `'cosine'` | Annotation; actual scheduler is OneCycleLR |
+| `use_sam` | `False` | See Stage 1 → "SAM disabled" note |
+| `sam_rho` | `0.05` | Default Foret et al. value |
+| `sam_adaptive` | `True` | Adaptive (per-parameter scale by weight magnitude) |
+| `ms_training` | `True` | 50 %-prob random resize each batch |
+| `ms_scales` | `(0.75, 1.0, 1.25)` | Tighter than the textbook `(0.5, 1.0, 1.5)` — keeps batch shapes within a single VRAM budget |
+| `dice_weight` | `0.40` | Largest term — overlap is the most important target |
+| `bce_weight` | `0.15` | CE (the key in config is `bce_weight` for historical reasons) |
+| `focal_weight` | `0.15` | |
+| `boundary_weight` | `0.15` | |
+| `lovasz_weight` | `0.15` | |
+| `touching_weight` | `0.10` | Smaller because it only affects building boundaries |
+| `focal_gamma` | `2.0` | Standard |
+| `class_weights` | `[0.20, 2.00, 5.00, 2.50]` | Road 5× because thin classes are under-represented in pixel count |
+| `label_smoothing` | `0.08` | Slightly higher than typical 0.05 — combats SVAMITVA mask noise |
+| `use_swa` | `True` | Free +0.5–1.5 mIoU |
+| `swa_lr` | `2e-5` | Low, flat LR for SWA averaging |
+| `swa_start_frac` | `0.75` | Start averaging from epoch 60 (75 % of 80) |
+| `use_ema` | `True` | Decay 0.9998 |
+| `ema_decay` | `0.9998` | |
+| `cutmix_alpha` | `1.0` | Standard CutMix |
+| `drop_path_rate` | `0.2` | MiT-B4 stochastic depth |
+| `val_fraction` | `0.15` | 85/15 train/val split |
+| `seed` | `42` | |
+| `min_building_area_px` | `80` | Drop building blobs smaller than this in cleanup |
+| `min_road_width_px` | `3` | Drives the road morphology kernel sizes |
+| `polygon_min_area_px` | `{building:80, road:120, waterbody:160}` | Per-class vector-area filter |
+| `polygon_simplify_tolerance` | `0.5` | Shapely simplify tolerance in pixel units |
+| `crf_inference` | `True` | DenseCRF runs by default |
+| `crf_iter` | `10` | Krähenbühl & Koltun convergence point |
+| `neg_tile_ratio` | `0.15` | Negative tile sampling during preprocessing |
+| `min_fg_ratio` | `0.01` | Drop patches with <1 % foreground from training set |
 
-All improvements made to this codebase, in chronological order from oldest to newest.
+### Stage 2A — `STAGE2A` dict
 
----
+| Key | Value | Why |
+|---|---|---|
+| `num_classes` | `4` | RCC / Tiled / Tin / Other |
+| `class_names` | `['RCC', 'Tiled', 'Tin', 'Other']` | |
+| `shp_roof_col` / `shp_roof_cols` | `'Roof_type'` / tuple of fallbacks | Tolerant to varied SVAMITVA column casing |
+| `roof_type_map` | `ROOF_TYPE_MAP` | See Section 3 |
+| `arch` | `'convnext_large'` | Best texture-classification backbone at 224 px |
+| `pretrained` | `True` | ImageNet |
+| `crop_size` | `224` | Model input |
+| `min_crop_px` | `40` | Skip buildings smaller than 40 px (noise / artefacts) |
+| `batch_size` | `32` | Halved to 16 by VRAM auto-guard if SAM is on |
+| `lr` | `5e-5` | |
+| `epochs` | `80` | |
+| `label_smoothing` | `0.05` | |
+| `mixup_alpha` | `0.4` | |
+| `cutmix_alpha` | `1.0` | |
+| `weight_decay` | `1e-4` | |
+| `grad_accum` | `1` | |
+| `tta_steps` | `8` | Per-scale fold count; total = 8 × 3 = 24 passes |
+| `stage2a_conf_thresh` | `{RCC:0.45, Tiled:0.55, Tin:0.50, Other:0.40}` | Per-class calibration (see Stage 2A section) |
+| `use_arcface` | `True` | Tighter inter-class margin |
+| `arcface_s` | `30.0` | Standard scale |
+| `arcface_m` | `0.55` | Tighter than 0.50; previously hardcoded ignoring this value, fixed |
+| `use_sam` | `True` | Stage 2A is small enough to absorb SAM's 1.9× per-step cost |
+| `sam_rho` | `0.05` | |
+| `sam_adaptive` | `True` | |
+| `use_randaugment` | `True` | |
+| `randaugment_n` | `2` | |
+| `randaugment_m` | `7` | Magnitude 7 — moderate |
+| `drop_path_rate` | `0.4` | Heavy regularisation for ConvNeXt-L |
+| `use_ema` | `True` | |
+| `ema_decay` | `0.9995` | Slightly faster-adapting than Stage 1 (smaller model, fewer steps) |
 
-### Initial commit — Baseline pipeline
+### Stage 2B — `STAGE2B` dict
 
-- Basic inference pipeline: Stage 1 (UNet), Stage 2A (classifier), Stage 2B (YOLO)
-- Simple min-max normalisation in `_to_uint8`
-- Basic augmentation (flip, rotate, colour jitter)
-- Standard AdamW optimiser, no SAM, no EMA
-- Single-GPU only
-
----
-
-### Early iterative improvements
-
-- Added DVC pipeline configuration (`dvc.yaml`, `params.yaml`) for experiment tracking
-- Added `activate.bat` for Windows venv activation
-- Multiple rounds of code cleanup and config tuning
-
----
-
-### feat: SAM + DDP + reproducible installer (`fb618f4`)
-
-**What was added:**
-- **SAM optimizer** (`utils/sam.py`): Sharpness-Aware Minimisation wrapping AdamW. Two forward+backward passes per step → flatter loss minima → better generalisation.
-- **DDP support** (`utils/ddp.py`): Multi-GPU training via `DistributedDataParallel`. Single-GPU falls through transparently.
-- **EMA** (`utils/hardware.py`): Exponential Moving Average over model weights. Validation uses EMA weights; best checkpoint saves EMA, not raw weights.
-- **SWA**: Stochastic Weight Averaging from epoch 75%, with BN stat update after training.
-- **Modular training pipelines**: `train_stage1.py`, `train_stage2.py` as importable functions.
-- **Cross-platform installer**: `install.sh` (macOS/Linux) + `setup_venv.bat` (Windows) detect the right PyTorch wheel (CUDA / ROCm / MPS / CPU) and provision a `venv`.
-- **Atomic checkpointing** (`utils/checkpointing.py`): Writes to `.tmp` first, then `os.replace()`.
-- _(Note: a prior Dockerfile was removed in v1.x — PyInstaller binaries are now the recommended distribution; see `geo_intel.spec` and `geo_intel_cli.spec`.)_
-
----
-
-### fix: remove duplicate block, implement evaluate(), fix train_all() (`f00f318`)
-
-- Removed accidentally duplicated code block in training loop
-- Implemented `InfrastructureDetector.evaluate()` method
-- Fixed `train_all()` orchestration function
-
----
-
-### feat: accuracy improvements v0.1 (`f0bd3da`)
-
-**Config changes:**
-- Road class weight raised to **4.5×** (from lower value) — roads are narrow and underrepresented
-- `arcface_m` set to **0.55** in config (was 0.50) — tighter angular margin between rooftop classes
-- SAHI overlap ratio set to **0.40** (was 0.30) — more overlap catches small objects at tile boundaries
-- Well confidence threshold set to 0.03 — intentionally aggressive for recall (later raised to 0.10)
-- `agnostic_nms=True` — class-agnostic NMS prevents same-location duplicate detections of different classes
+| Key | Value | Why |
+|---|---|---|
+| `class_names` | `['transformer', 'overhead_tank', 'well']` | Class id order is fixed; preprocessing writes labels against this order |
+| `num_classes` | `3` | |
+| `shp_infra_col` / `shp_infra_cols` | `'Utility_Ty'` / fallback tuple | |
+| `infra_type_map` | `INFRA_TYPE_MAP` | See Section 3 |
+| `model_variant` | `'yolo11l'` | ~2× faster than YOLOv9e at parity accuracy; C2PSA attention helps small objects |
+| `use_obb` | `False` | Targets are rotationally symmetric / near-square → angle is undefined or ambiguous; Point centroids are what GIS users want |
+| `obb_model_variant` | `'yolo11l-obb'` | Kept as a no-op fallback if OBB is ever re-enabled |
+| `img_size` | `1280` | Matches inference tile size |
+| `cache` | `'ram'` | Pre-decoded images cached in RAM |
+| `batch_size` | `4` | YOLOv11l at 1280 px uses ~4.5 GB; doubled from 2 (yolov9e budget) for better gradient signal |
+| `workers` | `NUM_WORKERS` | Parity with Stages 1/2A (was 0 → serial dataloader → idle GPU) |
+| `dropout` | `0.1` | Light head dropout |
+| `multi_scale` | `True` | YOLO resizes within ±50 % per batch |
+| `epochs` | `120` | |
+| `lr0` / `lrf` | `1e-3` / `0.01` | YOLO defaults |
+| `warmup_epochs` | `3` | |
+| `patience` | `20` | Early stop |
+| `cos_lr` | `True` | |
+| `mosaic` | `1.0` | Always-on |
+| `close_mosaic` | `20` | Last 20 epochs mosaic-off for clean convergence |
+| `hsv_h/s/v` | `0.015 / 0.5 / 0.3` | Standard YOLO HSV jitter |
+| `degrees` | `15.0` | Rotation augmentation |
+| `translate` | `0.1` | |
+| `scale` | `0.6` | |
+| `fliplr` / `flipud` | `0.5 / 0.5` | Aerial is rotation-invariant; vertical flip OK |
+| `mixup` | `0.15` | Light mixup |
+| `copy_paste` | `0.30` | Strong copy-paste — proven mAP lift for sparse small objects |
+| `conf_thresh` | `0.10` | Default per-class fallback |
+| `iou_thresh` | `0.60` | YOLO NMS IoU |
+| `max_det` | `1000` | Per image |
+| `overlap` | `512` | Inference tile overlap |
+| `class_buffer_px` | `{transformer:100, overhead_tank:80, well:40}` | Per-class half-width in YOLO label generation |
+| `context_classes` | `('building', 'road', 'waterbody')` | Used by context-gated tiling |
+| `context_buffer_px` | `128` | Buffer around context polygons for tile inclusion |
+| `neg_tile_ratio` | `0.3` | Negative tile sampling fraction |
+| `soft_nms_sigma` | `0.40` | Sharper Gaussian decay than 0.5 paper default — helps closely-spaced small objects |
+| `agnostic_nms` | `True` | Suppress cross-class duplicates |
+| `use_sahi` | `True` | Sliced inference for small-object recall |
+| `sahi_slice_size` | `512` | Smaller slices = better small-object recall |
+| `sahi_overlap_ratio` | `0.45` | High overlap so edge objects are seen by ≥1 slice fully |
+| `class_conf_thresh` | `{transformer:0.20, overhead_tank:0.12, well:0.10}` | See Stage 2B section |
 
 ---
 
-### feat: add RandomFog and RandomSunFlare to Stage 2A augmentation (`f0bd3da`)
+## 17. A4000-Specific Optimization Notes
 
-- Added `A.RandomFog` (fog_coef 0.05–0.15, prob=0.10) to rooftop training augmentation
-- Added `A.RandomSunFlare` (prob=0.15) to rooftop training augmentation
-- Simulates real-world aerial imagery conditions (haze, lens flare from sun angles)
-- Makes the rooftop classifier more robust to atmospheric scattering
+These are the choices motivated specifically by the RTX A4000 (Ampere, CC 8.6,
+16 GB VRAM, PCIe 4.0 x16):
 
----
-
-### feat: wire sahi_overlap_ratio and agnostic_nms from config (`5a001e2`)
-
-- `InfrastructureDetector.predict()` now reads `sahi_overlap_ratio` and `agnostic_nms` from `CFG.STAGE2B`
-- Previously hardcoded; now tunable without touching model code
-
----
-
-### feat: add PyQt6 desktop GUI (`34880c2`, `91aad98`)
-
-- Full PyQt6 operator console (`gui.py`) with:
-  - Pipeline Runner tab (QProcess subprocess launcher, live log output)
-  - Map Viewer tab (OpenCV + Matplotlib segmentation overlay)
-  - Results tab (shapefile statistics table)
-- Custom Geo-Intel dark/light theme
-- Animated progress indicators
-- Decoupled from GPU — runs on any machine, calls inference scripts as subprocesses
-
----
-
-### fix: SAM optimizer PyTorch 2.x compatibility (`9f4ddb9`)
-
-- PyTorch 2.x renamed internal optimizer attribute from `_defaults` to `defaults`
-- Fixed `utils/sam.py` to use `param_groups[i]["defaults"]` pattern
-- Without this fix, SAM would throw `AttributeError` on PyTorch 2.x and silently fall back
+| Choice | Where | Why for A4000 specifically |
+|---|---|---|
+| `bfloat16` AMP | `config.AMP_DTYPE`, `utils/hardware.get_amp_context` | Ampere has native bf16 tensor cores; no `GradScaler` needed (8-bit exponent matches fp32) |
+| Channels-last (NHWC) | `to_channels_last(module)` everywhere | Ampere tensor cores process NHWC convs 15–30 % faster than NCHW |
+| TF32 matmul + cudnn | `setup()` | Ampere TF32 path: ~8× fp32 throughput, negligible accuracy loss |
+| `cudnn.benchmark = True` | `setup()` | Fixed shapes → cuDNN picks the fastest kernel once |
+| Flash Attention (SDPA) | `setup()` | Memory-efficient attention for transformer encoder (MiT-B4) |
+| `expandable_segments:True` | `config.py`, `setup()` | PyTorch 2.1+ allocator that grows segments on demand; the single biggest fragmentation win on a 16 GB card running bf16 + ConvNeXt-L + TTA mega-batches |
+| `max_split_size_mb:256` | Same | Defensive cap on legacy code paths |
+| Effective batch 4×8 (Stage 1) | `STAGE1.batch_size / grad_accum` | Same effective batch as 8×4, half the activation peak — fits MAnet+MiT-B4 at 512 px without checkpointing and leaves SAM headroom |
+| GPU-side confusion matrix | `train_stage1._validate` | Cuts B per-batch CPU round-trips down to one final transfer |
+| Cosine window cached once | `inference/pipeline.py` | Constant given `(patch_size, overlap)` — was recomputed per call |
+| Batched `_foreach_*` ops | `utils/sam.py`, `utils/hardware.EMA.update` | One kernel per op vs N per parameter — meaningful on 64 M-param MiT-B4 |
+| `empty_cache()` after Stage 1 val | `train/train_stage1.py` | TTA mega-batches fragment the heap; release before next epoch |
+| `clear_cuda_cache()` between Stage 2A & 2B | `train/train_stage2.py __main__`, `run_pipeline.py` | ConvNeXt-L blocks shouldn't sit in the allocator while YOLO grabs 1280 px tensors |
+| VRAM auto-guard (Stage 1 + Stage 2A) | Both train loops | Halve batch on ≤16.5 GB when SAM is on; otherwise SAM's 2× peak would OOM |
+| `MAX_STEPS_PER_EPOCH = 2000` | `config.py` | Caps wall-clock per epoch on 30 GB+ datasets |
+| Gradient-norm spike skip | Both train loops | Skip step (and scheduler/EMA tick) when pre-clip norm > 10; prevents one bad batch from poisoning the run |
+| EMA shadow on GPU + `_foreach_lerp_` | `utils/hardware.EMA` | No PCIe round-trips; two CUDA kernels instead of N |
+| Soft-NMS on CPU/numpy | `models/stage2_models.soft_nms_gaussian` | Sequential algorithm — GPU version would `.item()`-sync per step (one per detection), CPU is faster |
+| OpenMP thread cap in workers | `utils/hardware.worker_init_fn` | Without this, 8 DataLoader workers × `cpu_count()` OMP threads each thrash the i9 P-cores |
+| CPU affinity to P-cores (0–15) | Same | Avoids work being preempted onto efficiency cores |
+| `non_blocking=True` H2D transfers | Both train loops | Lets DMA overlap with the previous batch's backward when `pin_memory=True` |
 
 ---
 
-### improvements v0.1 (`67e91b4`) — Major batch
+## 18. Improvement History
 
-This commit introduced a large set of improvements across the entire codebase:
+Newest first.
 
-**Stage 1 model:**
-- Standardized Stage 1 on **Unet + MiT-B4** for production speed/accuracy balance
-- Added **scSE decoder attention** on all decoder blocks
-- Added **deep supervision** (auxiliary heads at stages 2/3/4, aux weights 0.4/0.2/0.1)
-- Added **Lovász-Softmax loss** (directly optimises mIoU instead of a proxy)
-- Added **instance-touching separation loss** (penalises merged adjacent buildings)
-- Changed Dice to **cosine-log Dice** for smoother gradients near 0/1
-- Upgraded TTA from 8-fold to **3-scale × 8-fold = 24 passes**
-- Added **0.875× scale** to TTA (sees more context around large buildings)
+### Latest — Stage 2B detector swap
 
-**Stage 1 training:**
-- Multi-scale training with crop sizes (256/512/768px → resize to 512px)
-- Stratified train/val split by foreground ratio quartile
-- OneCycleLR scheduler (replaced CosineAnnealingLR)
-- VRAM auto-guard: auto-reduces batch size when SAM is active on ≤16 GB GPU
-- VRAM auto-guard: keeps `mit_b4` fixed and reduces batch size on low-VRAM GPUs
-- Gradient checkpointing on MiT-B4 encoder
-- Gradient spike guard: skips optimizer step if grad norm > 10
+**`config.STAGE2B`:**
+- `model_variant`: `'yolov9e'` → **`'yolo11l'`** — ~2× faster at parity accuracy; C2PSA attention adds small-object recall; actively maintained
+- `use_obb`: `True` → **`False`** — the three target classes (transformer / overhead_tank / well) are rotationally symmetric or near-square from above. OBB's angle regression is undefined for circles and 4-way ambiguous for squares; AABB outputs Point centroids which is what GIS users actually want
+- `obb_model_variant`: `'yolov9e-obb'` → **`'yolo11l-obb'`** — kept as a no-op fallback for future re-enablement
+- `batch_size`: `2` → **`4`** — YOLOv11l uses ~4.5 GB at imgsz=1280 (vs 7.2 GB for YOLOv9e); doubled batch fits and gives a cleaner gradient signal
 
-**Stage 1 inference:**
-- Spline window blending (was linear, now power-2 cosine taper → no seams)
-- Shared `cosine_window` utility between `_segment()` and CRF tiling
-- Dense CRF tiling with cosine blending (was full-image, OOM on large orthos)
-- CRF: texture-aware bilateral using Sobel gradient magnitude
-- CRF: per-class compatibility matrix (building↔waterbody 3×, building↔road 1.5×)
-- Watershed building separation in morphological cleanup
+**`models/stage2_models.py`:** updated stale `"yolov9e"` fallback strings in
+`InfrastructureDetector._load()` to match the new default.
 
-**Stage 2A model:**
-- Upgraded backbone from `convnext_base` → **`convnext_large`**
-- Added **ArcFace head** (angular margin loss) replacing standard linear head
-- Deeper feature projection trunk (LayerNorm + Dropout + GELU + LayerNorm)
-- Drop path rate 0.4 (was 0.2) — stronger regularisation for larger backbone
-- 3-scale TTA in classifier (was single-scale)
-- Per-crop **instance normalisation** in `RooftopDataset` — equalises brightness across villages with different sun angles
-- MixUp + CutMix augmentation in training
+**`PROJECT_REFERENCE.md` checkpoint path:** updated from `stage2b_yolov9e/` to
+`stage2b_yolo11l/` to match the auto-generated YOLO run directory.
 
-**Stage 2B model:**
-- Added **SAHI** (Slicing Aided Hyper Inference) for small object recall
-- Added **per-class confidence thresholds** (transformer/tank/well each tunable)
-- Soft-NMS Gaussian sigma configurable (was hardcoded)
-- OBB → rotated rectangle polygon export in `detections_to_shapefile()`
-- Class-specific bounding box sizes in YOLO label generation
+### This session
 
-**Data preprocessing:**
-- Strip-based processing for giant TIFs (never loads full raster)
-- STRtree spatial index for SHP burning (vs brute-force iteration)
-- ProcessPoolExecutor for parallel raster processing
-- ThreadPoolExecutor for parallel tile writes
-- Negative tile sampling for Stage 2B
-- Object-centered tile strategy (vs grid-snapped)
-- `_to_uint8` in preprocessing uses percentile stretch with zero-pixel exclusion
+**A4000 optimization pass**
+- `config.py`: `PYTORCH_CUDA_ALLOC_CONF` now uses `expandable_segments:True,max_split_size_mb:256`. The expandable allocator is the documented Ampere-friendly mode in PyTorch 2.1+; it eliminates long-run fragmentation under bf16 + ConvNeXt-L + TTA.
+- `utils/hardware.py`: same allocator hint mirrored inside `setup()` so unit tests / standalone scripts that don't import `config.py` first still get it before any CUDA allocation.
+- `train/train_stage1.py`: `torch.cuda.empty_cache()` after each validation. TTA mega-batches leave the allocator full of large blocks the next epoch's training batches don't fit into.
+- `train/train_stage2.py`: Stage 2A now has parity with Stage 1's safety rails:
+  - VRAM auto-guard halves `batch_size` (local var, not cfg mutation) when SAM is on and VRAM ≤ 16.5 GB.
+  - `MAX_STEPS_PER_EPOCH` cap honoured; `actual_steps` used as the loss/acc divisor so logs aren't underreported when the cap kicks in.
+  - Gradient-norm spike skip; scheduler/EMA only advance on a real step via a `did_step` flag.
+  - `clear_cuda_cache()` between Stage 2A and 2B in `__main__`.
+  - `EMA` and `clear_cuda_cache` hoisted to top-level imports.
+- `utils/sam.py`: `_grad_norm` skips the redundant `.to(device)` round-trip per parameter when all gradients already share one device.
 
-**Infrastructure:**
-- `utils/window.py` extracted as shared module
-- `utils/logger.py` structured logging + `crash_logged` context manager
-- Atomic checkpoint save (`utils/checkpointing.py`)
-- Multi-backend hardware support (CUDA / ROCm / MPS / CPU)
-- Flash Attention via SDPA enabled
+**Bug fixes**
+- `train/train_stage1.py`: validation was bracketed by `apply_shadow → _validate → restore` with no exception protection. If `_validate` raised (OOM during TTA, CUDA error, anything), the model stayed swapped to EMA shadow weights — the next training step would then `optimiser.step()` on EMA weights and feed those right back through `ema.update`, silently corrupting both the live model and the EMA. Now wrapped in `try/finally`.
+- `inference/pipeline.py`: replaced `sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))` with a clean `from pathlib import Path` followed by `sys.path.insert(...)`.
+- `run_pipeline.py`: `--mode train_stage2` ran Stage 2A back-to-back with 2B with no cache clear, leaving the heap full of ConvNeXt blocks when YOLO tried to grab 1280 px tensors. Added the same `clear_cuda_cache()` call that `--mode train_all` already had.
+
+**Dead-code sweep**
+- Unused top-level imports removed across: `utils/hardware.py` (`sys`), `utils/ecw_compat.py` (`Optional`), `models/stage2_models.py` (`List`), `train/train_stage1.py` (`Optional`, `DataLoader`, `cleanup_ddp`), `train/train_stage2.py` (`os`, `math`; folded redundant `pathlib` imports), `run_stage2b.py` (`os`), `tests/test_core_components.py` (`math`).
+- Removed `_cosine_warmup` from `train/train_stage2.py` (defined but never called; Stage 2A uses `SequentialLR(LinearLR + CosineAnnealingWarmRestarts)` instead).
+- Removed `log_event` from `utils/logger.py` (never called anywhere).
+- Removed `ClassificationMetrics` from `utils/metrics.py` (`_val_clf` uses `sklearn.metrics.classification_report` directly).
+- All 33 project files now parse-clean with zero unused top-level imports.
+
+### Earlier session — accuracy + correctness pass
+
+- `config.crf_iter`: 5 → 10 (DenseCRF needs ~10 iterations for boundary convergence).
+- `config.min_fg_ratio`: 0.003 → 0.01 (filter near-empty training patches).
+- `config.soft_nms_sigma`: 0.9 → 0.5 → 0.40 (0.9 barely suppressed; 0.40 is sharper than paper default and helps tightly-spaced small objects).
+- `config.class_conf_thresh[well]`: 0.03 → 0.10 (eliminate false-positive well flood).
+- Added per-class `stage2a_conf_thresh` calibration (was a single blanket 0.55).
+- Added `FAST_TTA` module toggle.
+- `inference._to_uint8`: min-max → 2nd–98th percentile (satellite outliers compressed valid range to 7/255; percentile gives 181/255).
+- Removed `_segment()` `min(overlap, 128)` cap — full configured overlap is now used.
+- `tta_predict` calls now controlled by `CFG.FAST_TTA` (was hardcoded `fast_tta=True`).
+- `_classify_rooftops` confidence gate now reads per-class thresholds from config.
+- `ArcFaceHead` now reads `m` and `s` from config (was hardcoded `m=0.50` — config value ignored for 11 commits).
+
+### `improvements v0.1` batch (`67e91b4`)
+
+- **Stage 1 model:** standardised on MAnet + MiT-B4; scSE on all decoder blocks; Lovász-Softmax added; instance-touching separation loss added; cosine-log Dice; 24-pass TTA with 0.875× added; deep-supervision-ready loss.
+- **Stage 1 training:** multi-scale random resize 50 % per batch; stratified split by foreground ratio; OneCycleLR; VRAM auto-guard; gradient checkpointing on MiT-B4 (where supported); gradient spike guard.
+- **Stage 1 inference:** spline window blending; shared `cosine_window` utility; tiled CRF with cosine blending; texture-aware bilateral; per-class CRF compatibility matrix; watershed building separation.
+- **Stage 2A:** upgraded `convnext_base` → `convnext_large`; ArcFace head; deeper trunk; drop_path 0.4; 3-scale TTA; per-crop instance normalisation in `RooftopDataset`; MixUp + CutMix.
+- **Stage 2B:** SAHI added; per-class confidence thresholds; configurable Soft-NMS sigma; OBB → rotated polygon export; class-specific bbox sizes in YOLO label generation.
+- **Preprocessing:** strip-based processing; STRtree; ProcessPoolExecutor for rasters + ThreadPoolExecutor for tile writes; negative tile sampling; object-centred tile strategy; zero-pixel-excluded percentile stretch.
+- **Infrastructure:** `utils/window.py`; `utils/logger.py` + `crash_logged`; atomic checkpoint save; multi-backend hardware (CUDA / ROCm / MPS / CPU); Flash Attention via SDPA.
+
+### Earlier infrastructure batch (`fb618f4`)
+
+- **SAM** (`utils/sam.py`) added.
+- **DDP** (`utils/ddp.py`) added; single-GPU falls through transparently.
+- **EMA** (`utils/hardware.EMA`) added.
+- **SWA** added.
+- Modular training pipelines as importable functions.
+- Cross-platform installer scripts.
+- Atomic checkpointing.
+
+### `f0bd3da` — initial accuracy bump
+
+- Road class weight raised.
+- `arcface_m` set to 0.55 (initially ignored at the head; later fixed).
+- SAHI overlap 0.30 → 0.40.
+- Aggressive well threshold (later corrected).
+- `agnostic_nms=True`.
+- RandomFog + RandomSunFlare added to Stage 2A augmentation.
+
+### `34880c2`, `91aad98` — PyQt6 GUI
+
+Full operator console; subprocess-based pipeline launching; map viewer; results tab.
+
+### `9f4ddb9` — SAM PyTorch 2.x fix
+
+PyTorch 2.x renamed `_defaults` → `defaults`; fixed `utils/sam.py` to use the public attribute.
+
+### Initial commit
+
+Baseline pipeline (UNet, ConvNeXt-Base classifier, YOLO detector), simple
+min-max normalisation, basic augmentation, AdamW only, single GPU.
 
 ---
 
-### Session improvements — 2026-05-10 (current session)
-
-These are the improvements made in the most recent development session:
-
-**`config.py`**
-- `crf_iter`: **5 → 10** — CRF requires at least 10 iterations to converge on boundary refinement
-- `min_fg_ratio`: **0.003 → 0.01** — patches with <0.3% foreground add noise without signal
-- `soft_nms_sigma`: **0.9 → 0.5** — σ=0.9 barely penalises overlapping boxes; σ=0.5 is the paper's default
-- `well` confidence threshold: **0.03 → 0.10** — 3% threshold was flooding output with false-positive wells
-- Added `stage2a_conf_thresh = {RCC:0.45, Tiled:0.55, Tin:0.50, Other:0.40}` — per-class calibration
-- Added `FAST_TTA = False` — module-level toggle for TTA mode (False = full 24-pass TTA)
-
-**`inference/pipeline.py`**
-- `_to_uint8()`: **min-max → 2nd–98th percentile clipping** — satellite imagery has frequent outliers (dead pixels, saturated areas). Min-max was compressing the entire valid range to 7/255 in tests; percentile gives 181/255. All downstream models receive proper input contrast.
-- `_segment()` overlap: **removed `min(overlap, 128)` cap** — config specifies 192px; the cap was silently reducing overlap quality. Full 192px overlap is now used.
-- Both `tta_predict()` calls: **`fast_tta=True` → `fast_tta=CFG.FAST_TTA`** — now controlled by config; defaults to full 24-pass TTA.
-- `_classify_rooftops()` confidence gate: **hardcoded 0.55 → per-class thresholds from config** — reads `CFG.STAGE2A["stage2a_conf_thresh"]`; falls back to 0.55 if key missing.
-
-**`models/stage2_models.py`**
-- `ArcFaceHead` instantiation: **hardcoded `m=0.50`, `s=30.0` → `cfg.get("arcface_m", 0.50)`, `cfg.get("arcface_s", 30.0)`** — `config.py` had `arcface_m=0.55` for 11 commits but the value was never used. The tuned margin is now active.
-
----
-
-*End of document.*
+*End of document. If you find a discrepancy between this file and the code,
+the code wins — please update this document to match.*

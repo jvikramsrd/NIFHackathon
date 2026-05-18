@@ -1333,7 +1333,8 @@ def _extract_infra_streaming(
     contain annotated features — never loads the full raster.
 
     Improvements over original:
-      • Class-specific bounding box sizes (transformer=60px, tank=50px, well=25px)
+      • Class-specific bounding box sizes (driven by ``class_buffer_px`` arg;
+        config currently sets transformer=100, overhead_tank=80, well=40)
       • Tiles centered on objects instead of grid-snapped (no edge cropping)
       • Negative tile sampling to reduce false positive rate
     """
