@@ -693,13 +693,13 @@ class ThemeManager(QObject):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ThemeToggle(QPushButton):
-    """Tri-mode theme cycler styled to match the active QSS.
+    """Windows 11 Light/Dark theme toggle.
 
-    Replaced the animated dark/light pill — Win3 mode wouldn't make sense
-    inside a rounded sliding-thumb control. Now this is a plain QPushButton
-    that displays the current theme name and cycles on click. In Win3 mode it
-    inherits the standard 3D beveled button; in modern modes it's a flat pill
-    via the dynamic style applied below.
+    Plain QPushButton styled by the active QSS (#theme_cycle selector). The
+    label shows the *current* theme — a sun for Light, a moon for Dark —
+    matching the convention in Windows 11 Settings → Personalisation → Colour.
+    Clicking it routes to ThemeManager.cycle() which swaps the PAL and
+    triggers a full restyle.
     """
 
     # Sun glyph for Light → indicates "currently Light, click for Dark";
