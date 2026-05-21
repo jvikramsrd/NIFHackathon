@@ -40,6 +40,7 @@ from utils.hardware import (
     clear_cuda_cache,
     compile_model,
     get_amp_context,
+    get_yolo_device,
     maybe_backward,
     setup,
     to_channels_last,
@@ -530,7 +531,7 @@ def train_stage2b(resume: bool = True):
             epochs=cfg["epochs"],
             imgsz=cfg["img_size"],
             batch=cfg["batch_size"],
-            device="0",
+            device=get_yolo_device(),
             project=str(CFG.CKPT_DIR),
             name=f"stage2b_{variant}",
             exist_ok=True,
@@ -569,7 +570,7 @@ def train_stage2b(resume: bool = True):
         detector._backend = "yolo"
     else:
         detector = InfrastructureDetector(cfg, str(CFG.CKPT_DIR))
-        _ = detector.train(data_yaml, device="0")  # type: ignore
+        _ = detector.train(data_yaml, device=get_yolo_device())  # type: ignore
     log.info("\nStage 2B done.")
     return detector
 

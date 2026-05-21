@@ -35,7 +35,7 @@ log = get_logger(__name__)
 sys.path.insert(0, str(Path(__file__).parent))
 
 import config as CFG
-from utils.hardware import setup, vram_stats, clear_cuda_cache
+from utils.hardware import setup, vram_stats, clear_cuda_cache, get_yolo_device
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -245,7 +245,7 @@ def train_stage2b(data_yaml: str, resume: bool = True):
             epochs=cfg2b["epochs"],
             imgsz=cfg2b["img_size"],
             batch=cfg2b["batch_size"],
-            device="0",
+            device=get_yolo_device(),
             project=str(CFG.CKPT_DIR),
             name=f"stage2b_{variant}",
             exist_ok=True,
@@ -286,7 +286,7 @@ def train_stage2b(data_yaml: str, resume: bool = True):
         if last_ckpt.exists() or best_ckpt.exists():
             log.info(f"  [INFO] Previous checkpoint found but --no-resume specified, training from scratch")
         detector = InfrastructureDetector(cfg2b, str(CFG.CKPT_DIR))
-        detector.train(data_yaml, device="0")
+        detector.train(data_yaml, device=get_yolo_device())
 
     # Show results
     best_pt = run_dir / "weights" / "best.pt"

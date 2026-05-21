@@ -69,7 +69,10 @@
       "Bash(pytest tests/test_optimizations.py::test_to_uint8_vectorized_matches_original_simple tests/test_optimizations.py::test_to_uint8_edge_cases_simple -v)",
       "Bash(./venv/Scripts/python.exe -m pytest tests/ -x -q)",
       "Bash(venv/Scripts/pip.exe install *)",
-      "Bash(venv/Scripts/python.exe -m pyflakes --version)"
+      "Bash(venv/Scripts/python.exe -m pyflakes --version)",
+      "Bash(venv/Scripts/python.exe -c ' *)",
+      "Bash(venv/Scripts/python.exe -m pytest tests/ -x --tb=short)",
+      "Bash(venv/Scripts/python.exe -m pytest tests/ --tb=short)"
     ]
   }
 }

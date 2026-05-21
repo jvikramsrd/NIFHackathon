@@ -416,3 +416,29 @@ def clear_cuda_cache():
 
         gc.collect()
         log.info(f"  Cache cleared. {vram_stats()}")
+
+
+def get_yolo_device() -> str:
+    """Return the device string Ultralytics YOLO accepts for the active backend.
+
+    YOLO's ``device=`` kwarg expects: a GPU ordinal string like ``"0"`` for CUDA,
+    ``"mps"`` for Apple Silicon, or ``"cpu"``. Hardcoding ``"0"`` crashes on any
+    machine without an NVIDIA GPU.
+    """
+    if torch.cuda.is_available():
+        return "0"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def get_inference_device_str() -> str:
+    """Return a torch device string for libraries that take a string (e.g. SAHI).
+
+    Mirrors the precedence in ``config.py``: CUDA → MPS → CPU.
+    """
+    if torch.cuda.is_available():
+        return "cuda:0"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"

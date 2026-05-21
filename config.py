@@ -36,7 +36,7 @@ LOG_DIR = ROOT / "logs"
 OUT_DIR = ROOT / "outputs" / "vectorized"
 TRAIN_MASKS = DATA_ROOT / "masks"
 
-for d in [
+for _d in [
     PATCH_DIR,
     MASK_DIR,
     CROP_DIR,
@@ -46,7 +46,8 @@ for d in [
     OUT_DIR,
     TRAIN_MASKS,
 ]:
-    d.mkdir(parents=True, exist_ok=True)
+    _d.mkdir(parents=True, exist_ok=True)
+del _d
 
 # ─── Hardware — multi-backend (NVIDIA CUDA / AMD ROCm / Apple MPS / CPU) ─────
 if torch.cuda.is_available():

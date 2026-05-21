@@ -70,7 +70,7 @@ if mode in ("--verify", "--all"):
             fail.append((pkg, str(e)))
 
     for pkg, attr in [("numpy", "__version__"), ("pandas", "__version__"),
-                      ("PyQt6", "QtCore.PYQT_VERSION_STR"), ("matplotlib", "__version__"),
+                      ("matplotlib", "__version__"),
                       ("tensorboard", "__version__"), ("onnx", "__version__")]:
         try:
             m = importlib.import_module(pkg)
@@ -80,6 +80,12 @@ if mode in ("--verify", "--all"):
             ok.append((pkg, v or getattr(m, "__version__", "?")))
         except Exception as e:
             fail.append((pkg, str(e)))
+
+    try:
+        from PyQt6.QtCore import PYQT_VERSION_STR
+        ok.append(("PyQt6", PYQT_VERSION_STR))
+    except Exception as e:
+        fail.append(("PyQt6", str(e)))
 
     print()
     for k, v in ok:

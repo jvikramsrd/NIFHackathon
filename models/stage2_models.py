@@ -323,9 +323,12 @@ class InfrastructureDetector:
             self._backend = "frcnn"
             self.model = _build_frcnn(self.cfg["num_classes"])
 
-    def train(self, data_yaml: str, device: str = "0"):
+    def train(self, data_yaml: str, device: Optional[str] = None):
         if self._backend != "yolo":
             raise RuntimeError("Install ultralytics: pip install ultralytics")
+        if device is None:
+            from utils.hardware import get_yolo_device
+            device = get_yolo_device()
 
         train_args = dict(
             data=data_yaml,
@@ -370,7 +373,8 @@ class InfrastructureDetector:
             return self._sahi_model
         try:
             from sahi import AutoDetectionModel  # type: ignore
-            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            from utils.hardware import get_inference_device_str
+            device = get_inference_device_str()
             self._sahi_model = AutoDetectionModel.from_pretrained(
                 model_type="yolov8",
                 model=self.model,

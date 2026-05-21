@@ -145,10 +145,6 @@ class RooftopDataset(Dataset):
             raise ValueError(f"Failed to read image at {path}")
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        if img.size == 0 or img.shape[0] == 0 or img.shape[1] == 0:
-            img = np.zeros((self.transform.transforms[0].size[0] if hasattr(self.transform.transforms[0], 'size') else 224,
-                            self.transform.transforms[0].size[1] if hasattr(self.transform.transforms[0], 'size') else 224, 3), dtype=np.uint8)
-
         # Per-crop contrast normalisation, in place: replaces
         #   img_norm = (img_f - mean) / std * 64.0 + 127.0
         # which allocated 4 float32 buffers per sample (~600 KB each for a
