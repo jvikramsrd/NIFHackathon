@@ -72,7 +72,8 @@
       "Bash(venv/Scripts/python.exe -m pyflakes --version)",
       "Bash(venv/Scripts/python.exe -c ' *)",
       "Bash(venv/Scripts/python.exe -m pytest tests/ -x --tb=short)",
-      "Bash(venv/Scripts/python.exe -m pytest tests/ --tb=short)"
+      "Bash(venv/Scripts/python.exe -m pytest tests/ --tb=short)",
+      "Bash(PYTHONIOENCODING=utf-8 python)"
     ]
   }
 }

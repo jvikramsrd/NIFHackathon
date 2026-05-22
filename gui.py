@@ -143,10 +143,6 @@ DARK_PAL = {
     "cls_bg":      "#3D3D3D",
 }
 
-# Legacy alias — `WIN3_PAL` is kept as a name so anything that imports the
-# module by that name still works, but it now points at the light theme.
-WIN3_PAL = LIGHT_PAL
-
 PAL: dict[str, str] = dict(LIGHT_PAL)  # mutable current palette — defaults to Win11 Light
 
 # Class overlay colours as uint8 RGB arrays (for numpy blending)
@@ -624,9 +620,7 @@ class ThemeManager(QObject):
     """Two-mode theme manager: Windows 11 'light' (default) ↔ 'dark'.
 
     Both modes share the same Fluent QSS structure — only the PAL dict swaps.
-    `is_dark` is the canonical state, exposed as a property; `theme` is an
-    alias for any caller that prefers the string form. Both setters route
-    through `set_theme` so a single repaint path covers every call site.
+    All state changes route through `set_theme` so the repaint path is single-source.
     """
 
     THEMES = ("light", "dark")
@@ -651,19 +645,11 @@ class ThemeManager(QObject):
 
     @theme.setter
     def theme(self, value: str):
-        if value in self.THEMES:
-            self._theme = value
-
-    @property
-    def is_dark(self) -> bool:
-        return self._theme == "dark"
-
-    @is_dark.setter
-    def is_dark(self, dark: bool):
         # Pre-QApplication assignment path (called from main() before the
         # first stylesheet build). Just store the state; the actual repaint
-        # happens when app.setStyleSheet() is called.
-        self._theme = "dark" if dark else "light"
+        # happens when app.setStyleSheet() is called next.
+        if value in self.THEMES:
+            self._theme = value
 
     def set_theme(self, theme: str):
         if theme not in self.THEMES or theme == self._theme:
@@ -682,10 +668,6 @@ class ThemeManager(QObject):
 
     def cycle(self):
         self.set_theme("dark" if self._theme == "light" else "light")
-
-    # Kept for backwards compatibility with any caller that pre-dated cycle().
-    def set_dark(self, dark: bool):
-        self.set_theme("dark" if dark else "light")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2212,8 +2194,7 @@ def main():
     app.setStyle("Fusion")
 
     # Load saved theme before building QSS. Two-state: "light" (default)
-    # or "dark". Anything else (including the legacy "win3" value from
-    # earlier sessions) falls through to Light.
+    # or "dark". Any other value falls through to Light.
     try:
         saved = _THEME_FILE.read_text().strip().lower()
     except (OSError, ValueError):
