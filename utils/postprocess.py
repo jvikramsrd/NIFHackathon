@@ -375,7 +375,11 @@ def separate_touching_buildings(binary_mask: np.ndarray) -> np.ndarray:
     markers = np.zeros_like(binary_mask, dtype=np.int32)
     markers[tuple(coords.T)] = np.arange(1, len(coords) + 1)
     markers = ndi.label(markers)[0]
-    labels = watershed(-dist, markers, mask=binary_mask)
+    # watershed_line=True leaves a 1-pixel background line between adjacent basins
+    # (touching buildings), giving the polygon vectoriser clean boundaries to trace.
+    # Without it the basins fill the exact same footprint as the input, leaving
+    # buildings merged in the vector output.
+    labels = watershed(-dist, markers, mask=binary_mask, watershed_line=True)
     return (labels > 0).astype(np.uint8)
 
 

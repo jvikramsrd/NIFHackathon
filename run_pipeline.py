@@ -144,6 +144,7 @@ def evaluate():
     from models.stage2_models import RooftopClassifier
     from train.train_stage1 import _validate
     from train.train_stage2 import _val_clf
+    from utils.checkpointing import clean_state_dict
     from utils.hardware import get_amp_context, setup
     from utils.metrics import SegmentationMetrics
 
@@ -167,7 +168,8 @@ def evaluate():
                                 num_workers=0, pin_memory=True)
         module = Stage1Module(cfg1).to(device)
         ckpt = torch.load(str(ckpt1), map_location=device, weights_only=False)
-        module.load_state_dict(ckpt.get("state_dict", ckpt), strict=False)
+        raw_state = ckpt.get("state_dict", ckpt)
+        module.load_state_dict(clean_state_dict(raw_state, module.state_dict()), strict=False)
         metrics = SegmentationMetrics(cfg1["num_classes"], cfg1["class_names"])
         miou, _ = _validate(module, val_loader, device, metrics, amp_ctx)
         r = metrics.compute()
@@ -197,7 +199,8 @@ def evaluate():
         val_loader2a = DataLoader(val_ds2a, batch_size=32, shuffle=False, num_workers=0)
         model2a = RooftopClassifier(cfg2a).to(device)
         ckpt = torch.load(str(ckpt2a), map_location=device, weights_only=False)
-        model2a.load_state_dict(ckpt.get("state_dict", ckpt), strict=False)
+        raw_state2a = ckpt.get("state_dict", ckpt)
+        model2a.load_state_dict(clean_state_dict(raw_state2a, model2a.state_dict()), strict=False)
         acc, report = _val_clf(model2a, val_loader2a, device, cfg2a, amp_ctx)
         results["stage2a"] = {"accuracy": float(acc)}
         log.info(f"Stage 2A Accuracy: {acc:.4f}")

@@ -217,7 +217,9 @@ def get_train_transforms(patch_size: int = 640, patch_sizes=None):
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
             A.RandomRotate90(p=1.0),
-            A.Transpose(p=0.5),
+            # NOTE: A.Transpose removed — it swaps row/col axes (matrix transpose),
+            # which breaks geographic pixel-grid alignment when tiles are georeferenced.
+            # RandomRotate90 + HFlip + VFlip already cover the full D4 dihedral group.
             A.OneOf(
                 [
                     A.RandomBrightnessContrast(0.25, 0.25),
@@ -282,7 +284,8 @@ def get_clf_train_transforms(
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
         A.RandomRotate90(p=0.75),
-        A.Transpose(p=0.5),
+        # NOTE: A.Transpose removed — swaps row/col axes, breaking geospatial reference.
+        # The full D4 group is already covered by RandomRotate90 + HFlip + VFlip.
     ]
     if use_randaugment:
         transforms.append(_randaugment_block(randaugment_n, randaugment_m, p=0.85))
@@ -435,6 +438,27 @@ def split_dataset(
     patch_size=640,
     patch_sizes=None,
 ):
+    """Split a tile dataset into train/val with **zero raster leakage**.
+
+    Standard stratified-random splits can place tiles from the *same*
+    orthophoto in both train and val sets.  Models then learn scene-specific
+    geographic texture (road colour, tree species, building hue) rather than
+    semantic features, causing severe overfitting.
+
+    This function groups tiles by their **source raster** (inferred from the
+    filename suffix convention ``<rasterName>_<rowIdx>_<colIdx>.png`` produced
+    by ``data/preprocessing.py``) and then assigns *entire rasters* to train
+    or val so the two splits are geographically independent.
+
+    Foreground-ratio stratification is preserved at the *raster* level: rasters
+    are sorted by their mean fg-ratio before the val slice is taken, so val
+    receives a representative mix of easy (low-fg) and hard (high-fg) scenes.
+
+    Falls back to a single ``"ungrouped"`` bucket when filenames do not follow
+    the ``_row_col`` convention.
+    """
+    from collections import defaultdict
+
     mask_dir_p = Path(mask_dir)
     all_imgs = [
         Path(e.path)
@@ -446,6 +470,7 @@ def split_dataset(
 
     rng = random.Random(seed)
 
+    # ── Step 1: per-tile foreground ratio (parallelised) ────────────────────
     def _fg_ratio(img_path: Path) -> float:
         mp = mask_dir_p / img_path.name
         if not mp.exists() or mp.stat().st_size == 0:
@@ -458,28 +483,83 @@ def split_dataset(
         except Exception:
             return 0.0
 
-    # Parallel mask reads: this dominates startup time on large patch sets.
-    # I/O-bound, so threads beat processes (no spawn overhead, GIL released in cv2).
     n_workers = max(2, min((os.cpu_count() or 4), 16))
     with ThreadPoolExecutor(max_workers=n_workers) as ex:
         ratios = list(ex.map(_fg_ratio, all_imgs))
-    sorted_idx = sorted(range(len(all_imgs)), key=lambda i: ratios[i])
-    n = len(sorted_idx)
-    strata_size = max(1, n // 4)
-    strata = [sorted_idx[i : i + strata_size] for i in range(0, n, strata_size)]
 
-    trn_imgs, val_imgs = [], []
-    for stratum in strata:
-        rng.shuffle(stratum)
-        n_val = max(1, int(len(stratum) * val_fraction)) if len(stratum) > 1 else 0
-        val_imgs.extend(all_imgs[i] for i in stratum[:n_val])
-        trn_imgs.extend(all_imgs[i] for i in stratum[n_val:])
+    tile_fg: dict[Path, float] = dict(zip(all_imgs, ratios))
+
+    # ── Step 2: group tiles by source raster ────────────────────────────────
+    # Convention from preprocessing.py:  <rasterName>_<rowIdx>_<colIdx>.png
+    # The raster prefix is everything except the last two underscore-tokens.
+    raster_groups: dict[str, list[Path]] = defaultdict(list)
+    for img_path in all_imgs:
+        parts = img_path.stem.split("_")
+        # Need at least 3 parts to extract a meaningful prefix.
+        if len(parts) >= 3:
+            prefix = "_".join(parts[:-2])
+        else:
+            prefix = "ungrouped"   # graceful fallback
+        raster_groups[prefix].append(img_path)
+
+    n_rasters = len(raster_groups)
+    raster_names = list(raster_groups.keys())
+
+    # ── Step 3: sort rasters by mean fg-ratio for stratified split ──────────
+    raster_mean_fg = {
+        name: (sum(tile_fg[t] for t in tiles) / len(tiles))
+        for name, tiles in raster_groups.items()
+    }
+    raster_names.sort(key=lambda n: raster_mean_fg[n])
+
+    # ── Step 4: deterministic raster-level val selection ───────────────────
+    # Shuffle with a fixed seed *within* foreground strata so the selection is
+    # reproducible while still picking a representative subset.
+    n_val_rasters = max(1, round(n_rasters * val_fraction))
+    if n_val_rasters >= n_rasters:
+        n_val_rasters = max(1, n_rasters - 1)
+
+    # Stratify rasters into 4 fg-ratio buckets, pick proportionally from each.
+    strata_size = max(1, n_rasters // 4)
+    strata = [raster_names[i: i + strata_size] for i in range(0, n_rasters, strata_size)]
+    val_raster_set: set[str] = set()
+    remaining = n_val_rasters
+    for si, stratum in enumerate(strata):
+        shuffled = list(stratum)
+        rng.shuffle(shuffled)
+        # Proportional allocation; last stratum gets whatever remains
+        if si < len(strata) - 1:
+            take = max(0, round(len(shuffled) / n_rasters * n_val_rasters))
+        else:
+            take = remaining
+        take = min(take, len(shuffled))
+        val_raster_set.update(shuffled[:take])
+        remaining -= take
+
+    # ── Step 5: assign tiles based on raster assignment ─────────────────────
+    trn_imgs: list[Path] = []
+    val_imgs: list[Path] = []
+    for name, tiles in raster_groups.items():
+        if name in val_raster_set:
+            val_imgs.extend(tiles)
+        else:
+            trn_imgs.extend(tiles)
+
+    n_val_r = len(val_raster_set)
+    n_trn_r = n_rasters - n_val_r
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+    _log.info(
+        "split_dataset: %d rasters → %d train / %d val rasters  "
+        "(%d train tiles, %d val tiles)  [seed=%d]",
+        n_rasters, n_trn_r, n_val_r, len(trn_imgs), len(val_imgs), seed,
+    )
 
     if not trn_imgs:
         trn_imgs = all_imgs
         val_imgs = []
     elif not val_imgs:
-        val_imgs = trn_imgs[:max(1, len(trn_imgs) // 10)] if len(trn_imgs) > 10 else []
+        val_imgs = trn_imgs[: max(1, len(trn_imgs) // 10)] if len(trn_imgs) > 10 else []
         trn_imgs = trn_imgs[len(val_imgs):]
 
     rng.shuffle(trn_imgs)

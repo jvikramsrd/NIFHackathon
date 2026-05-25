@@ -26,7 +26,7 @@ from tqdm import tqdm
 import config as CFG
 from data.dataset import split_dataset
 from models.stage1_segmentation import Stage1Module
-from utils.checkpointing import atomic_torch_save
+from utils.checkpointing import atomic_torch_save, clean_state_dict
 from utils.ddp import is_main_process, make_loader, set_epoch, setup_ddp, wrap_ddp
 from utils.hardware import (
     EMA, compile_model, get_amp_context, maybe_backward, maybe_step, setup,
@@ -543,6 +543,7 @@ def _load_training_state(module, optimiser, scheduler, ema, ckpt_path: Path, dev
     # with strict=False, so we catch those explicitly and produce the same
     # clear message instead of an opaque PyTorch traceback.
     try:
+        model_state = clean_state_dict(model_state, module.state_dict())
         incompatible = module.load_state_dict(model_state, strict=False)
         missing = list(getattr(incompatible, "missing_keys", []) or [])
         unexpected = list(getattr(incompatible, "unexpected_keys", []) or [])

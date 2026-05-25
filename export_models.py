@@ -12,6 +12,7 @@ import torch
 import config as CFG
 from models.stage1_segmentation import Stage1Module
 from models.stage2_models import RooftopClassifier
+from utils.checkpointing import clean_state_dict
 from utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -28,7 +29,8 @@ def export_stage1_onnx(
     cfg = {**CFG.STAGE1, "encoder_weights": None}
     model = Stage1Module(cfg).eval()
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    model.load_state_dict(ckpt.get("state_dict", ckpt), strict=False)
+    raw_state = ckpt.get("state_dict", ckpt)
+    model.load_state_dict(clean_state_dict(raw_state, model.state_dict()), strict=False)
     dummy = torch.randn(1, 3, int(CFG.STAGE1["patch_size"]), int(CFG.STAGE1["patch_size"]))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.onnx.export(
@@ -53,7 +55,8 @@ def export_stage2a_onnx(
     cfg = {**CFG.STAGE2A, "pretrained": False}
     model = RooftopClassifier(cfg).eval()
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    model.load_state_dict(ckpt.get("state_dict", ckpt), strict=False)
+    raw_state = ckpt.get("state_dict", ckpt)
+    model.load_state_dict(clean_state_dict(raw_state, model.state_dict()), strict=False)
     crop_size = int(CFG.STAGE2A["crop_size"])
     dummy = torch.randn(1, 3, crop_size, crop_size)
     out_path.parent.mkdir(parents=True, exist_ok=True)

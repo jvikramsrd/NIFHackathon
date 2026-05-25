@@ -239,7 +239,11 @@ STAGE1 = dict(
     focal_weight=0.15,
     boundary_weight=0.15,
     lovasz_weight=0.15,
-    touching_weight=0.10,
+    # touching_weight=0.0: disabled — this loss penalises building predictions at
+    # ALL building edges (including isolated ones), conflicting with Dice + CE loss
+    # and suppressing mIoU. Instance separation is handled more cleanly by the
+    # watershed postprocessing in utils/postprocess.py (separate_touching_buildings).
+    touching_weight=0.0,
     focal_gamma=2.0,
     class_weights=[0.20, 2.00, 5.00, 2.50],
     label_smoothing=0.08,

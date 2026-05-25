@@ -26,6 +26,7 @@ import config as CFG
 from data.dataset import get_clf_val_transforms, get_val_transforms
 from models.stage1_segmentation import Stage1Module, tta_predict
 from models.stage2_models import InfrastructureDetector, RooftopClassifier
+from utils.checkpointing import clean_state_dict
 from utils.hardware import (
     cl_input,
     clear_cuda_cache,
@@ -61,8 +62,16 @@ class GeoIntelPipeline:
         log.info("[1] Loading Stage-1 segmentation model …")
         ckpt = torch.load(stage1_ckpt, map_location=self.device, weights_only=False)
         self.seg = Stage1Module(CFG.STAGE1).to(self.device)
-        seg_state = {k.removeprefix("module."): v for k, v in ckpt["state_dict"].items()}
-        self.seg.load_state_dict(seg_state, strict=True)
+        seg_state = clean_state_dict(
+            ckpt.get("state_dict") or ckpt, self.seg.state_dict()
+        )
+        incomp = self.seg.load_state_dict(seg_state, strict=False)
+        if incomp.missing_keys or incomp.unexpected_keys:
+            log.warning(
+                "Stage 1 checkpoint key mismatch: missing=%d unexpected=%d — "
+                "weights may be partially loaded.",
+                len(incomp.missing_keys), len(incomp.unexpected_keys),
+            )
         self.seg.eval()
         if CFG.COMPILE_ENABLED:
             # fullgraph=False keeps MiT encoder attention/control-flow tolerant.
@@ -78,8 +87,16 @@ class GeoIntelPipeline:
         log.info("[2] Loading Stage-2A rooftop classifier …")
         ckpt2a = torch.load(stage2a_ckpt, map_location=self.device, weights_only=False)
         self.clf = RooftopClassifier(CFG.STAGE2A).to(self.device)
-        clf_state = {k.removeprefix("module."): v for k, v in ckpt2a["state_dict"].items()}
-        self.clf.load_state_dict(clf_state, strict=True)
+        clf_state = clean_state_dict(
+            ckpt2a.get("state_dict") or ckpt2a, self.clf.state_dict()
+        )
+        incomp2a = self.clf.load_state_dict(clf_state, strict=False)
+        if incomp2a.missing_keys or incomp2a.unexpected_keys:
+            log.warning(
+                "Stage 2A checkpoint key mismatch: missing=%d unexpected=%d — "
+                "weights may be partially loaded.",
+                len(incomp2a.missing_keys), len(incomp2a.unexpected_keys),
+            )
         self.clf.eval()
         self.clf = to_channels_last(self.clf)  # NHWC for ConvNeXt
         if CFG.COMPILE_ENABLED:
@@ -322,7 +339,15 @@ class GeoIntelPipeline:
                     count_map[br:br2, bc:bc2] += wind_slice
 
         log.debug("  [DEBUG] Tiling loop finished. Returning averaged probability map...")
-        return prob_sum / np.maximum(count_map, 1e-6)
+        # Compute the final averaged probability map, then explicitly free the
+        # large intermediate arrays.  For a 5000×5000-px orthophoto with 4
+        # classes, prob_sum is ~400 MB (float32) and count_map ~25 MB — leaving
+        # them alive through downstream classification and vectorisation causes
+        # unnecessary memory pressure and OOM errors on large rasters.
+        averaged = prob_sum / np.maximum(count_map, 1e-6)
+        del prob_sum, count_map
+        torch.cuda.empty_cache()
+        return averaged
 
     # ── Stage 2A rooftop classification ──────────────────────────────────────
 

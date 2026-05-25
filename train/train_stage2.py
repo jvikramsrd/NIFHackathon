@@ -33,7 +33,7 @@ from tqdm import tqdm
 import config as CFG
 from data.dataset import split_clf_dataset
 from models.stage2_models import InfrastructureDetector, RooftopClassifier
-from utils.checkpointing import atomic_torch_save
+from utils.checkpointing import atomic_torch_save, clean_state_dict
 from utils.hardware import (
     EMA,
     cl_input,
@@ -193,15 +193,22 @@ def train_stage2a(resume: bool = True):
     else:
         optimiser = base_opt
 
-    # SequentialLR with Linear Warmup and CosineAnnealingWarmRestarts
-    # Allows the model to warm up linearly, then stabilize at local optima while preventing catastrophic forgetting.
-    warmup_iters = max(1, int(cfg["epochs"]) // 10) * len(train_loader)
+    # Mirror Stage 1's MAX_STEPS_PER_EPOCH cap. On a 30 GB dataset the rooftop
+    # split can have tens of thousands of crops; capping makes epochs a fixed
+    # wall-clock budget and avoids OneCycle-style schedulers overshooting.
+    max_steps_per_epoch = int(getattr(CFG, "MAX_STEPS_PER_EPOCH", len(train_loader)))
+    capped_steps = min(len(train_loader), max_steps_per_epoch)
+
+    # SequentialLR with Linear Warmup and CosineAnnealingWarmRestarts.
+    # IMPORTANT: use capped_steps (actual optimizer steps per epoch) rather than
+    # len(train_loader) so the warmup and cosine decay match the real training pace.
+    warmup_iters = max(1, int(cfg["epochs"]) // 10) * capped_steps
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         base_opt, start_factor=0.1, total_iters=warmup_iters
     )
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         base_opt,
-        T_0=max(1, (int(cfg["epochs"]) * len(train_loader) - warmup_iters) // 3),
+        T_0=max(1, (int(cfg["epochs"]) * capped_steps - warmup_iters) // 3),
         T_mult=1,
         eta_min=float(cfg["lr"]) / 1000,
     )
@@ -227,7 +234,9 @@ def train_stage2a(resume: bool = True):
         # Report any silently-dropped keys (strict=False) AND catch shape
         # mismatches (which always raise) with a clear message.
         try:
-            incompatible = model.load_state_dict(state["model_state"], strict=False)
+            incompatible = model.load_state_dict(
+                clean_state_dict(state["model_state"], model.state_dict()), strict=False
+            )
             miss = list(getattr(incompatible, "missing_keys", []) or [])
             unexp = list(getattr(incompatible, "unexpected_keys", []) or [])
         except RuntimeError as e:
@@ -276,10 +285,8 @@ def train_stage2a(resume: bool = True):
 
     log.info(f"\n[Stage 2A] {cfg['arch']}  |  {vram_stats()}\n")
 
-    # Mirror Stage 1's MAX_STEPS_PER_EPOCH cap. On a 30 GB dataset the rooftop
-    # split can have tens of thousands of crops; capping makes epochs a fixed
-    # wall-clock budget and avoids OneCycle-style schedulers overshooting.
-    max_steps_per_epoch = int(getattr(CFG, "MAX_STEPS_PER_EPOCH", len(train_loader)))
+    # max_steps_per_epoch and capped_steps were computed above (before the scheduler).
+    # Both are used in the training loop below.
 
     for epoch in range(start_epoch, int(cfg["epochs"]) + 1):  # type: ignore
         model.train()
@@ -367,7 +374,11 @@ def train_stage2a(resume: bool = True):
                 ema.update(model)
 
             ep_loss += loss.item()
-            correct += (logits.argmax(1) == ya).sum().item()
+            # Use the ORIGINAL labels (before MixUp/CutMix shuffling) for the
+            # training accuracy metric. `ya` is the shuffled label — comparing
+            # predictions to it gives a biased signal (e.g. when lam=0.6,
+            # 40% of image content belongs to `yb` but gets counted as wrong).
+            correct += (logits.argmax(1) == labels).sum().item()
             total += labels.size(0)
 
             train_pbar.set_postfix(
@@ -507,6 +518,7 @@ def train_stage2b(resume: bool = True):
     data_yaml = _write_yolo_yaml()
     if not data_yaml:
         return None
+    _validate_yolo_yaml(data_yaml)  # catch malformed YAML before YOLO starts
 
     run_dir = CFG.CKPT_DIR / f"stage2b_{variant}"
     best_ckpt = run_dir / "weights" / "best.pt"
@@ -573,6 +585,53 @@ def train_stage2b(resume: bool = True):
         _ = detector.train(data_yaml, device=get_yolo_device())  # type: ignore
     log.info("\nStage 2B done.")
     return detector
+
+
+def _validate_yolo_yaml(data_yaml: str) -> None:
+    """Raise ValueError if data.yaml is malformed or references missing directories.
+
+    YOLO's .train() surfaces these as an opaque internal crash after spending
+    time initialising — validating upfront gives a clear, actionable error.
+    """
+    import yaml as _yaml
+
+    with open(data_yaml) as f:
+        data = _yaml.safe_load(f)
+
+    # 1. Required top-level keys
+    required = ["train", "val", "nc", "names"]
+    missing_keys = [k for k in required if k not in data]
+    if missing_keys:
+        raise ValueError(
+            f"data.yaml is missing required keys: {missing_keys}  (path={data_yaml})"
+        )
+
+    # 2. nc must match len(names)
+    nc = data["nc"]
+    names = data["names"]
+    if len(names) != nc:
+        raise ValueError(
+            f"data.yaml nc={nc} does not match len(names)={len(names)}  "
+            f"(path={data_yaml})"
+        )
+
+    # 3. Train/val image directories must exist
+    base = Path(data.get("path", ""))
+    for split_key in ("train", "val"):
+        rel = data[split_key]
+        split_dir = (base / rel) if base else Path(rel)
+        if not split_dir.exists():
+            log.warning(
+                "data.yaml %s directory does not exist: %s",
+                split_key,
+                split_dir,
+            )
+
+    log.info(
+        "[Stage 2B] data.yaml validated: nc=%d, names=%s",
+        nc,
+        names,
+    )
 
 
 def _write_yolo_yaml() -> str:

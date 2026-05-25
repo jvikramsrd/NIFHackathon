@@ -17,6 +17,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from utils.logger import get_logger
+
+log = get_logger(__name__)
+
+# Counter used to rate-limit the invalid-label warning so it doesn't flood logs.
+_invalid_label_warn_count: int = 0
+_INVALID_LABEL_WARN_EVERY: int = 100  # warn at most once per N forward passes
 
 def build_stage1_model(cfg: dict) -> nn.Module:
     """Build the configured smp architecture with scSE attention."""
@@ -56,7 +63,11 @@ def get_parameter_groups(model: nn.Module, cfg: dict) -> List[dict]:
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        is_enc = name.startswith("encoder")
+        # Use `in` instead of `startswith` so this works when the model is wrapped in
+        # DDP (prefix "module."), torch.compile (prefix "_orig_mod."), or both.
+        # With startswith("encoder") the check silently fails and the entire encoder
+        # gets the full decoder LR — 10x too high — causing mIoU to decrease.
+        is_enc = "encoder" in name
         no_wd = any(nd in name for nd in no_decay)
         if is_enc:
             (enc_nodecay if no_wd else enc_decay).append(param)
@@ -227,6 +238,22 @@ class TriLoss(nn.Module):
             return logits.new_tensor(0.0)
 
         if targets.max() >= C or targets.min() < 0:
+            global _invalid_label_warn_count
+            _invalid_label_warn_count += 1
+            if _invalid_label_warn_count % _INVALID_LABEL_WARN_EVERY == 1:
+                invalid_count = int(((targets < 0) | (targets >= C)).sum().item())
+                log.warning(
+                    "[TriLoss] Clamped %d invalid label pixel(s) in batch "
+                    "(min=%d, max=%d, valid range=[0, %d]). "
+                    "This may indicate a preprocessing bug or wrong mask palette. "
+                    "(warning %d/%d)",
+                    invalid_count,
+                    int(targets.min().item()),
+                    int(targets.max().item()),
+                    C - 1,
+                    _invalid_label_warn_count,
+                    _INVALID_LABEL_WARN_EVERY,
+                )
             targets = torch.clamp(targets, 0, C - 1)
 
         tgt = F.one_hot(targets, C).permute(0, 3, 1, 2).float()
