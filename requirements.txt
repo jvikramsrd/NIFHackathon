@@ -7,34 +7,54 @@
 #   Step 1 — PyTorch with CUDA 12.1 (for RTX A4000):
 #     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 #
-#   Step 2 — Geospatial stack (conda recommended for ECW support):
-#     conda install -c conda-forge libgdal-ecw rasterio fiona geopandas
-#     OR (pip only, no ECW):
-#     pip install rasterio fiona geopandas
+#   Step 2 — Geospatial stack:
 #
-#   Step 3 — Everything else:
+#     RECOMMENDED — pip (works on Windows, Linux, macOS):
+#       pip install rasterio fiona geopandas
+#
+#     ALTERNATIVE — conda (gives libgdal-ecw native ECW driver, no QGIS needed):
+#       conda install -c conda-forge libgdal-ecw rasterio fiona geopandas
+#
+#   Step 3 — ECW support (skip if using conda libgdal-ecw above):
+#
+#     Windows → Install QGIS (free):  https://qgis.org/download
+#       The pipeline calls utils/ecw_compat.ensure_ecw_driver() at startup
+#       which auto-detects QGIS and loads its ECW DLLs via ctypes so that
+#       rasterio.open() works on .ecw files directly — no temp file conversion,
+#       no disk overhead.  All shapefile burning, strip-reads, and tiling
+#       work identically on ECW as on GeoTIFF.
+#
+#     Linux / macOS → conda:
+#       conda install -c conda-forge libgdal-ecw
+#       (QGIS runtime injection is Windows-only; Linux uses the native driver)
+#
+#   Step 4 — Everything else:
 #     pip install -r requirements.txt
 #
-#   Step 4 — Optional CRF (requires VS Build Tools 2022):
+#   Step 5 — Optional CRF (requires VS Build Tools 2022 on Windows):
 #     pip install pydensecrf2
+#
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Deep Learning ─────────────────────────────────────════════════════════════
+# ── Deep Learning ──────────────────────────────────────────────────────────────
 segmentation-models-pytorch>=0.3.3
 timm>=0.9.12
 ultralytics>=8.1.0
 
-# ── Geospatial (install via conda for ECW — see above) ────────────────────────
+# ── Geospatial ─────────────────────────────────────────────────────────────────
+# rasterio, fiona, geopandas: pip install rasterio fiona geopandas
+#   OR: conda install -c conda-forge libgdal-ecw rasterio fiona geopandas
+# ECW: QGIS on Windows (auto-detected at runtime) OR conda libgdal-ecw
 shapely>=2.0.3
 pyproj>=3.6.1
-# rasterio, fiona, geopandas installed via conda above
 
-# ── Image Processing / Augmentation ──────────────────────────────────────────
+# ── Image Processing / Augmentation ───────────────────────────────────────────
 albumentations>=1.4.0
 opencv-python>=4.9.0
 Pillow>=10.2.0
+tifffile>=2023.1.1      # used by preprocessing helpers for GeoTIFF metadata
 
-# ── Instance Separation (Watershed) ──────────────────────────────────────────
+# ── Instance Separation (Watershed) ───────────────────────────────────────────
 scikit-image>=0.22.0
 
 # ── Small Object Detection ────────────────────────────────────────────────────
@@ -59,16 +79,14 @@ tensorboard>=2.16.0
 # ── GUI ───────────────────────────────────────────────────────────────────────
 PyQt6>=6.6.0
 
-# ── ONNX Export (graph only — runtime is optional, see notes below) ──────────
+# ── ONNX Export (graph only — runtime is optional, see notes below) ───────────
 onnx>=1.16.0
 
 # ── Optional dependencies ─────────────────────────────────────────────────────
-# Test runner — install via:    pip install -e .[dev]
-# CRF refinement —              pip install pydensecrf2
-# ONNX GPU runtime —            pip install onnxruntime-gpu  (or onnxruntime for CPU/AMD)
-# TensorRT —                    pip install nvidia-tensorrt --index-url https://pypi.ngc.nvidia.com
+# Test runner      — pip install -e .[dev]
+# CRF refinement   — pip install pydensecrf2
+# ONNX GPU runtime — pip install onnxruntime-gpu  (or onnxruntime for CPU/AMD)
+# TensorRT         — pip install nvidia-tensorrt --index-url https://pypi.ngc.nvidia.com
 #
-# These were previously pinned in this file. Forcing onnxruntime-gpu in core
-# broke fresh installs on CPU-only and AMD machines; install.sh and
-# setup_venv.bat both had workarounds for it. Pulled out to keep the base
-# install always succeed.
+# onnxruntime-gpu was previously pinned here; removed because it breaks fresh
+# installs on CPU-only and AMD machines.  Install manually if needed.

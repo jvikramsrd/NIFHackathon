@@ -30,11 +30,11 @@ from utils.checkpointing import atomic_torch_save, clean_state_dict
 from utils.ddp import is_main_process, make_loader, set_epoch, setup_ddp, wrap_ddp
 from utils.hardware import (
     EMA, compile_model, get_amp_context, maybe_backward, maybe_step, setup,
-    to_channels_last, vram_stats, worker_init_fn,
+    to_channels_last, vram_stats, warmup_cuda_graphs, worker_init_fn,
 )
 from utils.logger import crash_logged, get_logger
 from utils.metrics import SegmentationMetrics
-from utils.sam import SAM
+from utils.metrics import SegmentationMetrics
 
 log = get_logger(__name__)
 
@@ -80,21 +80,6 @@ def train_stage1(resume: bool = True):
 
     batch_size = int(cfg["batch_size"])
 
-    # ── VRAM auto-guard: SAM doubles peak activation memory ──────────────────
-    # SAM does TWO forward+backward passes per step. Keep a conservative guard
-    # even with the lighter Unet/MiT-B4 build.
-    use_sam_cfg = cfg.get("use_sam", False)
-    try:
-        vram_total = torch.cuda.get_device_properties(device).total_memory / 1024**3
-        if use_sam_cfg and vram_total <= 16.5 and batch_size > 2:
-            old_bs = batch_size
-            batch_size = max(1, batch_size // 2)
-            log.warning(
-                f"SAM enabled on {vram_total:.0f}GB GPU — auto-reducing batch "
-                f"{old_bs}→{batch_size} (effective batch preserved via grad_accum)"
-            )
-    except Exception:
-        pass
 
     try:
         # make_loader adds DistributedSampler automatically when DDP is active
@@ -140,32 +125,33 @@ def train_stage1(resume: bool = True):
     if CFG.COMPILE_ENABLED:
         module.model = compile_model(module.model, CFG.COMPILE_MODE)
 
+    # CUDA Graphs warmup: trigger torch.compile compilation + graph capture
+    # before the main loop so the first real step isn't slowed down.
+    if CFG.COMPILE_ENABLED and CFG.CUDA_GRAPHS_ENABLED:
+        try:
+            dummy_inp = torch.randn(
+                int(cfg["batch_size"]), int(cfg["in_channels"]),
+                int(cfg["patch_size"]), int(cfg["patch_size"]),
+                device=device,
+            )
+            warmup_cuda_graphs(module.model, device, dummy_inp, n_warmup=3)
+        except Exception:
+            pass
+
     # Wrap in DDP — no-op when world_size=1
     module.model = wrap_ddp(module.model, ddp)
 
     ema = EMA(module, decay=cfg["ema_decay"]) if cfg.get("use_ema") else None
 
-    # ── Optimiser with SAM ───────────────────────────────────────────────────
+    # ── Optimiser ────────────────────────────────────────────────────────────
     param_groups = module.parameter_groups()
-    base_opt = torch.optim.AdamW(param_groups, lr=cfg["lr"], weight_decay=cfg["weight_decay"])
-    use_sam = cfg.get("use_sam", False)
-    configured_grad_accum = int(cfg["grad_accum"])
-    grad_accum = 1 if use_sam else configured_grad_accum
-    if use_sam:
-        optimiser = SAM(base_opt, rho=cfg.get("sam_rho", 0.05), adaptive=cfg.get("sam_adaptive", True))
-        log.info(f"SAM enabled  rho={cfg['sam_rho']}  adaptive={cfg['sam_adaptive']}")
-        if configured_grad_accum != 1:
-            log.warning(
-                "SAM requires two passes over the same batch; using grad_accum=1 "
-                f"instead of configured value {configured_grad_accum}."
-            )
-    else:
-        optimiser = base_opt
+    optimiser = torch.optim.AdamW(param_groups, lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+    grad_accum = int(cfg["grad_accum"])
 
-    steps_per_ep = math.ceil(min(len(train_loader), int(getattr(CFG, "MAX_STEPS_PER_EPOCH", len(train_loader)))) / grad_accum)
+    steps_per_ep = math.ceil(min(len(train_loader), getattr(CFG, "MAX_STEPS_PER_EPOCH", len(train_loader))) / grad_accum)
     max_lrs = [g.get("lr", cfg["lr"]) for g in param_groups]
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimiser if not use_sam else base_opt,
+        optimiser,
         max_lr=max_lrs, epochs=cfg["epochs"], steps_per_epoch=steps_per_ep,
         pct_start=0.15, div_factor=25, final_div_factor=1e4,
     )
@@ -176,7 +162,7 @@ def train_stage1(resume: bool = True):
     if cfg.get("use_swa"):
         swa_model = torch.optim.swa_utils.AveragedModel(module)
         swa_scheduler = torch.optim.swa_utils.SWALR(
-            optimiser if not use_sam else base_opt, swa_lr=cfg["swa_lr"], anneal_epochs=5
+            optimiser, swa_lr=cfg["swa_lr"], anneal_epochs=5
         )
 
     # ── Metrics + checkpointing ──────────────────────────────────────────────
@@ -188,20 +174,20 @@ def train_stage1(resume: bool = True):
     last_ckpt_path = CFG.CKPT_DIR / "stage1_last.pth"
     start_epoch = 1
 
-    if resume and last_ckpt_path.exists() and is_main_process(ddp):
-        log.info(f"Resuming Stage 1 from: {last_ckpt_path}")
+    if resume and last_ckpt_path.exists():
+        if is_main_process(ddp):
+            log.info(f"Resuming Stage 1 from: {last_ckpt_path}")
         start_epoch, best_miou, no_improv = _load_training_state(
             module=module, optimiser=optimiser, scheduler=scheduler,
             ema=ema, ckpt_path=last_ckpt_path, device=device,
         )
-        log.info(f"Resume: start_epoch={start_epoch}, best_mIoU={best_miou:.4f}, no_improv={no_improv}")
+        if is_main_process(ddp):
+            log.info(f"Resume: start_epoch={start_epoch}, best_mIoU={best_miou:.4f}, no_improv={no_improv}")
 
     log.info(f"[Stage 1] Starting training — {cfg['epochs']} epochs")
     log.info(f"  Effective batch: {batch_size} × {grad_accum} = {batch_size * grad_accum}")
     log.info(f"  {vram_stats()}")
 
-    ms_training = cfg.get("ms_training", False)
-    ms_scales = cfg.get("ms_scales", (0.75, 1.0, 1.25))
     max_steps_per_epoch = int(getattr(CFG, "MAX_STEPS_PER_EPOCH", len(train_loader)))
 
     # ── Training loop ─────────────────────────────────────────────────────────
@@ -214,10 +200,7 @@ def train_stage1(resume: bool = True):
         set_epoch(train_loader, epoch)
 
         # Initialise gradients at epoch start
-        if use_sam:
-            base_opt.zero_grad(set_to_none=True)
-        else:
-            optimiser.zero_grad(set_to_none=True)
+        optimiser.zero_grad(set_to_none=True)
 
         capped_steps = min(len(train_loader), max_steps_per_epoch)
         train_pbar = tqdm(enumerate(train_loader), total=capped_steps,
@@ -231,94 +214,53 @@ def train_stage1(resume: bool = True):
             imgs = imgs.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
 
-            # Multi-scale training: resize to a random scale. Since the segmentation
-            # model is fully convolutional it accepts variable input sizes directly.
-            # A single resize preserves more detail than the old down→up approach.
-            # ``F.interpolate`` is fp32-safe and gains nothing from autocast — the
-            # original wrapped it in amp_ctx unnecessarily, which forced a
-            # downcast→upcast through the bf16 pipeline.
-            if ms_training and np.random.rand() < 0.5:
-                scale = float(np.random.choice(ms_scales))
-                orig_h, orig_w = imgs.shape[2], imgs.shape[3]
-                new_h = max(32, int(round(orig_h * scale / 32)) * 32)  # multiple of 32 for encoder
-                new_w = max(32, int(round(orig_w * scale / 32)) * 32)
-                if (new_h, new_w) != (orig_h, orig_w):
-                    imgs = F.interpolate(imgs, size=(new_h, new_w), mode="bilinear", align_corners=False)
-                    masks = F.interpolate(
-                        masks.unsqueeze(1).float(), size=(new_h, new_w), mode="nearest"
-                    ).squeeze(1).long()
-
-            if np.random.rand() < 0.2:
-                imgs, masks = _cutmix_seg(imgs, masks, alpha=cfg.get("cutmix_alpha", 1.0))
-
             def _forward():
                 with amp_ctx:
                     logits = module(imgs)
                     return module.loss(logits, masks) / grad_accum
 
-            if use_sam:
-                loss = _forward()
-                maybe_backward(loss, scaler)
-                # SAM's two-step protocol is incompatible with GradScaler's
-                # unscale-once semantics, so we disallow fp16+SAM at config time
-                # below; with bf16 the scaler is None and these calls are
-                # straight torch.* ops.
-                optimiser.first_step(zero_grad=True)
-                del loss
-                loss2 = _forward()
-                maybe_backward(loss2, scaler)
-                torch.nn.utils.clip_grad_norm_(module.parameters(), 1.0)
-                optimiser.second_step(zero_grad=True)
-                loss = loss2
-                try:
-                    scheduler.step()
-                except ValueError:
-                    pass
-                if ema:
-                    ema.update(module)
-            else:
-                loss = _forward()
-                maybe_backward(loss, scaler)
+            loss = _forward()
+            maybe_backward(loss, scaler)
 
-                if (step + 1) % grad_accum == 0:
-                    # We need to PEEK at the gradient norm before stepping,
-                    # so we can skip the step on a spike. The helper
-                    # ``maybe_step`` always steps, so we open-code the
-                    # scaler-aware sequence here.
-                    if scaler is not None:
-                        scaler.unscale_(optimiser)
-                    total_norm = torch.nn.utils.clip_grad_norm_(
-                        module.parameters(), 1.0,
+            if (step + 1) % grad_accum == 0:
+                # PEEK at gradient norm before stepping to skip on spike
+                if scaler is not None:
+                    scaler.unscale_(optimiser)
+                total_norm = torch.nn.utils.clip_grad_norm_(
+                    module.parameters(), 1.0,
+                )
+                if total_norm.item() > 10.0:
+                    log.warning(
+                        f"Gradient norm spike ({total_norm.item():.2f}) — skipping step"
                     )
-                    if total_norm.item() > 10.0:
-                        log.warning(
-                            f"Gradient norm spike ({total_norm.item():.2f}) — skipping step"
-                        )
-                        if scaler is not None:
-                            # Advance scaler bookkeeping without stepping;
-                            # update() also reacts to inf/nan grads detected
-                            # during unscale_, growing/decreasing the loss
-                            # scale as appropriate.
-                            scaler.update()
+                    if scaler is not None:
+                        scaler.update()
+                else:
+                    if scaler is not None:
+                        scaler.step(optimiser)
+                        scaler.update()
                     else:
-                        if scaler is not None:
-                            scaler.step(optimiser)
-                            scaler.update()
-                        else:
-                            optimiser.step()
-                        try:
-                            scheduler.step()
-                        except ValueError:
-                            pass
-                        if ema:
-                            ema.update(module)
-                    optimiser.zero_grad(set_to_none=True)
+                        optimiser.step()
+                    try:
+                        scheduler.step()
+                    except ValueError:
+                        pass
+                    if ema:
+                        ema.update(module)
+                optimiser.zero_grad(set_to_none=True)
 
             ep_loss += loss.item() * grad_accum
             train_pbar.set_postfix(loss=f"{loss.item() * grad_accum:.4f}")
 
         # Flush remaining gradients if steps run is not a multiple of grad_accum
-        if not use_sam and (actual_steps % grad_accum) != 0:
+        if (actual_steps % grad_accum) != 0:
+            # The loss was divided by grad_accum in _forward(), but we only accumulated
+            # (actual_steps % grad_accum) steps. Rescale gradients to correct magnitude.
+            scale_factor = grad_accum / (actual_steps % grad_accum)
+            for p in module.parameters():
+                if p.grad is not None:
+                    p.grad.data.mul_(scale_factor)
+            
             if scaler is not None:
                 scaler.unscale_(optimiser)
             total_norm = torch.nn.utils.clip_grad_norm_(module.parameters(), 1.0)
@@ -374,7 +316,7 @@ def train_stage1(resume: bool = True):
                 swa_scheduler.step()
 
         elapsed = time.time() - t0
-        lr_now = base_opt.param_groups[-1]["lr"] if use_sam else optimiser.param_groups[-1]["lr"]
+        lr_now = optimiser.param_groups[-1]["lr"]
 
         # Only log / checkpoint on rank-0 to avoid duplicate output
         if is_main_process(ddp):
@@ -399,7 +341,8 @@ def train_stage1(resume: bool = True):
         do_early_stop = is_main_process(ddp) and (no_improv >= patience)
         if ddp.enabled:
             import torch.distributed as dist
-            stop_tensor = torch.tensor(int(do_early_stop), device=device)
+            # gloo (used on Windows DDP) doesn't support broadcasting CUDA tensors
+            stop_tensor = torch.tensor(int(do_early_stop), device="cpu")
             dist.broadcast(stop_tensor, src=0)
             do_early_stop = bool(stop_tensor.item())
         if do_early_stop:
@@ -416,22 +359,6 @@ def train_stage1(resume: bool = True):
     log.info(f"\nStage 1 complete. Best mIoU: {best_miou:.4f}")
     return ckpt_path
 
-
-def _cutmix_seg(imgs: torch.Tensor, masks: torch.Tensor, alpha: float = 1.0):
-    B, C, H, W = imgs.shape
-    lam = np.random.beta(alpha, alpha)
-    idx = torch.randperm(B, device=imgs.device)
-    cut_rat = np.sqrt(1.0 - lam)
-    cut_w, cut_h = int(W * cut_rat), int(H * cut_rat)
-    cx, cy = np.random.randint(W), np.random.randint(H)
-    x1, y1 = max(cx - cut_w // 2, 0), max(cy - cut_h // 2, 0)
-    x2, y2 = min(cx + cut_w // 2, W), min(cy + cut_h // 2, H)
-    # Skip the full B×C×H×W clones — advanced indexing on the RHS already
-    # materialises a fresh tensor for the source slice, and the caller
-    # reassigns its `imgs`/`masks` reference, so in-place writes are safe.
-    imgs[:, :, y1:y2, x1:x2] = imgs[idx, :, y1:y2, x1:x2]
-    masks[:, y1:y2, x1:x2] = masks[idx, y1:y2, x1:x2]
-    return imgs, masks
 
 
 @torch.no_grad()
@@ -508,7 +435,7 @@ def _save_best(module, ema, epoch, miou, cfg, path):
         weights = {k: v.detach().cpu() for k, v in ema.shadow.items()}
     else:
         weights = module.state_dict()
-    atomic_torch_save({"epoch": epoch, "state_dict": weights, "val_miou": miou, "config": cfg}, path)
+    atomic_torch_save({"epoch": epoch, "state_dict": weights, "val_miou": miou, "config": dict(cfg)}, path)
 
 
 _OPTIM_SAVE_EVERY = 5  # write the heavy optimizer/scheduler state every N epochs
@@ -526,7 +453,7 @@ def _save_last(module, ema, optimiser, scheduler, epoch, best_miou, no_improv, c
     payload = {
         "epoch": epoch, "model_state": model_state, "ema_state": ema_state,
         "scheduler_state": scheduler.state_dict(),  # tiny, always save
-        "best_miou": float(best_miou), "no_improv": int(no_improv), "config": cfg,
+        "best_miou": float(best_miou), "no_improv": int(no_improv), "config": dict(cfg),
     }
     if epoch % _OPTIM_SAVE_EVERY == 0:
         payload["optimizer_state"] = optimiser.state_dict()

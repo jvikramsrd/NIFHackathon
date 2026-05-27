@@ -122,34 +122,40 @@ echo   PyTorch ready
 REM ── 5/6  Geospatial stack ───────────────────────────────────────────────────
 echo.
 echo [5/6] Installing geospatial stack...
-conda --version >nul 2>&1
-if not errorlevel 1 (
-    echo   conda found - installing with ECW support
-    conda install -c conda-forge libgdal-ecw rasterio fiona geopandas --yes --quiet 2>nul
-    if errorlevel 1 conda install -c conda-forge rasterio fiona geopandas --yes --quiet
-    echo   Installed via conda
-) else (
-    echo   conda not found - using pip
-    pip install rasterio fiona geopandas --only-binary :all: --quiet
+
+REM Try pip first (works on all Windows Python 3.10-3.13 without conda)
+pip install rasterio fiona geopandas --only-binary :all: --quiet 2>nul
+if errorlevel 1 (
+    echo   Binary wheels not available for this Python version.
+    echo   Trying Christoph Gohlke's pre-built wheels...
+    for /f "tokens=1,2 delims=." %%a in ('python -c "import sys; print(sys.version_info.major, sys.version_info.minor)"') do set "PYVER_MAJ=%%a" ^& set "PYVER_MIN=%%b"
+    set "GOHLKE=https://github.com/cgohlke/geospatial-wheels/releases/download/v2025.1.25"
+    set "GDAL_WHL=GDAL-3.10.3-cp!PYVER_MAJ!!PYVER_MIN!-cp!PYVER_MAJ!!PYVER_MIN!-win_amd64.whl"
+    set "RASTERIO_WHL=rasterio-1.4.3-cp!PYVER_MAJ!!PYVER_MIN!-cp!PYVER_MAJ!!PYVER_MIN!-win_amd64.whl"
+    set "FIONA_WHL=Fiona-1.10.1-cp!PYVER_MAJ!!PYVER_MIN!-cp!PYVER_MAJ!!PYVER_MIN!-win_amd64.whl"
+    pip install "!GOHLKE!/!GDAL_WHL!" "!GOHLKE!/!RASTERIO_WHL!" "!GOHLKE!/!FIONA_WHL!" --quiet 2>nul
+    pip install geopandas --quiet
     if errorlevel 1 (
-        echo   Binary install failed - trying GDAL wheel first...
-        for /f "tokens=1,2 delims=." %%a in ('python -c "import sys; print(sys.version_info.major, sys.version_info.minor)"') do set "PYVER_MAJ=%%a" & set "PYVER_MIN=%%b"
-        set "GDAL_WHL=GDAL-3.10.3-cp!PYVER_MAJ!!PYVER_MIN!-cp!PYVER_MAJ!!PYVER_MIN!-win_amd64.whl"
-        set "RASTERIO_WHL=rasterio-1.4.3-cp!PYVER_MAJ!!PYVER_MIN!-cp!PYVER_MAJ!!PYVER_MIN!-win_amd64.whl"
-        set "FIONA_WHL=Fiona-1.10.1-cp!PYVER_MAJ!!PYVER_MIN!-cp!PYVER_MAJ!!PYVER_MIN!-win_amd64.whl"
-        set "GOHLKE=https://github.com/cgohlke/geospatial-wheels/releases/download/v2025.1.25"
-        pip install "!GOHLKE!/!GDAL_WHL!" "!GOHLKE!/!RASTERIO_WHL!" "!GOHLKE!/!FIONA_WHL!" --quiet 2>nul
-        pip install geopandas --quiet
-        if errorlevel 1 (
-            echo   [WARN] rasterio/fiona could not be installed automatically.
-            echo   Python !PYVER_MAJ!.!PYVER_MIN! may not have pre-built wheels yet.
-            echo   Options:
-            echo     1. Install via conda:  conda install -c conda-forge rasterio fiona
-            echo     2. Install OSGeo4W, then re-run this script
-            echo     3. Use Python 3.12: python3.12 -m venv venv
-        )
+        echo   [WARN] rasterio/fiona could not be installed automatically.
+        echo   Try: conda install -c conda-forge rasterio fiona geopandas
     )
-    echo   Installed via pip
+)
+echo   rasterio / fiona / geopandas installed
+
+REM Check for QGIS (provides free ECW driver via DLL injection)
+set "QGIS_FOUND=0"
+for /d %%d in ("C:\Program Files\QGIS*") do (
+    if exist "%%d\apps\gdal\lib\gdalplugins\gdal_ECW_JP2ECW.dll" (
+        echo   QGIS ECW driver found: %%d
+        echo   ECW files will open directly (no conversion) via runtime DLL injection.
+        set "QGIS_FOUND=1"
+    )
+)
+if %QGIS_FOUND%==0 (
+    echo   [INFO] QGIS not found - ECW support requires one of:
+    echo     Option A ^(recommended^): Install QGIS - https://qgis.org/download
+    echo     Option B ^(conda^):       conda install -c conda-forge libgdal-ecw
+    echo   Non-ECW rasters ^(GeoTIFF, IMG^) work without QGIS.
 )
 
 REM ── 6/6  Pipeline dependencies + CRF + verify ───────────────────────────────

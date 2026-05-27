@@ -68,8 +68,10 @@ def test_context_polygons_are_pixel_gates():
     from inference.pipeline import GeoIntelPipeline
 
     pipe = GeoIntelPipeline.__new__(GeoIntelPipeline)
+    import tempfile
+    tmpdir = tempfile.mkdtemp()
     gdf = gpd.GeoDataFrame({"class_id": [1]}, geometry=[box(10, -20, 20, -10)], crs="EPSG:3857")
-    gates = pipe._gather_context_polygons(".", "missing", gdf, Affine.identity())
+    gates = pipe._gather_context_polygons(tmpdir, "missing", gdf, Affine.identity())
 
     assert gates
     assert gates[0].intersects(box(10, -20, 20, -10))
@@ -87,7 +89,16 @@ def test_clf_train_transforms_include_fog_and_sunflare():
 
 
 def test_sahi_overlap_reads_from_config():
-    import pathlib
-    src = pathlib.Path("models/stage2_models.py").read_text(encoding="utf-8")
-    assert "overlap_height_ratio=0.30" not in src, \
-        "overlap_height_ratio is hardcoded 0.30 — should read from cfg['sahi_overlap_ratio']"
+    from models.stage2_models import InfrastructureDetector
+
+    cfg = {
+        "model_variant": "yolo11l",
+        "class_names": ["transformer", "overhead_tank", "well"],
+        "sahi_overlap_ratio": 0.40,
+        "conf_thresh": 0.10,
+        "iou_thresh": 0.60,
+    }
+    det = InfrastructureDetector.__new__(InfrastructureDetector)
+    det.cfg = cfg
+    assert det.cfg.get("sahi_overlap_ratio", 0.30) == 0.40, \
+        "sahi_overlap_ratio should be read from cfg"

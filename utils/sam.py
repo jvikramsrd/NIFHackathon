@@ -119,8 +119,6 @@ class SAM(torch.optim.Optimizer):
         for group in self.param_groups:
             params, olds = [], []
             for p in group["params"]:
-                if p.grad is None:
-                    continue
                 buf = self.state.get(p, {}).get("old_p")
                 if buf is None:
                     continue

@@ -171,6 +171,26 @@ class RooftopDataset(Dataset):
         w = 1.0 / (counts + 1e-6)
         return w / w.sum() * len(self.class_names)
 
+    def get_sample_weights(self) -> torch.Tensor:
+        """
+        Return per-sample weights for WeightedRandomSampler.
+
+        Each sample receives weight = 1 / class_count for its class.
+        This ensures that in expectation, each class contributes equally
+        to every mini-batch — critical for Tin and Other which can be
+        <5% of SVAMITVA buildings.
+
+        Returns:
+            Tensor of shape (N,) with positive float weights.
+        """
+        labels = np.array([lbl for _, lbl in self.samples], dtype=np.int64)
+        counts = np.bincount(labels, minlength=len(self.class_names)).astype(np.float64)
+        # Inverse-frequency weight per class; clip to avoid div/0
+        class_w = 1.0 / np.maximum(counts, 1.0)
+        # Assign per-sample weight
+        sample_weights = class_w[labels]
+        return torch.from_numpy(sample_weights.astype(np.float32))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AUGMENTATION PIPELINES
@@ -550,7 +570,7 @@ def split_dataset(
     import logging as _logging
     _log = _logging.getLogger(__name__)
     _log.info(
-        "split_dataset: %d rasters → %d train / %d val rasters  "
+        "split_dataset: %d rasters -> %d train / %d val rasters  "
         "(%d train tiles, %d val tiles)  [seed=%d]",
         n_rasters, n_trn_r, n_val_r, len(trn_imgs), len(val_imgs), seed,
     )

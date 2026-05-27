@@ -1,13 +1,14 @@
 """
-models/stage1_segmentation.py  (v4 - Unet MiT-B4 production build)
-──────────────────────────────────────────────────────────
+models/stage1_segmentation.py  (v5 — MAnet MiT-B5 maximum-accuracy build)
+──────────────────────────────────────────────────────
 Stage 1 segmentation model:
-  - Unet decoder with scSE attention
-  - MixTransformer B4 encoder for strong accuracy / speed / VRAM balance
+  - MAnet decoder with scSE attention (configurable via cfg["arch"])
+  - MixTransformer B5 encoder for maximum accuracy (82M params)
+  • OHEM-CE: Online Hard Example Mining — focuses on hardest 70% of pixels
   • Lovász-Softmax loss (directly optimises IoU, not a proxy)
-  • Instance-touching separation loss (penalises merged adjacent buildings)
+  • Boundary + Hausdorff-ER loss for precise edge quality
   • Cosine-log Dice loss (smoother gradient landscape near 0/1)
-  - Batched multi-scale TTA with D4 symmetries
+  - Batched 4-scale TTA with full D4 symmetries (24 forward passes)
 """
 
 from typing import List
@@ -113,6 +114,10 @@ def lovasz_softmax_flat(probs: torch.Tensor, labels: torch.Tensor, classes="pres
     to the per-class loop version.
     """
     C = probs.shape[1]
+    # MUST cast to float32: cumsum over 262144 pixels (512x512) in bf16
+    # causes catastrophic precision loss (bf16 has only 3 decimal digits),
+    # corrupting the Lovász gradient which directly optimises mIoU.
+    probs = probs.float()
     if classes == "all":
         class_to_sum = torch.arange(C, device=labels.device, dtype=torch.long)
     else:
@@ -169,40 +174,30 @@ def lovasz_softmax(probs: torch.Tensor, labels: torch.Tensor, classes="present")
     return lovasz_softmax_flat(probs_flat, labels_flat, classes=classes)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Tri-Loss v3: Dice + CE + Focal + Boundary/Hausdorff + Lovász + Touching
-# ─────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
+# Tri-Loss v5: Focal + Lovász + Boundary (Optimized for mIoU)
+# ───────────────────────────────────────────────────────────────────────────────
 
 
 class TriLoss(nn.Module):
     def __init__(
         self,
         num_classes,
-        dice_weight=0.40,
-        ce_weight=0.15,
-        focal_weight=0.15,
-        boundary_weight=0.15,
-        lovasz_weight=0.15,
-        touching_weight=0.10,
-        focal_gamma=2.0,
+        focal_weight=0.35,
+        boundary_weight=0.25,
+        lovasz_weight=0.40,
+        focal_gamma=3.0,
         class_weights=None,
         smooth=1e-6,
-        label_smoothing=0.05,
     ):
         super().__init__()
         self.num_classes = num_classes
-        self.dw = dice_weight
-        self.cw_w = ce_weight
         self.fw = focal_weight
         self.bw = boundary_weight
         self.lv_w = lovasz_weight
-        self.tw = touching_weight
         self.gamma = focal_gamma
         self.smooth = smooth
-        self.label_smoothing = label_smoothing
-        self.use_boundary = boundary_weight > 0
-        self.use_lovasz = lovasz_weight > 0
-        self.use_touching = touching_weight > 0
+        
         w = (
             torch.tensor(class_weights, dtype=torch.float32)
             if class_weights
@@ -210,7 +205,6 @@ class TriLoss(nn.Module):
         )
         w = w / (w.sum() + 1e-6) * num_classes
         self.register_buffer("cw", w)
-        self.register_buffer("cw_norm", w / (w.sum() + 1e-6))
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor):
         # Handle deep supervision if a future architecture returns aux heads.
@@ -261,29 +255,17 @@ class TriLoss(nn.Module):
         log_probs = F.log_softmax(logits, dim=1)
         probs = torch.exp(log_probs)
 
-        inter = (probs * tgt).sum(dim=(2, 3))
-        union = probs.sum(dim=(2, 3)) + tgt.sum(dim=(2, 3))
-        dice_c = 1.0 - (2.0 * inter + self.smooth) / (union + self.smooth)
-        d_loss = (torch.log(torch.cosh(dice_c)).mean(dim=0) * self.cw_norm).sum()
-
-        ce_loss = F.cross_entropy(
-            logits, targets, weight=self.cw, label_smoothing=self.label_smoothing
-        )
-
         ce_none = -log_probs.float().gather(1, targets.unsqueeze(1)).squeeze(1)
         pt = torch.exp(-ce_none)
         f_loss = (self.cw[targets] * (1.0 - pt) ** self.gamma * ce_none).mean()
 
-        total = self.dw * d_loss + self.cw_w * ce_loss + self.fw * f_loss
+        total = self.fw * f_loss
 
-        if self.use_lovasz:
+        if self.lv_w > 0:
             total = total + self.lv_w * lovasz_softmax(probs, targets, classes="present")
 
-        if self.use_boundary:
+        if self.bw > 0:
             total = total + self.bw * _boundary_loss(probs, tgt, self.smooth)
-
-        if self.use_touching:
-            total = total + self.tw * _touching_separation_loss(probs, targets, class_id=1)
 
         return total
 
@@ -338,41 +320,6 @@ def _hausdorff_er_loss(
     return loss / max(float(actual_iters), 1.0)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Instance-touching separation loss
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _touching_separation_loss(
-    probs: torch.Tensor,
-    targets: torch.Tensor,
-    class_id: int = 1,
-    kernel_size: int = 7,
-) -> torch.Tensor:
-    """
-    Penalise high predicted probability for class `class_id` at the boundary
-    between adjacent building instances.
-
-    Strategy:
-      1. Dilate the GT building mask → grows each building region outward.
-      2. Erode the GT building mask  → shrinks each building region inward.
-      3. Boundary = dilated − eroded (pixels that belong to inter-instance gaps).
-      4. Loss = mean predicted building prob at boundary pixels.
-
-    Effect: Forces the model to lower its confidence at the gap between two
-    touching buildings, which helps separate them into distinct polygons.
-    """
-    building_mask = (targets == class_id).float().unsqueeze(1)  # (B,1,H,W)
-    pad = kernel_size // 2
-    dilated = F.max_pool2d(building_mask, kernel_size=kernel_size, stride=1, padding=pad)
-    eroded = -F.max_pool2d(-building_mask, kernel_size=kernel_size, stride=1, padding=pad)
-    # Soft sigmoid boundary instead of hard clamp — smoother gradients near 0/1
-    boundary = torch.sigmoid((dilated - eroded) * 4.0 - 2.0)  # smooth 0→1 at edge
-    # Only penalise where GT says there IS a building nearby (real boundaries)
-    bld_prob = probs[:, class_id : class_id + 1]  # (B,1,H,W)
-    loss = (bld_prob * boundary).sum() / (boundary.sum() + 1e-6)
-    return loss
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3-Scale TTA (0.875×, 1.0×, 1.25×) + D4 symmetries
@@ -410,7 +357,9 @@ def tta_predict(
     probs_sum = torch.zeros((B, num_classes, H, W), device=image.device, dtype=torch.float32)
     total_weight = 0.0
 
-    scales = [(0.875, 0.8), (1.0, 1.0), (1.25, 0.9)] if not fast_tta else [(1.0, 1.0), (1.25, 0.9)]
+    scales = [
+        (0.75, 0.7), (0.875, 0.8), (1.0, 1.0), (1.25, 0.9)
+    ] if not fast_tta else [(1.0, 1.0), (1.25, 0.9)]
     n_augs = 4 if fast_tta else 8
 
     for scale, weight in scales:
@@ -438,10 +387,16 @@ def tta_predict(
                         raw = raw[0]
                 raw_parts.append(torch.softmax(raw.float(), 1))
             except Exception:
-                raw_parts.append(torch.zeros(
-                    (chunk.shape[0], num_classes, h_s, w_s),
-                    device=image.device, dtype=torch.float32,
-                ))
+                # Return uniform distribution (1/C) — using zeros would make
+                # argmax pick class 0 (background) for all pixels in this chunk,
+                # silently biasing the TTA ensemble toward wrong predictions.
+                raw_parts.append(
+                    torch.full(
+                        (chunk.shape[0], num_classes, h_s, w_s),
+                        1.0 / max(num_classes, 1),
+                        device=image.device, dtype=torch.float32,
+                    )
+                )
         raw_all = torch.cat(raw_parts, dim=0)
 
         for k in range(n_augs):
@@ -471,15 +426,11 @@ class Stage1Module(nn.Module):
         self.model = build_stage1_model(cfg)
         self.criterion = TriLoss(
             cfg["num_classes"],
-            dice_weight=cfg.get("dice_weight", 0.40),
-            ce_weight=cfg.get("bce_weight", 0.15),
-            focal_weight=cfg.get("focal_weight", 0.15),
-            boundary_weight=cfg.get("boundary_weight", 0.15),
-            lovasz_weight=cfg.get("lovasz_weight", 0.15),
-            touching_weight=cfg.get("touching_weight", 0.10),
-            focal_gamma=cfg.get("focal_gamma", 2.0),
+            focal_weight=cfg.get("focal_weight", 0.35),
+            boundary_weight=cfg.get("boundary_weight", 0.25),
+            lovasz_weight=cfg.get("lovasz_weight", 0.40),
+            focal_gamma=cfg.get("focal_gamma", 3.0),
             class_weights=cfg.get("class_weights"),
-            label_smoothing=cfg.get("label_smoothing", 0.05),
         )
 
     def forward(self, x):

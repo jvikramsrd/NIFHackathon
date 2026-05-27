@@ -29,7 +29,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel,
-    QMainWindow, QProgressBar, QPushButton,
+    QMainWindow, QProgressBar, QPushButton, QCheckBox,
     QSizePolicy, QSlider, QSplitter, QStatusBar, QTabWidget,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget, QFrame,
     QGridLayout, QHeaderView, QTextEdit,
@@ -1107,7 +1107,7 @@ class PipelineTab(QWidget):
         self.mode_combo = QComboBox()
         self.mode_combo.addItems([
             "preprocess", "train_stage1", "train_stage2",
-            "train_all", "evaluate", "infer",
+            "train_all", "evaluate", "infer", "calibrate_stage2a"
         ])
         self.mode_combo.currentTextChanged.connect(self._on_mode_change)
         mode_row.addWidget(lbl)
@@ -1347,6 +1347,8 @@ class PipelineTab(QWidget):
                 "--test_folder", folder,
                 "--out_folder", self.out_label.text(),
             ]
+        elif mode == "calibrate_stage2a":
+            args = ["-m", "utils.calibration"]
         else:
             args = [str(ROOT / "run_pipeline.py"), "--mode", mode,
                     "--data_root", self.data_label.text()]
@@ -1521,8 +1523,11 @@ class MapViewerTab(QWidget):
         open_btn.clicked.connect(self._open_tif)
         mask_btn = QPushButton("Load Mask")
         mask_btn.clicked.connect(self._load_mask)
+        self.unc_checkbox = QCheckBox("Uncertainty Map")
+        self.unc_checkbox.toggled.connect(self._update_display)
         toolbar.addWidget(open_btn)
         toolbar.addWidget(mask_btn)
+        toolbar.addWidget(self.unc_checkbox)
         toolbar.addSpacing(16)
 
         toolbar.addWidget(QLabel("Overlay"))
@@ -1657,7 +1662,17 @@ class MapViewerTab(QWidget):
                 self._mask, (rgb_disp.shape[1], rgb_disp.shape[0]),
                 interpolation=cv2.INTER_NEAREST,
             )
-            overlay = _CLASS_COLORS[np.clip(mask_r, 0, len(_CLASS_COLORS) - 1)]
+            
+            if self.unc_checkbox.isChecked():
+                # Uncertainty overlay uses JET colormap
+                mask_r = np.clip(mask_r, 0, 255).astype(np.uint8)
+                # Map 0 -> lowest uncertainty (blue), 255 -> highest (red)
+                overlay = cv2.applyColorMap(mask_r, cv2.COLORMAP_JET)
+                overlay = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+            else:
+                # Class overlay uses predefined colors
+                overlay = _CLASS_COLORS[np.clip(mask_r, 0, len(_CLASS_COLORS) - 1)]
+                
             alpha = self.opacity_slider.value() / 100.0
             blended = (
                 rgb_disp.astype(np.float32) * (1 - alpha)
@@ -1684,8 +1699,17 @@ class ResultsTab(QWidget):
         refresh_btn.clicked.connect(self._load_results)
         browse_btn = QPushButton("Browse Outputs")
         browse_btn.clicked.connect(lambda: open_folder(ROOT / "outputs"))
+        
+        from PyQt6.QtGui import QDesktopServices
+        from PyQt6.QtCore import QUrl
+        report_btn = QPushButton("View HTML Report")
+        report_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(ROOT / "outputs" / "accuracy_report.html")))
+        )
+        
         toolbar.addWidget(refresh_btn)
         toolbar.addWidget(browse_btn)
+        toolbar.addWidget(report_btn)
         toolbar.addStretch()
         layout.addLayout(toolbar)
 
@@ -2117,7 +2141,7 @@ def _to_uint8(arr: np.ndarray) -> np.ndarray:
 
 def _set_pixmap(label: QLabel, rgb: np.ndarray):
     h, w = rgb.shape[:2]
-    _buf = bytes(np.ascontiguousarray(rgb).data)
+    _buf = np.ascontiguousarray(rgb).data
     img = QImage(_buf, w, h, w * 3, QImage.Format.Format_RGB888)
     pix = QPixmap.fromImage(img)
     target = label.size()
@@ -2210,6 +2234,10 @@ def main():
     base_font = QFont("Segoe UI Variable", 10)
     if not base_font.exactMatch():
         base_font = QFont("Segoe UI", 10)
+    if not base_font.exactMatch():
+        base_font = QFont("SF Pro", 10)
+    if not base_font.exactMatch():
+        base_font = QFont("Noto Sans", 10)
     app.setFont(base_font)
 
     app.setStyleSheet(build_qss())

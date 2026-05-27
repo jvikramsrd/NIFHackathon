@@ -87,54 +87,6 @@ def test_to_uint8_edge_cases():
     assert _to_uint8(np.zeros((0, 0, 3), dtype=np.uint8)).shape == (256, 256, 3)
 
 
-def test_to_uint8_vectorized_matches_original_simple():
-    """Vectorized _to_uint8 must produce identical output to the original."""
-    from pathlib import Path
-
-    # Load and execute just the _to_uint8 function
-    pipeline_path = Path(__file__).parent.parent / "inference" / "pipeline.py"
-    with open(pipeline_path) as f:
-        content = f.read()
-
-    exec_globals = {"np": np}
-    start_idx = content.find("def _to_uint8(arr):")
-    end_idx = content.find("\nif __name__", start_idx)
-    func_code = content[start_idx:end_idx]
-    exec(func_code, exec_globals)
-    _to_uint8 = exec_globals["_to_uint8"]
-
-    rng = np.random.default_rng(0)
-    arr16 = (rng.integers(0, 65535, (64, 64, 3))).astype(np.uint16)
-    arr2f = rng.random((32, 32, 2)).astype(np.float32) * 1000
-    arr2d = rng.integers(0, 255, (48, 48)).astype(np.uint8)
-
-    for arr in [arr16, arr2f, arr2d]:
-        out = _to_uint8(arr)
-        assert out.dtype == np.uint8, f"wrong dtype {out.dtype}"
-        assert out.ndim == 3, f"expected 3D output, got shape {out.shape}"
-        assert out.shape[2] == 3, f"expected 3 channels, got {out.shape[2]}"
-        assert out.min() >= 0 and out.max() <= 255
-
-
-def test_to_uint8_edge_cases_simple():
-    from pathlib import Path
-
-    # Load and execute just the _to_uint8 function
-    pipeline_path = Path(__file__).parent.parent / "inference" / "pipeline.py"
-    with open(pipeline_path) as f:
-        content = f.read()
-
-    exec_globals = {"np": np}
-    start_idx = content.find("def _to_uint8(arr):")
-    end_idx = content.find("\nif __name__", start_idx)
-    func_code = content[start_idx:end_idx]
-    exec(func_code, exec_globals)
-    _to_uint8 = exec_globals["_to_uint8"]
-
-    assert _to_uint8(None).shape == (256, 256, 3)
-    assert _to_uint8(np.array([])).shape == (256, 256, 3)
-    assert _to_uint8(np.zeros((0, 0, 3), dtype=np.uint8)).shape == (256, 256, 3)
-
 
 def test_dbf_value_normalization_maps_common_aliases():
     from data.preprocessing import canonical_mapped_label

@@ -58,7 +58,7 @@ class GeoIntelPipeline:
 
         log.info(f"[Pipeline] {vram_stats()}")
 
-        # Stage 1 — Unet + MiT-B4 (channels_last applied to match training)
+        # Stage 1 — MAnet + MiT-B4 (channels_last applied to match training)
         log.info("[1] Loading Stage-1 segmentation model …")
         ckpt = torch.load(stage1_ckpt, map_location=self.device, weights_only=False)
         self.seg = Stage1Module(CFG.STAGE1).to(self.device)
@@ -108,7 +108,7 @@ class GeoIntelPipeline:
         log.info("[3] Loading Stage-2B infrastructure detector …")
         self.detector = InfrastructureDetector(CFG.STAGE2B, str(CFG.CKPT_DIR))
         if stage2b_ckpt and Path(stage2b_ckpt).exists():
-            from ultralytics.models.yolo.model import YOLO
+            from ultralytics import YOLO
 
             self.detector.model = YOLO(str(stage2b_ckpt))
             self.detector._backend = "yolo"
@@ -160,10 +160,17 @@ class GeoIntelPipeline:
 
         if CFG.STAGE1.get("crf_inference"):
             log.info("  Dense CRF refinement …")
+            # Read per-run CRF parameters from config; fall back to corrected defaults.
+            # bi_xy_std=20: spatial kernel = 20px = 1m at 5cm GSD (old default: 80px = 4m).
             prob_map = apply_dense_crf(
                 img,
                 prob_map,
-                n_iter=int(CFG.STAGE1.get("crf_iter", 12)),
+                n_iter=int(CFG.STAGE1.get("crf_iter", 10)),
+                pos_xy_std=float(CFG.STAGE1.get("crf_pos_xy_std", 3.0)),
+                pos_w=float(CFG.STAGE1.get("crf_pos_w", 3.0)),
+                bi_xy_std=float(CFG.STAGE1.get("crf_bi_xy_std", 20.0)),
+                bi_rgb_std=float(CFG.STAGE1.get("crf_bi_rgb_std", 13.0)),
+                bi_w=float(CFG.STAGE1.get("crf_bi_w", 10.0)),
             )
             log.debug("  [DEBUG] Finished CRF.")
 
@@ -275,7 +282,7 @@ class GeoIntelPipeline:
         count_map = np.zeros((H, W), dtype=np.float32)
         window = self._seg_window
 
-        batch_size = 16
+        batch_size = int(CFG.STAGE1.get("inference_batch_size", 16))
         batch_inputs = []
         batch_coords = []
 
@@ -470,6 +477,16 @@ class GeoIntelPipeline:
                     preds[idx] = "Other"
                     continue
 
+                pad_top = max(0, -y1)
+                pad_bottom = max(0, y2 - H_img)
+                pad_left = max(0, -x1)
+                pad_right = max(0, x2 - W_img)
+
+                if pad_top > 0 or pad_bottom > 0 or pad_left > 0 or pad_right > 0:
+                    img_slice = cv2.copyMakeBorder(
+                        img_slice, pad_top, pad_bottom, pad_left, pad_right, cv2.BORDER_REFLECT_101
+                    )
+
                 crop = cv2.resize(img_slice, (crop_sz, crop_sz), interpolation=cv2.INTER_LINEAR)
                 inp = self.clf_tf(image=crop)["image"]
 
@@ -657,10 +674,20 @@ def _to_uint8(arr):
 
     bands = min(arr.shape[2], 3)
     img = arr[:, :, :bands].astype(np.float32)
-    lo = np.percentile(img, 2, axis=(0, 1), keepdims=True)
-    hi = np.percentile(img, 98, axis=(0, 1), keepdims=True)
+    
+    lo = np.zeros((1, 1, bands), dtype=np.float32)
+    hi = np.zeros((1, 1, bands), dtype=np.float32)
+    for b in range(bands):
+        valid = img[..., b][img[..., b] > 0]
+        if valid.size > 0:
+            lo[0, 0, b] = np.percentile(valid, 2)
+            hi[0, 0, b] = np.percentile(valid, 98)
+        else:
+            hi[0, 0, b] = 255.0
+
     safe = np.where(hi > lo, hi - lo, 1.0)
     out = np.clip((img - lo) / safe * 255.0, 0, 255).astype(np.uint8)
+    out[img == 0] = 0
     if bands < 3:
         fill = np.repeat(out[:, :, :1], 3 - bands, axis=2)
         out = np.concatenate([out, fill], axis=2)

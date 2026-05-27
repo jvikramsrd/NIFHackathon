@@ -134,7 +134,7 @@ def apply_dense_crf(
     n_iter: int = 10,
     pos_xy_std: float = 3.0,
     pos_w: float = 3.0,
-    bi_xy_std: float = 80.0,
+    bi_xy_std: float = 20.0,   # CORRECTED: 20px = 1m at 5cm drone GSD (was 80px = 4m)
     bi_rgb_std: float = 13.0,
     bi_w: float = 10.0,
 ) -> np.ndarray:
@@ -269,8 +269,10 @@ def clean_segmentation_mask(
     except Exception:
         kernel_close = None
     try:
+        road_close_sz = min_road + 15
+        road_close_sz += 1 if road_close_sz % 2 == 0 else 0
         kernel_road_close = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (min_road + 15, min_road + 15)
+            cv2.MORPH_ELLIPSE, (road_close_sz, road_close_sz)
         )
     except Exception:
         kernel_road_close = None

@@ -13,6 +13,11 @@ import torch
 import torch.nn as nn
 from utils.logger import get_logger
 
+try:
+    from torch._inductor.exc import InductorError as _InductorError
+except ImportError:
+    _InductorError = None
+
 log = get_logger(__name__)
 
 
@@ -78,7 +83,7 @@ def setup(seed: int = 42, verbose: bool = True) -> torch.device:
     # before any CUDA allocation happens.
     os.environ.setdefault(
         "PYTORCH_CUDA_ALLOC_CONF",
-        "expandable_segments:True,max_split_size_mb:256",
+        "max_split_size_mb:256",
     )
 
     try:
@@ -188,26 +193,118 @@ def worker_init_fn(worker_id: int):
         pass
 
 
+class _CompiledModelWrapper(nn.Module):
+    """Wrapper that catches InductorError at runtime and falls back to eager.
+
+    torch.compile with ``reduce-overhead`` mode uses CUDA Graphs, which
+    require static tensor shapes. Models with dynamic shapes (multi-scale
+    training, CutMix) can trigger ``InductorError: CantSplit`` on recompilation.
+    This wrapper catches that error once and falls back to the uncompiled model
+    for the remainder of training, avoiding a crash.
+    """
+
+    def __init__(self, compiled: nn.Module, uncompiled: nn.Module):
+        super().__init__()
+        self._compiled = compiled
+        self._uncompiled = uncompiled
+        self._fallback = False
+
+    def forward(self, *args, **kwargs):
+        if self._fallback:
+            return self._uncompiled(*args, **kwargs)
+        try:
+            return self._compiled(*args, **kwargs)
+        except Exception as e:
+            if _InductorError is not None and isinstance(e, _InductorError):
+                log.warning("torch.compile InductorError at runtime — falling back to eager: %s", e)
+            else:
+                log.warning("torch.compile runtime error — falling back to eager: %s", e)
+            self._fallback = True
+            return self._uncompiled(*args, **kwargs)
+
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            pass
+        _uncompiled = self.__dict__.get('_modules', {}).get('_uncompiled')
+        if _uncompiled is not None:
+            return getattr(_uncompiled, name)
+        raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute '{name}'"
+        )
+
+
 def compile_model(
-    model: nn.Module, mode: str = "reduce-overhead", fullgraph: bool = False
+    model: nn.Module, mode: str = "reduce-overhead", fullgraph: bool = False,
+    dynamic: bool = True,
 ) -> nn.Module:
     """
     torch.compile() with graceful fallback.
 
     mode:
-      "reduce-overhead"  — fastest to compile, best for training loops
+      "reduce-overhead"  — fastest to compile, best for training loops.
+                           Internally uses CUDA Graphs to capture and replay
+                           static subgraphs, reducing CPU launch overhead.
       "max-autotune"     — ~20 min compile, +5% runtime throughput
 
     fullgraph=True → safe for ConvNeXt (no dynamic control flow) → +8%.
     fullgraph=False → required for Swin-B (has conditional ops in attention).
+
+    dynamic=True → tell inductor to handle dynamic tensor shapes (needed
+    when multi-scale training or CutMix changes input dimensions between
+    batches). Without this, ``reduce-overhead`` mode can raise
+    ``InductorError: CantSplit`` on the first dynamic-shaped batch.
     """
     try:
-        compiled = torch.compile(model, mode=mode, fullgraph=fullgraph)
-        log.info(f"  torch.compile() applied (mode={mode}, fullgraph={fullgraph})")
-        return compiled
+        compiled = torch.compile(model, mode=mode, fullgraph=fullgraph, dynamic=dynamic)
+        log.info(f"  torch.compile() applied (mode={mode}, fullgraph={fullgraph}, dynamic={dynamic})")
+        return _CompiledModelWrapper(compiled, model)
     except Exception as e:
         log.info(f"  torch.compile() skipped: {e}")
         return model
+
+
+def warmup_cuda_graphs(
+    model: nn.Module,
+    device: torch.device,
+    sample_input: torch.Tensor,
+    sample_target: Optional[torch.Tensor] = None,
+    n_warmup: int = 3,
+) -> None:
+    """
+    Warmup the compiled model + CUDA Graphs by running dummy forward passes.
+
+    ``torch.compile(mode="reduce-overhead")`` captures CUDA Graphs lazily on
+    the first invocation. Running a few dummy batches ahead of the main loop
+    ensures the compilation and graph capture happen before training begins,
+    avoiding a latency spike on the first real step.
+
+    Args:
+        model: Compiled model (after ``torch.compile``).
+        device: Target device.
+        sample_input: A dummy input tensor matching the expected batch shape.
+        sample_target: Optional dummy target tensor (for loss computation).
+        n_warmup: Number of warmup iterations (default 3).
+    """
+    if not torch.cuda.is_available():
+        return
+    try:
+        log.info("  Warming up CUDA Graphs (%d iterations) …", n_warmup)
+        model.train()
+        with torch.no_grad():
+            for i in range(n_warmup):
+                inp = sample_input.to(device, non_blocking=True)
+                _ = model(inp)
+                if sample_target is not None:
+                    tgt = sample_target.to(device, non_blocking=True)
+                    _ = model(inp)
+                if i == 0:
+                    torch.cuda.synchronize()
+        torch.cuda.synchronize()
+        log.info("  CUDA Graphs warmup complete")
+    except Exception as e:
+        log.info("  CUDA Graphs warmup skipped: %s", e)
 
 
 def to_channels_last(model: nn.Module) -> nn.Module:

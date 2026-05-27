@@ -1,5 +1,7 @@
 """Called by setup_venv.bat and install.sh for verification steps."""
 import sys
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 
 def _get_device():
@@ -29,11 +31,28 @@ if mode in ("--torch", "--all"):
 
 if mode in ("--ecw", "--all"):
     try:
-        from osgeo import gdal
-        names = [gdal.GetDriver(i).ShortName for i in range(gdal.GetDriverCount())]
-        print("  ECW driver:", "YES" if "ECW" in names else "NO (conda install -c conda-forge libgdal-ecw)")
+        import sys, os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from utils.ecw_compat import ensure_ecw_driver, _find_qgis_roots, _ecw_dlls_for_root
+        ready = ensure_ecw_driver()
+        if ready:
+            # Determine which backend delivered ECW support
+            qgis_roots = _find_qgis_roots()
+            for root in qgis_roots:
+                ncs, plug = _ecw_dlls_for_root(root)
+                if ncs and plug:
+                    print(f"  ECW driver:  YES  (QGIS runtime injection — {root.name})")
+                    break
+            else:
+                print("  ECW driver:  YES  (native GDAL / conda libgdal-ecw)")
+        else:
+            print("  ECW driver:  NO")
+            print("  To enable ECW support on Windows:")
+            print("    Install QGIS (free):  https://qgis.org/download")
+            print("  On Linux/macOS:")
+            print("    conda install -c conda-forge libgdal-ecw")
     except Exception as e:
-        print("  ECW: cannot check -", e)
+        print(f"  ECW check failed: {e}")
 
 if mode in ("--verify", "--all"):
     import importlib
@@ -69,6 +88,26 @@ if mode in ("--verify", "--all"):
         except Exception as e:
             fail.append((pkg, str(e)))
 
+    # ECW driver status
+    try:
+        import sys, os
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from utils.ecw_compat import ensure_ecw_driver, _find_qgis_roots, _ecw_dlls_for_root
+        ecw_ok = ensure_ecw_driver()
+        if ecw_ok:
+            qgis_roots = _find_qgis_roots()
+            backend = "native GDAL"
+            for root in qgis_roots:
+                ncs, plug = _ecw_dlls_for_root(root)
+                if ncs and plug:
+                    backend = f"QGIS {root.name}"
+                    break
+            ok.append(("ECW driver", f"YES  [{backend}]"))
+        else:
+            fail.append(("ECW driver", "NO — install QGIS (Windows) or conda libgdal-ecw"))
+    except Exception as e:
+        fail.append(("ECW driver", str(e)))
+
     for pkg, attr in [("numpy", "__version__"), ("pandas", "__version__"),
                       ("matplotlib", "__version__"),
                       ("tensorboard", "__version__"), ("onnx", "__version__")]:
@@ -89,8 +128,8 @@ if mode in ("--verify", "--all"):
 
     print()
     for k, v in ok:
-        print(f"  ✓  {k:<34} {v}")
+        print(f"  [OK]   {k:<30} {v}")
     for k, v in fail:
-        print(f"  ✗  {k:<34} MISSING ({v})")
+        print(f"  [FAIL] {k:<30} MISSING ({v})")
     if fail:
         sys.exit(1)

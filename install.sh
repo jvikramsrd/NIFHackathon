@@ -171,20 +171,37 @@ step "5/6  Installing geospatial stack"
 if [[ "$SKIP_GEO" -eq 1 ]]; then
   warn "Skipped (--no-geo)"
 else
-  if command -v conda &>/dev/null; then
-    info "conda found — installing with ECW support"
-    conda install -c conda-forge libgdal-ecw rasterio fiona geopandas --yes --quiet 2>/dev/null || \
-      conda install -c conda-forge rasterio fiona geopandas --yes --quiet
-    ok "Installed via conda"
+  # pip-first: binary wheels for rasterio/fiona/geopandas exist for all
+  # supported Python versions on Linux and macOS.
+  info "Installing rasterio / fiona / geopandas via pip..."
+  pip install rasterio fiona geopandas --quiet 2>/dev/null || \
+    pip install rasterio fiona geopandas \
+        --find-links https://github.com/cgohlke/geospatial-wheels/releases \
+        --quiet || \
+    warn "rasterio/fiona pip install failed — try: conda install -c conda-forge rasterio fiona geopandas"
+  ok "rasterio / fiona / geopandas ready"
+
+  # ECW support on Linux/macOS requires the GDAL ECW driver.
+  # Unlike Windows (where utils/ecw_compat.py injects the QGIS ECW driver
+  # at runtime via ctypes), Linux/macOS need the native libgdal-ecw driver:
+  #   conda install -c conda-forge libgdal-ecw
+  # Check whether ECW is available in the current rasterio build:
+  ECW_STATUS=$(python -c "
+import sys, os; sys.path.insert(0, '$(pwd)')
+try:
+    from utils.ecw_compat import ensure_ecw_driver
+    print('YES' if ensure_ecw_driver() else 'NO')
+except Exception as e:
+    print('NO')
+" 2>/dev/null || echo 'NO')
+  if [[ "$ECW_STATUS" == "YES" ]]; then
+    ok "ECW driver: available (native GDAL or conda libgdal-ecw)"
   else
-    info "conda not found — using pip"
-    if [[ "$OS" == "linux" ]]; then
-      pip install rasterio fiona geopandas --quiet 2>/dev/null || \
-        pip install rasterio fiona geopandas --find-links https://github.com/cgohlke/geospatial-wheels/releases --quiet
-    else
-      pip install rasterio fiona geopandas --quiet
-    fi
-    ok "Installed via pip"
+    warn "ECW driver: NOT available"
+    warn "  To enable ECW support on Linux/macOS:"
+    warn "    conda install -c conda-forge libgdal-ecw"
+    warn "  (QGIS runtime injection is Windows-only)"
+    warn "  Non-ECW rasters (GeoTIFF, IMG) work without ECW support."
   fi
 fi
 

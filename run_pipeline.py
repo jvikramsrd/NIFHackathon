@@ -24,8 +24,22 @@ if __name__ == "__main__":
     multiprocessing.freeze_support()
 
 import argparse
+import json
 import sys
 from pathlib import Path
+
+# ── Windows UTF-8 console fix ────────────────────────────────────────────────
+# Windows cmd/PowerShell defaults to cp1252 which can't encode Unicode chars
+# (arrows, checkmarks, box-drawing) used in log messages. Reconfigure to UTF-8.
+import os, io
+if sys.platform == "win32":
+    os.environ.setdefault("PYTHONUTF8", "1")
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 sys.path.insert(0, str(Path(__file__).parent))
 from utils.logger import get_logger
@@ -124,8 +138,9 @@ def train_all():
     train_stage2a()
     clear_cuda_cache()
 
-    _header("STAGE 2B — Infrastructure Detector  (YOLOv9/OBB)")
+    _header("STAGE 2B — Infrastructure Detector  (YOLOv11l)")
     train_stage2b()
+    _write_results_json()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -230,6 +245,19 @@ def evaluate():
     out_path.write_text(json.dumps(results, indent=2))
     log.info(f"\nResults saved to: {out_path}")
     return results
+
+
+def _write_results_json():
+    """Quick summary after training, so the GUI dashboard has something to show."""
+    import json
+    results = {}
+    results_path = CFG.ROOT / "outputs" / "results.json"
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    if results_path.exists():
+        return  # already written by evaluate()
+    _header("Writing results summary for GUI dashboard")
+    results["train_all"] = {"note": "Training completed. Run --mode evaluate for full metrics."}
+    results_path.write_text(json.dumps(results, indent=2))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

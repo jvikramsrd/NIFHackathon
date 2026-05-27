@@ -15,6 +15,16 @@ license = { text = "NIF Hackathon" }
 
 # Core deps — torch is NOT listed here; install separately with the right
 # backend (CUDA / ROCm / MPS-CPU) using requirements-torch-*.txt
+#
+# ECW support:
+#   Windows — Install QGIS (https://qgis.org/download); the pipeline auto-
+#             injects the QGIS ECW driver via ctypes at startup so rasterio
+#             opens .ecw files directly (utils/ecw_compat.ensure_ecw_driver).
+#   Linux   — conda install -c conda-forge libgdal-ecw
+#
+# rasterio / fiona / geopandas are NOT listed here because they are best
+# installed separately (pip install rasterio fiona geopandas) to avoid
+# binary-wheel conflicts with system GDAL on various platforms.
 dependencies = [
     "segmentation-models-pytorch>=0.3.3",
     "timm>=0.9.12",
@@ -24,6 +34,7 @@ dependencies = [
     "albumentations>=1.4.0",
     "opencv-python>=4.9.0",
     "Pillow>=10.2.0",
+    "tifffile>=2023.1.1",       # GeoTIFF metadata helpers in preprocessing
     "scikit-image>=0.22.0",
     "sahi>=0.11.15",
     "numpy>=1.26.0",
