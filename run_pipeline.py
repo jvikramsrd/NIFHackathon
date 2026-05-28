@@ -54,7 +54,7 @@ import config as CFG
 
 
 def preprocess(data_root: str):
-    from data.preprocessing import preprocess_folder
+    from data.preprocessing import preprocess_dataset_root
 
     data_root_path = Path(data_root)
     if not data_root_path.exists():
@@ -66,57 +66,26 @@ def preprocess(data_root: str):
         log.error("Data root is not a directory: %s", data_root_path)
         return
 
-    candidates = [data_root_path] + [d for d in data_root_path.iterdir() if d.is_dir()]
-
-    RASTER_EXTS = {".tif", ".tiff", ".ecw", ".img"}
-    folders_with_rasters = []
-    for d in candidates:
-        has_raster = any(
-            f.suffix.lower() in RASTER_EXTS for f in d.iterdir() if f.is_file()
-        )
-        if has_raster:
-            folders_with_rasters.append(d)
-
-    if not folders_with_rasters:
-        log.error("No raster files found under %s", data_root_path)
-        log.info("  Expected structure:")
-        log.info("    dataset/cg/*.tif  +  *.shp")
-        log.info("    dataset/pb/*.tif  +  *.shp")
-        return
-
-    log.info(f"\nFolders to process: {[f.name for f in folders_with_rasters]}")
-
-    all_summaries = []
-    for folder in folders_with_rasters:
-        summary = preprocess_folder(str(folder), CFG)
-        all_summaries.append(summary)
+    summary = preprocess_dataset_root(
+        data_root=data_root_path,
+        output_root=CFG.DATA_ROOT,
+        patch_size=512,
+        overlap=0.20,
+        role_map=CFG.SHP_LAYER_ROLES,
+        resume=True,
+    )
 
     log.info(f"\n{'=' * 60}")
     log.info("  PREPROCESSING COMPLETE")
     log.info(f"{'=' * 60}")
-    total_patches = sum(int(s.get("patches", 0)) for s in all_summaries)
-    total_crops = sum(int(s.get("crops", 0)) for s in all_summaries)
-    total_infra = sum(int(s.get("infra", 0)) for s in all_summaries)
-    total_failed = sum(int(s.get("failed", 0)) for s in all_summaries)
-
-    for s in all_summaries:
-        folder_name = Path(str(s.get("folder", ""))).name
-        log.info(f"\n  {folder_name}/")
-        log.info(f"    Rasters processed : {s.get('rasters', 0)}")
-        log.info(f"    Rasters failed    : {s.get('failed', 0)}")
-        log.info(f"    Patches           : {s.get('patches', 0)}")
-        log.info(f"    Building crops    : {s.get('crops', 0)}")
-        log.info(f"    Infra objects     : {s.get('infra', 0)}")
-
-    log.info("\n  TOTALS:")
-    log.info(f"    Patches           : {total_patches}")
-    log.info(f"    Building crops    : {total_crops}")
-    log.info(f"    Infra objects     : {total_infra}")
-    log.info(f"    Failed rasters    : {total_failed}")
+    log.info(f"  Rasters processed : {summary.get('rasters', 0)}")
+    log.info(f"  Rasters failed    : {summary.get('failed', 0)}")
+    log.info(f"  Patches           : {summary.get('patches', 0)}")
+    log.info(f"  Background skips  : {summary.get('skipped_background', 0)}")
+    log.info(f"  Checkpoint file    : {summary.get('checkpoint', '')}")
     log.info("\n  Output dirs:")
     log.info(f"    Patches    → {CFG.PATCH_DIR}")
-    log.info(f"    Crops      → {CFG.CROP_DIR}")
-    log.info(f"    YOLO       → {CFG.YOLO_DIR}")
+    log.info(f"    Masks      → {CFG.MASK_DIR}")
     log.info(f"{'=' * 60}\n")
 
 

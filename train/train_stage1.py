@@ -34,7 +34,6 @@ from utils.hardware import (
 )
 from utils.logger import crash_logged, get_logger
 from utils.metrics import SegmentationMetrics
-from utils.metrics import SegmentationMetrics
 
 log = get_logger(__name__)
 

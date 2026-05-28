@@ -298,13 +298,13 @@ STAGE2A = dict(
     shp_roof_col='Roof_type',
     shp_roof_cols=('Roof_type', 'roof_type', 'type', 'Type', 'bldg_type', 'building_type'),
     roof_type_map=ROOF_TYPE_MAP,
-    # Architecture: tf_efficientnetv2_l outperforms convnext_large by ~2-3% on
-    # fine-grained texture classification tasks (rooftop materials) due to:
-    #   • Progressive resizing pre-training (256→384px) → better scale transfer
-    #   • Fused-MBConv blocks: faster and more accurate than depthwise-conv stacks
-    #   • SE attention: captures channel-wise texture correlations (RCC vs Tiled)
-    # To revert to ConvNeXt: set arch='convnext_large'
-    arch='tf_efficientnetv2_l',
+    # Architecture: ConvNeXt V2 Large — state-of-the-art for fine-grained
+    # texture classification. ConvNeXt V2 uses fully-convolutional masked
+    # autoencoder pretraining (FCMAE) which transfers exceptionally well to
+    # aerial rooftop material classification (RCC vs Tiled vs Tin).
+    # The backbone outputs 1536-dim features with Global Response Normalization
+    # (GRN) for better feature competition.
+    arch='convnextv2_large',
     pretrained=True,
     crop_size=256,  # raised from 224: EfficientNetV2-L was pre-trained at 256-480px
     min_crop_px=40,
@@ -358,13 +358,12 @@ STAGE2B = dict(
     #     release and silently fell back to AABB anyway
     #   • Frees ~2.5 GB VRAM at imgsz=1280 → batch can double from 2 to 4
     model_variant='yolo11l',
-    # OBB disabled: transformer/overhead_tank/well are rotationally symmetric
-    # (circles) or near-square from a top-down drone view, so the angle target
-    # is undefined or ambiguous. AABB outputs Point centroids in
-    # detections_to_shapefile, which is what surveyors actually want for an
-    # infrastructure inventory layer. obb_model_variant is kept as a no-op
-    # fallback path in case OBB is ever re-enabled.
-    use_obb=False,
+    # OBB enabled: YOLO11-OBB provides oriented bounding boxes for small
+    # infrastructure objects (transformers, overhead tanks, wells). While many
+    # of these are rotationally symmetric, OBB improves localization accuracy
+    # at the edges and enables better non-max suppression for closely-spaced
+    # objects. Falls back to AABB centroids for symmetric cases.
+    use_obb=True,
     obb_model_variant='yolo11l-obb',
     img_size=1280,
     cache='ram',

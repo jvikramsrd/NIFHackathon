@@ -23,12 +23,17 @@ Key behaviours:
   • Detailed per-file logging so you know exactly what succeeded/failed
 """
 
+import gc
+import json
 import os
 import re
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+
+from shapely.geometry import box as shapely_box, Polygon
 
 import cv2
 import geopandas as gpd
@@ -41,6 +46,7 @@ import rasterio.transform
 import rasterio.warp
 import rasterio.windows
 from tqdm import tqdm
+from utils.image_utils import to_uint8
 from utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -53,28 +59,18 @@ warnings.filterwarnings("ignore")
 # DEFLATE / COMPRESSED-TIF SUPPORT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _configure_gdal_for_deflate() -> None:
-    """Set GDAL environment variables for fast decompression of DEFLATE/LZW TIFs,
-    and inject the QGIS ECW driver so ECW files can be opened directly.
-
-    DEFLATE-compressed GeoTIFFs decompress serially by default.  Setting
-    GDAL_NUM_THREADS=ALL_CPUS enables parallel tile/strip decoding, giving
-    5-10x throughput improvement on multi-band large rasters.  This function
-    is idempotent — safe to call multiple times.
-    """
+def _configure_runtime() -> None:
+    """Set GDAL + OpenCV runtime options for maximum throughput."""
     os.environ.setdefault("GDAL_NUM_THREADS", "ALL_CPUS")
     os.environ.setdefault("GDAL_TIFF_INTERNAL_MASK", "YES")
-    # GDAL_DISABLE_READDIR_ON_OPEN avoids expensive directory scans for
-    # sidecar files (.ovr, .aux, .xml) on every rasterio.open() call.
     os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
-    # VSI_CACHE + VSI_CACHE_SIZE: enable in-process read-ahead cache (128 MB)
-    # for sequential strip reads, amortising Windows kernel call overhead.
     os.environ.setdefault("VSI_CACHE", "TRUE")
-    os.environ.setdefault("VSI_CACHE_SIZE", str(128 * 1024 * 1024))  # 128 MB
-
-    # Inject the QGIS ECW driver so ECW rasters can be opened directly by
-    # rasterio without any file conversion.  No-op if the driver is already
-    # registered (conda libgdal-ecw) or if QGIS is not installed.
+    os.environ.setdefault("VSI_CACHE_SIZE", str(128 * 1024 * 1024))
+    try:
+        cv2.setNumThreads(0)
+        cv2.ocl.setUseOpenCL(False)
+    except Exception:
+        pass
     try:
         from utils.ecw_compat import ensure_ecw_driver
         ensure_ecw_driver()
@@ -83,7 +79,7 @@ def _configure_gdal_for_deflate() -> None:
 
 
 # Apply once at import time so every rasterio.open() call benefits.
-_configure_gdal_for_deflate()
+_configure_runtime()
 
 
 
@@ -338,7 +334,7 @@ def _read_strip_rgb(raster_path: Path, row_off: int, strip_h: int) -> np.ndarray
                 band = src.read(1, window=win)
                 arr = np.stack([band] * 3, axis=-1)
     if arr.dtype != np.uint8:
-        arr = _to_uint8(arr)
+        arr = to_uint8(arr)
     return arr
 
 
@@ -1330,64 +1326,412 @@ def _extract_infra_streaming(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# RECURSIVE DATASET-ROOT PREPROCESSING  (migrated from data_prep_and_rasterization.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_DATA_ROOT = ROOT / "dataset"
+DEFAULT_PATCH_DIR = DEFAULT_DATA_ROOT / "patches"
+DEFAULT_MASK_DIR = DEFAULT_DATA_ROOT / "patch_masks"
+
+RASTER_EXTS = {".tif", ".tiff", ".ecw", ".img", ".vrt", ".jp2"}
+IGNORED_DIRS = {
+    ".git", ".idea", ".pytest_cache", "__pycache__",
+    "build", "dist", "logs", "outputs",
+    "venv", ".venv", "env", "wandb",
+    "patches", "patch_masks", "masks", "yolo_infra", "building_crops", "checkpoints",
+}
+IGNORED_FILE_SUFFIXES = {
+    ".aux", ".aux.xml", ".cpg", ".dbf", ".prj",
+    ".sbn", ".sbx", ".shx", ".xml", ".ovr", ".rrd", ".pyrx",
+}
+
+DEFAULT_ROLE_MAP: dict[str, int] = {
+    "built_up_area_type": 1,
+    "built_up_area_typ": 1,
+    "building": 1,
+    "buildings": 1,
+    "road": 2,
+    "road_centre_line": 2,
+    "road_center_line": 2,
+    "water_body": 3,
+    "water_body_line": 3,
+    "waterbody_point": 3,
+    "waterbody": 3,
+}
+
+
+@dataclass(slots=True)
+class ProcessingUnit:
+    folder: Path
+    rasters: list[Path]
+    shapefiles: list[Path]
+
+
+@dataclass(slots=True)
+class VectorLayer:
+    class_id: int
+    name: str
+    geometries: tuple
+    spatial_index: object | None
+
+
+def _normalize_name(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(text).strip().lower()).strip("_")
+
+
+def _resolve_role_map(role_map: Mapping[str, object] | None) -> dict[str, int]:
+    resolved = dict(DEFAULT_ROLE_MAP)
+    if not role_map:
+        return resolved
+    for key, value in role_map.items():
+        class_id = value[0] if isinstance(value, (tuple, list)) else value
+        try:
+            resolved[_normalize_name(key)] = int(class_id)
+        except Exception:
+            continue
+    return resolved
+
+
+def _is_noise_file(path: Path) -> bool:
+    lower = path.name.lower()
+    if lower.startswith("."):
+        return True
+    if any(lower.endswith(sfx) for sfx in IGNORED_FILE_SUFFIXES):
+        return True
+    if ".shp." in lower and lower.endswith(".lock"):
+        return True
+    return False
+
+
+def discover_processing_units(root: Path) -> list[ProcessingUnit]:
+    root = Path(root)
+    units: list[ProcessingUnit] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS and not d.startswith(".")]
+        current = Path(dirpath)
+        rasters: list[Path] = []
+        shapefiles: list[Path] = []
+        for filename in filenames:
+            path = current / filename
+            if _is_noise_file(path):
+                continue
+            suffix = path.suffix.lower()
+            if suffix in RASTER_EXTS:
+                rasters.append(path)
+            elif suffix == ".shp":
+                shapefiles.append(path)
+        if rasters:
+            units.append(
+                ProcessingUnit(
+                    folder=current,
+                    rasters=sorted(rasters),
+                    shapefiles=sorted(shapefiles),
+                )
+            )
+    return units
+
+
+def _safe_prefix(path: Path) -> str:
+    return re.sub(r"[^\w]+", "_", path.stem)[:80].strip("_") or "raster"
+
+
+def _load_vector_layer(shp_path: Path, target_crs, class_id: int) -> VectorLayer | None:
+    if class_id <= 0:
+        return None
+    try:
+        gdf = gpd.read_file(str(shp_path))
+    except Exception:
+        return None
+    if len(gdf) == 0:
+        return None
+    if gdf.crs is None:
+        raise ValueError(f"Shapefile has no CRS: {shp_path}")
+    if target_crs is not None and gdf.crs != target_crs:
+        gdf = gdf.to_crs(target_crs)
+    if len(gdf) == 0:
+        return None
+    geometries = []
+    for geom in gdf.geometry.values:
+        if geom is None or geom.is_empty:
+            continue
+        if not geom.is_valid:
+            try:
+                geom = geom.buffer(0)
+            except Exception:
+                continue
+        if geom is None or geom.is_empty:
+            continue
+        geometries.append(geom)
+    if not geometries:
+        return None
+    spatial_index = None
+    try:
+        spatial_index = gdf.sindex
+    except Exception:
+        pass
+    return VectorLayer(
+        class_id=class_id,
+        name=shp_path.stem,
+        geometries=tuple(geometries),
+        spatial_index=spatial_index,
+    )
+
+
+def _iter_tile_windows(width: int, height: int, patch_size: int, stride: int) -> Iterable[rasterio.windows.Window]:
+    patch_size = int(patch_size)
+    stride = max(1, int(stride))
+    row_starts = list(range(0, max(height, 1), stride))
+    col_starts = list(range(0, max(width, 1), stride))
+    row_starts.append(max(0, height - patch_size))
+    col_starts.append(max(0, width - patch_size))
+    row_starts = sorted(set(max(0, min(height - 1 if height else 0, r)) for r in row_starts))
+    col_starts = sorted(set(max(0, min(width - 1 if width else 0, c)) for c in col_starts))
+    seen: set[tuple[int, int]] = set()
+    for row in row_starts:
+        for col in col_starts:
+            key = (row, col)
+            if key in seen:
+                continue
+            seen.add(key)
+            yield rasterio.windows.Window(col_off=col, row_off=row, width=patch_size, height=patch_size)
+
+
+def _read_rgb_window(src: rasterio.io.DatasetReader, window: rasterio.windows.Window) -> np.ndarray:
+    band_count = min(3, src.count)
+    indexes = list(range(1, band_count + 1))
+    data = src.read(indexes=indexes, window=window, boundless=True, fill_value=0)
+    if data.ndim == 2:
+        data = data[np.newaxis, ...]
+    if data.shape[0] == 1:
+        data = np.repeat(data, 3, axis=0)
+    elif data.shape[0] == 2:
+        data = np.concatenate([data, data[:1]], axis=0)
+    data = np.moveaxis(data, 0, -1)
+    return to_uint8(data)
+
+
+def _query_indices(layer: VectorLayer, tile_box):
+    if layer.spatial_index is None:
+        return range(len(layer.geometries))
+    try:
+        return layer.spatial_index.query(tile_box, predicate="intersects")
+    except Exception:
+        try:
+            return layer.spatial_index.intersection(tile_box.bounds)
+        except Exception:
+            return range(len(layer.geometries))
+
+
+def _rasterize_window(
+    src: rasterio.io.DatasetReader,
+    layers: Sequence[VectorLayer],
+    window: rasterio.windows.Window,
+    patch_size: int,
+) -> np.ndarray:
+    mask = np.zeros((patch_size, patch_size), dtype=np.uint8)
+    tile_transform = rasterio.windows.transform(window, src.transform)
+    tile_box = shapely_box(*rasterio.windows.bounds(window, src.transform))
+    for layer in layers:
+        shapes = []
+        for idx in _query_indices(layer, tile_box):
+            geom = layer.geometries[int(idx)]
+            if geom is None or geom.is_empty:
+                continue
+            try:
+                if not geom.intersects(tile_box):
+                    continue
+            except Exception:
+                pass
+            shapes.append((geom, layer.class_id))
+        if not shapes:
+            continue
+        burned = rasterio.features.rasterize(
+            shapes,
+            out_shape=(patch_size, patch_size),
+            transform=tile_transform,
+            fill=0,
+            dtype=np.uint8,
+            merge_alg=rasterio.enums.MergeAlg.replace,
+        )
+        mask = np.where(burned > 0, burned, mask)
+    return mask
+
+
+def _load_checkpoint(checkpoint_path: Path) -> dict:
+    if not checkpoint_path.exists():
+        return {}
+    try:
+        return json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_checkpoint(checkpoint_path: Path, payload: dict) -> None:
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(checkpoint_path)
+
+
+def _raster_checkpoint_key(raster_path: Path, root: Path) -> str:
+    try:
+        return str(raster_path.relative_to(root).as_posix())
+    except Exception:
+        return raster_path.name
+
+
+def process_raster(
+    raster_path: Path,
+    shapefiles: Sequence[Path],
+    output_root: Path,
+    role_map: Mapping[str, object] | None = None,
+    patch_size: int = 512,
+    overlap: float = 0.20,
+) -> dict:
+    resolved_roles = _resolve_role_map(role_map)
+    stride = max(1, patch_size - int(round(patch_size * overlap)))
+    images_dir = output_root / "patches"
+    masks_dir = output_root / "patch_masks"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    masks_dir.mkdir(parents=True, exist_ok=True)
+    saved = 0
+    skipped_background = 0
+    layer_cache: list[VectorLayer] = []
+    with rasterio.open(str(raster_path)) as src:
+        target_crs = src.crs
+        for shp_path in shapefiles:
+            role_key = _normalize_name(shp_path.stem)
+            class_id = resolved_roles.get(role_key)
+            if class_id is None or class_id <= 0:
+                continue
+            layer = _load_vector_layer(shp_path, target_crs, class_id)
+            if layer is not None:
+                layer_cache.append(layer)
+        if not layer_cache:
+            return {"raster": str(raster_path), "saved": 0, "skipped_background": 0, "layers": 0}
+        prefix = _safe_prefix(raster_path)
+        for window in tqdm(
+            _iter_tile_windows(src.width, src.height, patch_size, stride),
+            desc=f"Rasterizing {raster_path.name}",
+            leave=False,
+        ):
+            image = _read_rgb_window(src, window)
+            mask = _rasterize_window(src, layer_cache, window, patch_size)
+            if not np.any(mask):
+                skipped_background += 1
+                continue
+            row = int(window.row_off)
+            col = int(window.col_off)
+            name = f"{prefix}_{row:06d}_{col:06d}.png"
+            cv2.imwrite(str(images_dir / name), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(str(masks_dir / name), mask)
+            saved += 1
+    gc.collect()
+    return {
+        "raster": str(raster_path),
+        "saved": saved,
+        "skipped_background": skipped_background,
+        "layers": len(layer_cache),
+    }
+
+
+def preprocess_dataset_root(
+    data_root: str | Path,
+    output_root: str | Path | None = None,
+    patch_size: int = 512,
+    overlap: float = 0.20,
+    role_map: Mapping[str, object] | None = None,
+    resume: bool = True,
+    checkpoint_name: str = ".preprocess_checkpoint.json",
+) -> dict:
+    _configure_runtime()
+    data_root = Path(data_root)
+    output_root = Path(output_root) if output_root is not None else DEFAULT_DATA_ROOT
+    checkpoint_path = output_root / checkpoint_name
+    state = _load_checkpoint(checkpoint_path) if resume else {}
+    units = discover_processing_units(data_root)
+    if not units:
+        return {
+            "root": str(data_root),
+            "rasters": 0,
+            "failed": 0,
+            "patches": 0,
+            "skipped_background": 0,
+            "checkpoint": str(checkpoint_path),
+        }
+    total_rasters = 0
+    total_failed = 0
+    total_patches = 0
+    total_skipped_background = 0
+    for unit in units:
+        for raster_path in unit.rasters:
+            total_rasters += 1
+            key = _raster_checkpoint_key(raster_path, data_root)
+            meta = {
+                "size": raster_path.stat().st_size,
+                "mtime_ns": raster_path.stat().st_mtime_ns,
+                "patch_size": int(patch_size),
+                "overlap": float(overlap),
+            }
+            if resume and state.get(key) == meta:
+                continue
+            try:
+                result = process_raster(
+                    raster_path=raster_path,
+                    shapefiles=unit.shapefiles,
+                    output_root=output_root,
+                    role_map=role_map,
+                    patch_size=patch_size,
+                    overlap=overlap,
+                )
+                total_patches += int(result.get("saved", 0))
+                total_skipped_background += int(result.get("skipped_background", 0))
+                state[key] = meta
+            except Exception:
+                total_failed += 1
+            finally:
+                gc.collect()
+    if resume:
+        _save_checkpoint(checkpoint_path, state)
+    return {
+        "root": str(data_root),
+        "rasters": total_rasters,
+        "failed": total_failed,
+        "patches": total_patches,
+        "skipped_background": total_skipped_background,
+        "checkpoint": str(checkpoint_path),
+    }
+
+
+def build_preprocess_parser() -> argparse.ArgumentParser:
+    import argparse
+    parser = argparse.ArgumentParser(description="Recursive SVAMITVA preprocessing")
+    parser.add_argument("--data-root", type=str, default=str(DEFAULT_DATA_ROOT))
+    parser.add_argument("--output-root", type=str, default=str(DEFAULT_DATA_ROOT))
+    parser.add_argument("--patch-size", type=int, default=512)
+    parser.add_argument("--overlap", type=float, default=0.20)
+    parser.add_argument("--no-resume", action="store_true")
+    return parser
+
+
+def preprocess_main(argv: Sequence[str] | None = None) -> int:
+    args = build_preprocess_parser().parse_args(argv)
+    summary = preprocess_dataset_root(
+        data_root=args.data_root,
+        output_root=args.output_root,
+        patch_size=args.patch_size,
+        overlap=args.overlap,
+        resume=not args.no_resume,
+    )
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _to_uint8(arr: np.ndarray) -> np.ndarray:
-    """
-    Convert any numeric raster array to uint8 with per-channel 2nd–98th percentile
-    stretch.
 
-    Using min-max stretch (the old approach) is distorted by sensor outliers and
-    dead pixels, causing colour channels to shift relative to each other.
-    Percentile stretch preserves natural colour ratios and is the industry standard
-    for drone orthomosaic display.
-    """
-    if arr.dtype == np.uint8:
-        return arr
-
-    arr_f = arr.astype(np.float32)
-
-    if arr_f.ndim == 3:
-        C = arr_f.shape[2]
-        # Build a (C, 2) array of (p2, p98) across non-zero pixels per channel.
-        # Vectorising over the spatial axes drops C Python iterations + C percentile
-        # calls — the per-strip cost was dominating large-raster preprocessing.
-        lo = np.zeros(C, dtype=np.float32)
-        hi = np.ones(C, dtype=np.float32)
-        for i in range(C):
-            ch = arr_f[:, :, i]
-            nz = ch[ch > 0]
-            if nz.size > 0:
-                p2, p98 = np.percentile(nz, [2, 98])
-                if p98 <= p2:
-                    p2, p98 = float(ch.min()), float(ch.max())
-            else:
-                p2, p98 = 0.0, 1.0
-            lo[i] = p2
-            hi[i] = p98
-        denom = np.where(hi > lo, hi - lo, 1.0).astype(np.float32)
-        scaled = (arr_f - lo) / denom * 255.0
-        out = np.clip(scaled, 0, 255)
-        # Zero out channels that were degenerate (all-zero range)
-        degenerate = (hi <= lo)
-        if degenerate.any():
-            out[:, :, degenerate] = 0
-    else:
-        flat = arr_f[arr_f > 0]
-        if flat.size > 0:
-            p2, p98 = np.percentile(flat, [2, 98])
-            if p98 <= p2:
-                p2, p98 = float(arr_f.min()), float(arr_f.max())
-        else:
-            p2, p98 = 0.0, 1.0
-        if p98 == p2:
-            out = np.zeros_like(arr_f)
-        else:
-            out = np.clip((arr_f - p2) / (p98 - p2) * 255.0, 0, 255)
-        if out.ndim == 2:
-            out = np.stack([out] * 3, axis=-1)
-
-    return out.astype(np.uint8)
 

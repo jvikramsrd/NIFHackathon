@@ -129,16 +129,15 @@ class ArcFaceHead(nn.Module):
 
 class RooftopClassifier(nn.Module):
     """
-    EfficientNetV2-L (or ConvNeXt-Large) fine-tuned for 4-class rooftop
-    classification with:
+    ConvNeXt V2 Large fine-tuned for 4-class rooftop classification with:
     - Generalized Mean Pooling (GeM) for better texture discrimination
     - ArcFace angular-margin head for tighter class separation
     - 3-scale × 8-fold (or 4-fold) TTA at inference
     - MixUp + CutMix training augmentation
 
     Backbone selection via cfg["arch"]:
-      'tf_efficientnetv2_l' (default): +2-3% accuracy on texture tasks
-      'convnext_large': original, slightly faster to train
+      'convnextv2_large' (default): SOTA FCMAE pretraining, 1536-dim features
+      'tf_efficientnetv2_l': alternative EfficientNetV2-L backbone
     """
 
     def __init__(self, cfg: dict):
@@ -159,7 +158,7 @@ class RooftopClassifier(nn.Module):
         # GeM pooling: learnable exponent p, initialized at 3.0 (standard).
         # Falls back to avg-pool behaviour at p=1.0 if learning drives it there.
         self.gem = GeMPooling(p=3.0)
-        in_features = self.backbone.num_features  # 1280 for EfficientNetV2-L, 1536 for ConvNeXt-L
+        in_features = self.backbone.num_features  # 1536 for ConvNeXt V2 Large, 1280 for EfficientNetV2-L
 
         # Scale hidden dim proportionally to backbone features
         hidden_dim = max(512, in_features // 2)
@@ -402,10 +401,14 @@ class InfrastructureDetector:
         try:
             from ultralytics import YOLO  # type: ignore
 
-            variant = self.cfg.get("model_variant", "yolo11l")
+            use_obb = self.cfg.get("use_obb", False)
+            if use_obb:
+                variant = self.cfg.get("obb_model_variant", "yolo11l-obb")
+            else:
+                variant = self.cfg.get("model_variant", "yolo11l")
             self.model = YOLO(f"{variant}.pt")
             self._backend = "yolo"
-            log.info(f"  YOLO loaded: {variant}")
+            log.info(f"  YOLO loaded: {variant}" + (" (OBB)" if use_obb else ""))
         except ImportError:
             log.warning("ultralytics not found → falling back to Faster R-CNN")
             self._backend = "frcnn"
@@ -498,6 +501,7 @@ class InfrastructureDetector:
         default_thresh = self.cfg.get("conf_thresh", 0.10)
 
         raw_dets: list = []
+        use_obb = self.cfg.get("use_obb", False)
 
         if use_sahi:
             sahi_model = self._get_sahi_model()
@@ -514,16 +518,14 @@ class InfrastructureDetector:
                         overlap_height_ratio=overlap_ratio,
                         overlap_width_ratio=overlap_ratio,
                         perform_standard_pred=False,
-                        postprocess_type="GREEDYNMM",  # upgraded: +1.5% mAP@0.5 vs NMM
+                        postprocess_type="GREEDYNMM",
                         postprocess_match_threshold=0.50,
                         postprocess_max_detections=self.cfg.get("max_det", 1500),
                         verbose=0,
                     )
                     for pred in result.object_prediction_list:
                         bbox = pred.bbox
-                        # Use category name for robust class lookup (not raw ID)
                         pred_cls_name = pred.category.name.lower()
-                        # Find matching class index in our config
                         cid = next(
                             (i for i, c in enumerate(self.cfg["class_names"]) if c.lower() == pred_cls_name),
                             pred.category.id,
@@ -540,6 +542,7 @@ class InfrastructureDetector:
                     use_sahi = False
 
         if not use_sahi or not raw_dets:
+            task = "obb" if use_obb else "detect"
             results = self.model(
                 img_source,
                 conf=min(class_thresholds.values()) if class_thresholds else default_thresh,
@@ -547,22 +550,34 @@ class InfrastructureDetector:
                 max_det=self.cfg.get("max_det", 300),
                 augment=True,
                 agnostic_nms=bool(self.cfg.get("agnostic_nms", False)),
+                task=task,
             )
             for r in results:
-                obb = getattr(r, "obb", None) if self.cfg.get("use_obb") else None
-                boxes = obb if obb is not None and getattr(obb, "xyxy", None) is not None else r.boxes
-                xyxy_values = boxes.xyxy
-                for i, box in enumerate(boxes):
-                    cid = int(box.cls)
-                    xywhr_tensor = getattr(box, "xywhr", None)
-                    xywhr_list = xywhr_tensor.squeeze(0).tolist() if xywhr_tensor is not None else None
-                    raw_dets.append({
-                        "class_id": cid,
-                        "class_name": self.cfg["class_names"][cid],
-                        "bbox_xyxy": xyxy_values[i].tolist(),
-                        "obb_xywhr": xywhr_list,
-                        "conf": float(box.conf),
-                    })
+                obb_boxes = getattr(r, "obb", None) if use_obb else None
+                if obb_boxes is not None:
+                    for i, box in enumerate(obb_boxes):
+                        cid = int(box.cls)
+                        xywhr = box.xywhr.squeeze(0).tolist() if box.xywhr is not None else None
+                        xyxyn = box.xyxy
+                        raw_dets.append({
+                            "class_id": cid,
+                            "class_name": self.cfg["class_names"][cid] if cid < len(self.cfg["class_names"]) else "unknown",
+                            "bbox_xyxy": xyxyn[i].tolist() if xyxyn is not None else [0, 0, 0, 0],
+                            "obb_xywhr": xywhr,
+                            "conf": float(box.conf),
+                        })
+                else:
+                    for i, box in enumerate(r.boxes):
+                        cid = int(box.cls)
+                        xywhr_tensor = getattr(box, "xywhr", None)
+                        xywhr_list = xywhr_tensor.squeeze(0).tolist() if xywhr_tensor is not None else None
+                        raw_dets.append({
+                            "class_id": cid,
+                            "class_name": self.cfg["class_names"][cid] if cid < len(self.cfg["class_names"]) else "unknown",
+                            "bbox_xyxy": box.xyxy[i].tolist(),
+                            "obb_xywhr": xywhr_list,
+                            "conf": float(box.conf),
+                        })
 
         # Apply per-class confidence thresholds
         out = []

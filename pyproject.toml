@@ -22,13 +22,13 @@ license = { text = "NIF Hackathon" }
 #             opens .ecw files directly (utils/ecw_compat.ensure_ecw_driver).
 #   Linux   — conda install -c conda-forge libgdal-ecw
 #
-# rasterio / fiona / geopandas are NOT listed here because they are best
-# installed separately (pip install rasterio fiona geopandas) to avoid
-# binary-wheel conflicts with system GDAL on various platforms.
 dependencies = [
     "segmentation-models-pytorch>=0.3.3",
     "timm>=0.9.12",
     "ultralytics>=8.1.0",
+    "geopandas>=0.14.4",
+    "rasterio>=1.3.10",
+    "fiona>=1.9.6",
     "shapely>=2.0.3",
     "pyproj>=3.6.1",
     "albumentations>=1.4.0",

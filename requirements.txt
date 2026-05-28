@@ -45,6 +45,9 @@ ultralytics>=8.1.0
 # rasterio, fiona, geopandas: pip install rasterio fiona geopandas
 #   OR: conda install -c conda-forge libgdal-ecw rasterio fiona geopandas
 # ECW: QGIS on Windows (auto-detected at runtime) OR conda libgdal-ecw
+geopandas>=0.14.4
+rasterio>=1.3.10
+fiona>=1.9.6
 shapely>=2.0.3
 pyproj>=3.6.1
 

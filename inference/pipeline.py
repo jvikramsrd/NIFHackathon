@@ -36,6 +36,7 @@ from utils.hardware import (
     to_channels_last,
     vram_stats,
 )
+from utils.inference import sliding_window_inference
 from utils.logger import crash_logged, get_logger
 from utils.postprocess import (
     apply_dense_crf,
@@ -151,7 +152,7 @@ class GeoIntelPipeline:
                 img = np.stack([img[:, :, 0]] * 3, axis=-1)
 
         if img.dtype != np.uint8:
-            img = _to_uint8(img)
+            img = to_uint8(img)
 
         # ── Stage 1: Segmentation (Segmentation Mask Generation) ──────────────────────────────────────────
         log.info("[Stage 1] Tiled segmentation …")
@@ -263,98 +264,25 @@ class GeoIntelPipeline:
     # ── Stage 1 tiled inference ───────────────────────────────────────────────
 
     def _segment(self, img_rgb: np.ndarray) -> np.ndarray:
-        H, W = img_rgb.shape[:2]
-        if H == 0 or W == 0:
-            raise ValueError(f"Invalid image dimensions: {H}x{W}")
-
         ps = int(CFG.STAGE1["patch_size"])
-        if ps <= 0:
-            raise ValueError(f"Invalid patch_size: {ps}")
-
         overlap = int(CFG.STAGE1["overlap"])
-        stride = max(1, ps - overlap)
         C = int(CFG.STAGE1["num_classes"])
-
-        if C <= 0:
-            raise ValueError(f"Invalid num_classes: {C}")
-
-        prob_sum = np.zeros((C, H, W), dtype=np.float32)
-        count_map = np.zeros((H, W), dtype=np.float32)
-        window = self._seg_window
-
         batch_size = int(CFG.STAGE1.get("inference_batch_size", 16))
-        batch_inputs = []
-        batch_coords = []
 
-        with torch.no_grad():
-            for r in tqdm(range(0, H, stride), desc="  tiles"):
-                for c in range(0, W, stride):
-                    r2, c2 = min(r + ps, H), min(c + ps, W)
-                    if r2 <= r or c2 <= c:
-                        continue
-                    patch = img_rgb[r:r2, c:c2].copy()
-                    if patch.size == 0:
-                        continue
-                    ph, pw = patch.shape[:2]
-
-                    if ph < ps or pw < ps:
-                        pad = cv2.copyMakeBorder(
-                            patch, 0, ps - ph, 0, ps - pw, cv2.BORDER_REFLECT_101
-                        )
-                    else:
-                        pad = patch
-                    aug = self.seg_tf(image=pad)
-                    inp = aug["image"]
-
-                    batch_inputs.append(inp)
-                    batch_coords.append((r, r2, c, c2, ph, pw))
-
-                    if len(batch_inputs) == batch_size:
-                        inp_tensor = torch.stack(batch_inputs).to(self.device)
-                        probs = (
-                            tta_predict(
-                                self.seg.model,
-                                inp_tensor,
-                                C,
-                                CFG.AMP_DTYPE,
-                                fast_tta=CFG.FAST_TTA,
-                            )
-                            .cpu()
-                            .numpy()
-                        )
-                        for i, (br, br2, bc, bc2, bph, bpw) in enumerate(batch_coords):
-                            wind_slice = window[:bph, :bpw]
-                            prob_sum[:, br:br2, bc:bc2] += (
-                                probs[i, :, :bph, :bpw] * wind_slice
-                            )
-                            count_map[br:br2, bc:bc2] += wind_slice
-                        batch_inputs = []
-                        batch_coords = []
-
-            if len(batch_inputs) > 0:
-                inp_tensor = torch.stack(batch_inputs).to(self.device)
-                probs = (
-                    tta_predict(
-                        self.seg.model, inp_tensor, C, CFG.AMP_DTYPE, fast_tta=CFG.FAST_TTA
-                    )
-                    .cpu()
-                    .numpy()
-                )
-                for i, (br, br2, bc, bc2, bph, bpw) in enumerate(batch_coords):
-                    wind_slice = window[:bph, :bpw]
-                    prob_sum[:, br:br2, bc:bc2] += probs[i, :, :bph, :bpw] * wind_slice
-                    count_map[br:br2, bc:bc2] += wind_slice
-
-        log.debug("  [DEBUG] Tiling loop finished. Returning averaged probability map...")
-        # Compute the final averaged probability map, then explicitly free the
-        # large intermediate arrays.  For a 5000×5000-px orthophoto with 4
-        # classes, prob_sum is ~400 MB (float32) and count_map ~25 MB — leaving
-        # them alive through downstream classification and vectorisation causes
-        # unnecessary memory pressure and OOM errors on large rasters.
-        averaged = prob_sum / np.maximum(count_map, 1e-6)
-        del prob_sum, count_map
+        prob_map = sliding_window_inference(
+            model=self.seg.model,
+            image=img_rgb,
+            patch_size=ps,
+            overlap=overlap,
+            num_classes=C,
+            transform=self.seg_tf,
+            batch_size=batch_size,
+            device=self.device,
+            amp_dtype=CFG.AMP_DTYPE,
+            tta_fn=tta_predict,
+        )
         torch.cuda.empty_cache()
-        return averaged
+        return prob_map
 
     # ── Stage 2A rooftop classification ──────────────────────────────────────
 
@@ -659,39 +587,6 @@ class GeoIntelPipeline:
             f"Raw Detections: {len(dets)}  →  After Soft-NMS: {len(final_dets)}"
         )
         return final_dets
-
-
-def _to_uint8(arr):
-    if arr is None or arr.size == 0:
-        return np.zeros((256, 256, 3), dtype=np.uint8)
-    arr = np.asarray(arr)
-    if arr.ndim == 0:
-        return np.zeros((256, 256, 3), dtype=np.uint8)
-    if arr.ndim == 2:
-        arr = np.stack([arr] * 3, axis=-1)
-    if arr.ndim != 3:
-        return np.zeros((256, 256, 3), dtype=np.uint8)
-
-    bands = min(arr.shape[2], 3)
-    img = arr[:, :, :bands].astype(np.float32)
-    
-    lo = np.zeros((1, 1, bands), dtype=np.float32)
-    hi = np.zeros((1, 1, bands), dtype=np.float32)
-    for b in range(bands):
-        valid = img[..., b][img[..., b] > 0]
-        if valid.size > 0:
-            lo[0, 0, b] = np.percentile(valid, 2)
-            hi[0, 0, b] = np.percentile(valid, 98)
-        else:
-            hi[0, 0, b] = 255.0
-
-    safe = np.where(hi > lo, hi - lo, 1.0)
-    out = np.clip((img - lo) / safe * 255.0, 0, 255).astype(np.uint8)
-    out[img == 0] = 0
-    if bands < 3:
-        fill = np.repeat(out[:, :, :1], 3 - bands, axis=2)
-        out = np.concatenate([out, fill], axis=2)
-    return out
 
 
 if __name__ == "__main__":

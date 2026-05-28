@@ -561,10 +561,10 @@ def merge_rooftop_labels(
 
 def detections_to_shapefile(
     detections: List[Dict],  # from InfrastructureDetector.predict()
-    transform,  # rasterio Affine for the tile
+    transform,
     crs,
     out_path: str,
-):
+) -> str | None:
     """
     Convert bounding-box / OBB detections to a GeoDataFrame.
 
@@ -598,6 +598,15 @@ def detections_to_shapefile(
             # Rotate around centroid; YOLO angle is clockwise in image space
             angle_deg = math.degrees(angle_rad)
             geom = rotate(rect, -angle_deg, origin=(geo_cx, geo_cy), use_radians=False)
+        elif obb is not None and len(obb) == 8:
+            # OBB-8 format: [x1, y1, x2, y2, x3, y3, x4, y4] in pixel coords
+            corners_px = [(obb[i], obb[i+1]) for i in range(0, 8, 2)]
+            corners_geo = []
+            for px, py in corners_px:
+                gx = transform.c + px * transform.a
+                gy = transform.f + py * transform.e
+                corners_geo.append((gx, gy))
+            geom = Polygon(corners_geo)
         else:
             geom = Point(geo_cx, geo_cy)
 

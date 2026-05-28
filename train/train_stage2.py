@@ -21,6 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import argparse
+import gc
 import time
 import typing
 
@@ -601,7 +602,7 @@ def _val_clf(model, loader, device, cfg: typing.Any, amp_ctx, epoch=None):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def train_stage2b(resume: bool = True):
+def train_stage2b(data_yaml: str | None = None, resume: bool = True):
     cfg: typing.Any = CFG.STAGE2B
     variant = cfg["model_variant"]
     log.info(f"\n[Stage 2B] {variant} infrastructure detector")
@@ -610,7 +611,8 @@ def train_stage2b(resume: bool = True):
     log.info("  Progress: YOLO shows live training metrics in the console during .train()")
     log.info(f"  Watch folder: {CFG.CKPT_DIR / f'stage2b_{variant}'}")
 
-    data_yaml = _write_yolo_yaml()
+    if data_yaml is None:
+        data_yaml = _write_yolo_yaml()
     if not data_yaml:
         return None
     _validate_yolo_yaml(data_yaml)  # catch malformed YAML before YOLO starts
@@ -823,17 +825,117 @@ def _write_yolo_yaml() -> str:
     return str(yaml_path)
 
 
+def extract_infra_data(data_dirs: list) -> int:
+    from data.preprocessing import scan_folder, _extract_infra_streaming
+
+    cfg2b: typing.Any = CFG.STAGE2B
+    out_img_dir = str(CFG.YOLO_DIR / "images")
+    out_lbl_dir = str(CFG.YOLO_DIR / "labels")
+    total_infra = 0
+
+    for folder in data_dirs:
+        folder = Path(folder)
+        if not folder.exists():
+            log.info(f"  [SKIP] Folder not found: {folder}")
+            continue
+        log.info(f"\n{'='*60}")
+        log.info(f"  Scanning: {folder}")
+        log.info(f"{'='*60}")
+        rasters, shps = scan_folder(str(folder))
+        if not rasters:
+            log.info(f"  No rasters found in {folder}")
+            continue
+        shp_by_stem = {s.stem.lower().rstrip("_"): s for s in shps}
+        utility_shps = [s for k, s in shp_by_stem.items() if k.startswith("utility")]
+        if not utility_shps:
+            log.info(f"  No Utility shapefiles found in {folder}")
+            continue
+        log.info(f"  Utility SHPs: {[s.name for s in utility_shps]}")
+        for raster_path in rasters:
+            log.info(f"\n  Processing: {raster_path.name}")
+            try:
+                n = _extract_infra_streaming(
+                    raster_path,
+                    utility_shps,
+                    cfg2b["shp_infra_col"],
+                    CFG.INFRA_TYPE_MAP,
+                    cfg2b["class_names"],
+                    out_img_dir,
+                    out_lbl_dir,
+                    cfg2b["img_size"],
+                    class_buffer_px=cfg2b.get("class_buffer_px"),
+                    neg_tile_ratio=cfg2b.get("neg_tile_ratio", 0.0),
+                    use_obb=cfg2b.get("use_obb", False),
+                )
+                total_infra += n
+                log.info(f"    -> {n} infrastructure objects extracted")
+            except Exception as e:
+                log.error("Extraction failed: %s", e, exc_info=True)
+                continue
+            gc.collect()
+
+    img_count = len(list((CFG.YOLO_DIR / "images").glob("*.png")))
+    lbl_count = len(list((CFG.YOLO_DIR / "labels").glob("*.txt")))
+    neg_count = len(list((CFG.YOLO_DIR / "images").glob("infra_neg_*.png")))
+    log.info(f"\n{'='*60}")
+    log.info(f"  EXTRACTION COMPLETE")
+    log.info(f"  Total infrastructure objects: {total_infra}")
+    log.info(f"  Tile images: {img_count}  ({neg_count} negative)")
+    log.info(f"  Label files: {lbl_count}")
+    log.info(f"  Output: {CFG.YOLO_DIR}")
+    log.info(f"{'='*60}")
+    return total_infra
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--stage", choices=["2a", "2b", "both"], default="both")
+    ap.add_argument("--stage", choices=["2a", "2b", "both", "2b-extract"], default="both")
+    ap.add_argument("--data-dir", action="append", default=None, help="Dataset folder(s) with rasters + Utility SHPs")
+    ap.add_argument("--extract-only", action="store_true", help="Only extract data, don't train")
+    ap.add_argument("--train-only", action="store_true", help="Only train (assumes data already extracted)")
+    ap.add_argument("--no-resume", action="store_true", help="Train from scratch")
+    ap.add_argument("--clean", action="store_true", help="Delete existing YOLO data before extraction")
     args = ap.parse_args()
+
+    if args.stage == "2b-extract":
+        args.stage = "2b"
+        args.extract_only = True
+
     with crash_logged(log, f"Stage {args.stage} training"):
         if args.stage in ("2a", "both"):
             train_stage2a()
-            # ConvNeXt-L's cached blocks would otherwise sit in the allocator
-            # while YOLO tries to grab its own 1280-px tensors — release them
-            # so Stage 2B starts on a defragmented heap.
             if args.stage == "both":
                 clear_cuda_cache()
         if args.stage in ("2b", "both"):
-            train_stage2b()
+            device = setup(verbose=True)
+            log.info(f"\n  Device: {device}")
+
+            if args.clean:
+                import shutil as _shutil
+                yolo_dir = CFG.YOLO_DIR
+                for sub in ["images", "labels", "train", "val"]:
+                    d = yolo_dir / sub
+                    if d.exists():
+                        _shutil.rmtree(d, ignore_errors=True)
+                        d.mkdir(parents=True, exist_ok=True)
+                log.info("  Cleaned existing YOLO data")
+
+            if not args.train_only:
+                data_dirs = args.data_dir or [
+                    str(d) for d in sorted(CFG.DATA_ROOT.iterdir())
+                    if d.is_dir() and d.name not in {
+                        "patches", "patch_masks", "building_crops",
+                        "yolo_infra", "masks",
+                    }
+                ]
+                log.info(f"\n  Data folders: {data_dirs}")
+                n = extract_infra_data(data_dirs)
+                if n == 0:
+                    log.error("No infrastructure objects found")
+                    sys.exit(1)
+
+            if args.extract_only:
+                log.info("\n  Done (extract-only mode).")
+            else:
+                clear_cuda_cache()
+                train_stage2b(resume=not args.no_resume)

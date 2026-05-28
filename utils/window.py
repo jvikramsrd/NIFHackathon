@@ -10,6 +10,16 @@ easier.
 import numpy as np
 
 
+def gaussian_window(window_size: int, sigma: float | None = None) -> np.ndarray:
+    window_size = int(window_size)
+    if sigma is None:
+        sigma = window_size / 6.0
+    ax = np.linspace(-(window_size - 1) / 2.0, (window_size - 1) / 2.0, window_size)
+    gauss_1d = np.exp(-0.5 * (ax / sigma) ** 2)
+    gauss_2d = np.outer(gauss_1d, gauss_1d)
+    return gauss_2d.astype(np.float32)
+
+
 def cosine_window(window_size: int, overlap: int, power: float = 2.0) -> np.ndarray:
     """
     Return a 2‑D cosine spline window for seamless blending of overlapping tiles.
