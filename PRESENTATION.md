@@ -143,7 +143,7 @@ D4 group: 4 rotations × 2 flip states = 8 folds per scale.
 
 ---
 
-## 7. Stage 2A — Why ConvNeXt-Large + ArcFace
+## 7. Stage 2A — Why ConvNeXt V2 Large + ArcFace
 
 ### Backbone alternatives
 
@@ -151,7 +151,7 @@ D4 group: 4 rotations × 2 flip states = 8 folds per scale.
 |---|---|---|---|
 | ResNet-50 | baseline | OK | older, no large-kernel conv |
 | ViT-Base | poor at 224 px | poor | ViTs need bigger inputs for texture |
-| **ConvNeXt-Large ←** | **best** | **+15-25 %** | large-kernel depthwise conv = texture specialist |
+| **ConvNeXt V2 Large ←** | **best** | **+15-25 %** | FCMAE pretraining + GRN; SOTA texture specialist |
 | Swin-B | good | medium | window attention has conditional ops → no `fullgraph=True` compile |
 
 ### Head alternatives
@@ -188,7 +188,7 @@ Equalises brightness across villages with different sun angles **before** augmen
 
 ---
 
-## 9. Stage 2B — Why YOLOv11l + SAHI (AABB)
+## 9. Stage 2B — Why YOLO11-OBB + SAHI
 
 ### Detector alternatives
 
@@ -200,13 +200,14 @@ Equalises brightness across villages with different sun angles **before** augmen
 | YOLOv9e | ~58 M | medium | high | Strong but **2× slower than YOLOv11l** at parity |
 | **YOLOv11l ←** | **~25 M** | **fastest** | **highest** | **C2PSA attention; ~4.5 GB at 1280 px → batch=4 fits A4000** |
 
-### Why AABB (axis-aligned), not OBB
+### Why OBB (oriented bounding boxes)
 
-Transformer / overhead_tank / well are rotationally symmetric (circles) or
-near-square from a top-down drone view. OBB's angle target is **undefined for
-circles** and **4-way ambiguous for squares** — regression head learns noise.
-AABB outputs **Point centroids** in `detections_to_shapefile`, which is what
-GIS users actually want for an infrastructure inventory layer.
+While transformers, tanks, and wells are rotationally symmetric, their
+bounding boxes in dense clusters benefit from OBB's tight rotated fit —
+two adjacent wells or a transformer at 45° get clean separation that
+axis-aligned boxes would merge. `cfg["use_obb"]=True` enables
+`yolo11l-obb`; outputs are stored as rotated rectangle polygons in
+geo-coordinates, preserving orientation for GIS users.
 
 ### Why SAHI (Slicing Aided Hyper Inference)
 
@@ -433,7 +434,7 @@ Wrote an inline AST tool to find:
 | `List` | unused import | `models/stage2_models.py` |
 | `DataLoader` | replaced by `make_loader` | `train/train_stage1.py` |
 | `cleanup_ddp` | unused import | `train/train_stage1.py` |
-| `os`, `math` | unused imports | `train/train_stage2.py`, `run_stage2b.py` |
+| `os`, `math` | unused imports | `train/train_stage2.py` |
 | `math` | unused import | `tests/test_core_components.py` |
 
 **Result:** 33/33 project files parse-clean with zero unused top-level imports.
@@ -629,12 +630,12 @@ INPUT (GeoTIFF / ECW, up to 72 GB)
     ↓
  SEGMENTATION MASK + per-class .shp + .gpkg
     │
-    ├─→ STAGE 2A   ConvNeXt-L + ArcFace (bf16, NHWC, SAM)
+    ├─→ STAGE 2A   ConvNeXt V2 L + ArcFace (bf16, NHWC, SAM)
     │             224px crops from building polygons
     │             24-pass TTA → per-class threshold
     │             → building_rooftop.shp
     │
-    └─→ STAGE 2B   YOLOv11l + SAHI (AABB)
+    └─→ STAGE 2B   YOLO11-OBB + SAHI
                   1280px tiles, STRtree-gated by Stage 1
                   SAHI 512px slices → NMM → Soft-NMS (σ=0.40)
                   → infrastructure.shp

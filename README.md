@@ -29,7 +29,7 @@ INPUT: SVAMITVA drone orthophoto (GeoTIFF / ECW) + Annotation Shapefiles
 ┌────────────────────────┐     ┌──────────────────────────────┐
 │  STAGE 2A              │     │  STAGE 2B                    │
 │  Rooftop Classifier    │     │  Infrastructure Detector     │
-│  ConvNeXt-Large        │     │  YOLOv11l (AABB)             │
+│  ConvNeXt V2 Large     │     │  YOLO11-OBB                  │
 │  + ArcFace Head        │     │  + SAHI Sliced Inference     │
 │  224×224 crops         │     │  1280×1280 tiles             │
 │                        │     │                              │
@@ -185,7 +185,7 @@ This installs two console commands:
 | Stage | Model | Input | Batch | NVIDIA A4000 | Apple M2 Max (96 GB unified) |
 |-------|-------|-------|-------|--------------|-------------------------------|
 | 1 — Segmentation | Unet mit_b4 | 512×512 | 8 | ~12 GB | ~16 GB unified |
-| 2A — Classification | ConvNeXt-Large | 224×224 | 32 | ~7.8 GB | ~8 GB unified |
+| 2A — Classification | ConvNeXt V2 Large | 224×224 | 32 | ~7.8 GB | ~8 GB unified |
 | 2B — Detection | YOLOv11l | 1280×1280 | 4 | ~5.5 GB | ~7 GB unified |
 
 ---
@@ -285,6 +285,7 @@ NIFHackathon/
 ├── infer_folder.py                # Standalone batch inference script
 ├── export_models.py               # ONNX export utility
 ├── build.py                       # Binary build script (PyInstaller)
+├── _setup_verify.py               # Post-install smoke test
 ├── geo_intel.spec                 # PyInstaller spec
 ├── pyproject.toml                 # pip-installable package definition
 ├── requirements.txt               # Base deps (no torch — platform-specific)
@@ -303,29 +304,32 @@ NIFHackathon/
 │   └── dataset.py                 # PyTorch Datasets + Albumentations pipelines
 │
 ├── models/
-│   ├── stage1_segmentation.py     # Unet + scSE + TriLoss + Lovász + TTA
-│   └── stage2_models.py           # ConvNeXt-Large + ArcFace + YOLOv11l + SAHI
+│   ├── stage1_segmentation.py     # MAnet + MiT-B4 + TriLoss + TTA
+│   └── stage2_models.py           # ConvNeXt V2 + ArcFace + YOLO-OBB + SAHI
 │
 ├── train/
 │   ├── train_stage1.py            # EMA, SWA, grad checkpointing (SAM available, off by default)
-│   └── train_stage2.py            # Classifier + YOLO training loops
+│   └── train_stage2.py            # Classifier + YOLO training loops + data extraction
 │
 ├── inference/
 │   └── pipeline.py                # Batched multi-stage inference + shapefile export
 │
 ├── utils/
 │   ├── hardware.py                # Multi-backend setup, AMP, EMA, VRAM stats
+│   ├── image_utils.py             # Shared to_uint8() image normalisation
+│   ├── inference.py               # Shared sliding-window inference with Gaussian weight map
 │   ├── sam.py                     # Sharpness-Aware Minimisation optimiser
 │   ├── metrics.py                 # mIoU, Dice, per-class IoU
 │   ├── postprocess.py             # DenseCRF, watershed, morphology, vectorisation
 │   ├── checkpointing.py           # Atomic checkpoint save/load
 │   ├── logger.py                  # Structured logging + crash recovery
-│   ├── window.py                  # Cosine spline blending for tile stitching
+│   ├── window.py                  # Gaussian blending + cosine spline window
 │   └── ecw_compat.py              # ECW → GeoTIFF auto-conversion (rasterio / gdal_translate / osgeo)
 │
 └── tests/
     ├── test_config_values.py      # Config value assertions
-    └── test_core_components.py    # Unit tests for core pipeline components
+    ├── test_core_components.py    # Unit tests for core pipeline components
+    └── test_data_prep_and_rasterization.py  # Preprocessing unit tests
 ```
 
 ---

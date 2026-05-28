@@ -62,7 +62,7 @@ the right architecture, the right input size, and the right loss:
 | Stage | Task | Why a dedicated model |
 |---|---|---|
 | 1 | Pixel segmentation | Needs full-image context + dense per-pixel output → an encoder-decoder (MAnet/MiT-B4) at 512 px |
-| 2A | Building-level classification | Needs only the cropped rooftop + tight angular margin → ConvNeXt-Large + ArcFace at 224 px |
+| 2A | Building-level classification | Needs only the cropped rooftop + tight angular margin → ConvNeXt V2 Large + ArcFace at 224 px |
 | 2B | Small-object detection | Needs high-resolution sliding-window inference → YOLOv9e-OBB at 1280 px with SAHI |
 
 **Stage 2A is *gated* by Stage 1's building polygons** — it never sees the full
@@ -151,25 +151,24 @@ NIFHackathon/
 ├── gui.py                      ← PyQt6 desktop operator console
 ├── run_pipeline.py             ← Master CLI (preprocess / train / evaluate / infer / all)
 ├── infer_folder.py             ← Batch inference entry point
-├── run_stage2b.py              ← Stage 2B standalone training runner
 ├── export_models.py            ← ONNX / TorchScript export
 ├── _setup_verify.py            ← Post-install smoke test
 ├── build.py                    ← PyInstaller binary builder
 │
 ├── data/
 │   ├── dataset.py              ← Dataset classes + Albumentations augmentation
-│   └── preprocessing.py        ← Raw TIF → patches/crops/YOLO labels (strip-streamed)
+│   └── preprocessing.py        ← Raw TIF → patches/crops/YOLO labels + recursive dataset-root entry
 │
 ├── models/
 │   ├── stage1_segmentation.py  ← MAnet/MiT-B4 + TriLoss + TTA
-│   └── stage2_models.py        ← ConvNeXt+ArcFace + YOLOv9 wrapper + Soft-NMS
+│   └── stage2_models.py        ← ConvNeXt V2+ArcFace + YOLO-OBB wrapper + Soft-NMS
 │
 ├── inference/
 │   └── pipeline.py             ← Full 3-stage inference orchestration
 │
 ├── train/
 │   ├── train_stage1.py         ← Stage 1 training loop (DDP-aware)
-│   ├── train_stage2.py         ← Stage 2A + 2B training loops
+│   ├── train_stage2.py         ← Stage 2A + 2B training loops + infra data extraction
 │   └── launch_ddp.py           ← Multi-GPU torchrun launcher
 │
 ├── utils/
@@ -177,16 +176,18 @@ NIFHackathon/
 │   ├── ddp.py                  ← DistributedDataParallel helpers
 │   ├── ecw_compat.py           ← ECW → GeoTIFF auto-conversion
 │   ├── hardware.py             ← Device setup, EMA, channels_last, AMP, VRAM stats
+│   ├── image_utils.py          ← Shared to_uint8() image normalisation
+│   ├── inference.py            ← Shared sliding-window inference with Gaussian weight map
 │   ├── logger.py               ← Structured logging + crash_logged context manager
 │   ├── metrics.py              ← Segmentation mIoU + detection mAP
 │   ├── postprocess.py          ← CRF, morphology, vectorization, SHP writers
 │   ├── sam.py                  ← Sharpness-Aware Minimisation (batched _foreach_*)
-│   └── window.py               ← Cosine blending window for tile overlap
+│   └── window.py               ← Gaussian + cosine blending windows for tile overlap
 │
 ├── tests/
 │   ├── test_config_values.py   ← Config invariants
 │   ├── test_core_components.py ← Component-level unit tests
-│   └── test_optimizations.py   ← Regression tests for vectorised paths
+│   └── test_data_prep_and_rasterization.py  ← Preprocessing unit tests
 │
 ├── dataset/                    ← Raw SVAMITVA data (gitignored)
 │   ├── patches/                ← 512 px segmentation training tiles
@@ -227,7 +228,7 @@ GeoTIFF / ECW ortho (potentially 70 GB+ uncompressed)
       Vectorised → {prefix}_building.shp, _road.shp, _waterbody.shp, _all_features.gpkg
       │
       ▼
-[STAGE 2A]  ConvNeXt-Large + ArcFace head, bf16 + channels_last
+[STAGE 2A]  ConvNeXt V2 Large + ArcFace head, bf16 + channels_last
       • Constrained to building polygons from Stage 1
       • 224 px crops with 15 % padding, INTER_LINEAR resize
       • Per-class confidence thresholds (RCC/Tiled/Tin/Other)
@@ -236,10 +237,11 @@ GeoTIFF / ECW ortho (potentially 70 GB+ uncompressed)
       → {prefix}_building_rooftop.shp
       │
       ▼
-[STAGE 2B]  YOLOv9e-OBB + SAHI sliced inference
+[STAGE 2B]  YOLO11-OBB + SAHI sliced inference
       • Context-gated tiling (skip tiles >128 px from any building/road)
       • 1280 px tiles, 512 px overlap
       • SAHI slices: 512 px sub-tiles, 45 % overlap, NMM merge
+      • OBB: oriented bounding boxes preserve rotated-object shape
       • Per-class confidence thresholds + Soft-NMS Gaussian (σ=0.40)
       ↓
       → {prefix}_infrastructure.shp
@@ -366,7 +368,7 @@ filters by per-class minimum area: `{building: 80, road: 120, waterbody: 160}`.
 ### Architecture (`models/stage2_models.py → RooftopClassifier`)
 
 ```
-ConvNeXt-Large (timm, ImageNet pretrained, drop_path_rate=0.4)
+ConvNeXt V2 Large (timm, FCMAE pretrained, drop_path_rate=0.4)
   → Global Avg Pool (num_classes=0)
   → LayerNorm(1536)
   → Dropout(0.50)
@@ -377,11 +379,10 @@ ConvNeXt-Large (timm, ImageNet pretrained, drop_path_rate=0.4)
   → ArcFaceHead(768 → 4, s=30.0, m=0.55)    [or nn.Linear if use_arcface=False]
 ```
 
-**Why ConvNeXt-Large over ViT:** large-kernel depthwise convolutions in
-ConvNeXt are the best fit for fine-grained texture classification at small
-input sizes (224 px). ViTs need bigger inputs to be competitive on texture.
-ConvNeXt is also one of the best `channels_last`-friendly architectures —
-on Ampere it gains 15–25 %.
+**Why ConvNeXt V2 Large over ConvNeXt V1:** V2 adds Global Response
+Normalisation (GRN) and FCMAE self-supervised pretraining, which gives
++1-2 % top-1 on ImageNet and sharper texture discrimination on aerial
+rooftops without any architectural overhead at inference.
 
 **Why ArcFace:** RCC and Tiled rooftops share visual statistics (both are
 hard, often grey, broken into rectangular cells). Standard softmax produces
@@ -394,7 +395,7 @@ without instability on this dataset. The original code hardcoded `m=0.50`
 and ignored the config value for 11 commits; the bug was fixed and 0.55 is
 now actually in effect.
 
-**Why `drop_path_rate=0.4`:** ConvNeXt-Large is ~200 M params on a small
+**Why `drop_path_rate=0.4`:** ConvNeXt V2 Large is ~200 M params on a small
 rooftop dataset. Aggressive stochastic depth is the main regulariser.
 
 ### Training loop highlights
@@ -461,26 +462,25 @@ prediction is overridden to **`Other`**:
 
 ### Backend (`models/stage2_models.py → InfrastructureDetector`)
 
-**Primary:** `YOLOv11l` (axis-aligned) via `ultralytics`.
+**Primary:** `YOLO11l-OBB` (oriented bounding boxes) via `ultralytics`.
 Falls back to torchvision `fasterrcnn_resnet50_fpn_v2` if `ultralytics` is
 missing.
+
+**Why YOLO11-OBB:** while transformers, tanks, and wells are rotationally
+symmetric, their bounding boxes in dense clusters benefit from OBB's
+tight rotated fit — two adjacent wells or a transformer mounted on a pole
+at 45° get clean separation that axis-aligned boxes would merge. OBB is
+enabled via `cfg["use_obb"]=True` with `"obb_model_variant"="yolo11l-obb"`.
+Outputs are stored as rotated rectangle polygons in geo-coordinates
+(via `detections_to_shapefile`), preserving orientation for GIS users.
 
 **Why YOLOv11l over YOLOv9e (previous choice):**
 - ~2× faster at parity COCO accuracy (25 M params vs 58 M)
 - C2PSA attention block gives a small but consistent recall lift on small
   objects (wells ~15 px, transformers ~30 px)
 - Frees ~2.5 GB VRAM at imgsz=1280 → `batch_size` doubled from 2 to 4 on the A4000
-- Actively maintained in `ultralytics`; YOLOv9-OBB was never a first-party
-  release and we were silently falling back to AABB anyway
-
-**Why AABB, not OBB:** the three target classes are rotationally symmetric
-(circular wells, circular/square tanks) or near-square from a top-down drone
-view. The angle parameter is mathematically undefined for circles and
-4-way ambiguous for squares, so OBB regression on these objects is wasted
-capacity at best and noisy at worst. AABB outputs Point centroids via
-`detections_to_shapefile`, which is what GIS users actually want for an
-infrastructure inventory layer. `cfg["obb_model_variant"]` is retained as a
-no-op fallback in case OBB is ever re-enabled for a different class set.
+- First-class OBB support in `ultralytics` (unlike YOLOv9-OBB which was
+  never a first-party release)
 
 ### SAHI — Slicing Aided Hyper Inference
 
@@ -541,7 +541,7 @@ inference-time saving across the pipeline.
 | `close_mosaic` | 20 | Disables mosaic for the last 20 epochs so the model sees clean images before convergence (avoids mosaic-conditioned features) |
 | `mixup` | 0.15 | Light mixup |
 | `copy_paste` | 0.30 | Strong copy-paste — proven mAP lift for sparse small-object datasets |
-| `flipud` | 0.5 | Aerial imagery is rotation-invariant; vertical flips are fine |
+| `flipud` | 0.5 | Aerial imagery is rotation-invariant; vertical flips are fine. Unified between `train/train_stage2.py` and the old standalone `run_stage2b.py` (which had `flipud=0.0` — now removed, merged into `train_stage2()`). |
 | `multi_scale` | True | YOLO resizes within ±50 % each batch |
 | `dropout` | 0.1 | Light head dropout |
 | `amp` | True | Auto-mixed precision |
@@ -873,6 +873,10 @@ Incompatibilities (enforced at config-load time):
 2-D cosine taper. Used by both Stage 1's `_segment()` and the DenseCRF tiler.
 `power=2` gives a smooth C¹-continuous taper; no visible tile seams.
 
+**`gaussian_window(window_size, sigma)`** — 2-D Gaussian weight map used by
+the shared `sliding_window_inference()` in `utils/inference.py`. Eliminates
+edge artefacts when stitching overlapping inference patches.
+
 ### `utils/ecw_compat.py`
 
 ECW → GeoTIFF auto-conversion. Cascade of strategies:
@@ -889,14 +893,14 @@ Raises a clear `RuntimeError` with install instructions if all four fail.
 ## 14. Entry Points
 
 | Script | Purpose | Usage |
-|---|---|---|
+|---|---|---|---|
 | `run_pipeline.py` | Master CLI | `python run_pipeline.py --mode {preprocess,train_stage1,train_stage2,train_all,evaluate,infer,all} [--data_root DIR] [--tif FILE] [--out DIR]` |
 | `inference/pipeline.py` | Single-image inference | `python inference/pipeline.py --tif file.tif --out ./out` |
 | `infer_folder.py` | Batch inference on a folder | `python infer_folder.py --test_folder ./test --out_folder ./results` |
+| `data/preprocessing.py` | Recursive dataset-root preprocessing | `python -c "from data.preprocessing import preprocess_main; preprocess_main()"` |
 | `train/train_stage1.py` | Stage 1 training (standalone) | `python train/train_stage1.py` |
-| `train/train_stage2.py` | Stage 2A / 2B training | `python train/train_stage2.py --stage {2a,2b,both}` |
+| `train/train_stage2.py` | Stage 2A / 2B training + data extraction | `python train/train_stage2.py --stage {2a,2b,both,2b-extract} [--data-dir DIR] [--extract-only] [--train-only] [--no-resume] [--clean]` |
 | `train/launch_ddp.py` | Multi-GPU launcher | `torchrun --nproc_per_node=N train/launch_ddp.py` |
-| `run_stage2b.py` | Stage 2B standalone runner | `python run_stage2b.py` |
 | `export_models.py` | ONNX / TorchScript export | `python export_models.py` |
 | `gui.py` | Desktop operator console | `python gui.py` (or `launch_gui.bat`) |
 | `_setup_verify.py` | Post-install smoke test | `python _setup_verify.py` |
