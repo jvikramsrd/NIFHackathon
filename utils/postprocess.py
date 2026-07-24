@@ -17,7 +17,7 @@ from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
-from utils.logger import get_logger
+from utils.core import get_logger
 
 # Optional geo stack — hoisted to module level so we pay the import cost once
 # rather than on every call to mask_to_shapefile / clean_vector_geometries /
@@ -453,7 +453,7 @@ def mask_to_shapefile(
                     "class_name": [class_name] * len(geoms_list),
                 },
                 geometry=geoms_list,
-                crs=crs,
+                crs=crs or "EPSG:3857",
             )
             gdf = clean_vector_geometries(
                 gdf,
@@ -466,6 +466,8 @@ def mask_to_shapefile(
 
             cls_path = out_dir / f"{prefix}_{class_name}.shp"
             gdf.to_file(str(cls_path))
+            cls_path_json = out_dir / f"{prefix}_{class_name}.geojson"
+            gdf.to_file(str(cls_path_json), driver="GeoJSON")
             all_gdfs.append(gdf)
         except Exception as e:
             log.warning(f"Failed to process class {class_name}: {e}")
@@ -474,7 +476,7 @@ def mask_to_shapefile(
     if all_gdfs:
         try:
             combined = pd.concat(all_gdfs, ignore_index=True)
-            combined_gdf = gpd.GeoDataFrame(combined, crs=crs)
+            combined_gdf = gpd.GeoDataFrame(combined, crs=crs or "EPSG:3857")
             combined_path = out_dir / f"{prefix}_all_features.gpkg"
             combined_gdf.to_file(str(combined_path), driver="GPKG")
             log.info(f"  ✓ Combined vector saved: {combined_path}")
@@ -621,5 +623,7 @@ def detections_to_shapefile(
 
     gdf = gpd.GeoDataFrame(rows, crs=crs)
     gdf.to_file(out_path)
-    log.info("  ✓ Infrastructure features → %s", out_path)
+    out_path_json = str(Path(out_path).with_suffix(".geojson"))
+    gdf.to_file(out_path_json, driver="GeoJSON")
+    log.info("  ✓ Infrastructure features → %s and .geojson", out_path)
     return gdf

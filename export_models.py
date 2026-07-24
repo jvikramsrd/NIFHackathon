@@ -13,13 +13,13 @@ import config as CFG
 from models.stage1_segmentation import Stage1Module
 from models.stage2_models import RooftopClassifier
 from utils.checkpointing import clean_state_dict
-from utils.logger import get_logger
+from utils.core import get_logger
 
 log = get_logger(__name__)
 
 
 def export_stage1_onnx(
-    ckpt_path: Path = CFG.CKPT_DIR / "stage1_best.pth",
+    ckpt_path: Path = CFG.CKPT_DIR / f"stage1_{CFG.STAGE1['encoder']}_best.pth",
     out_path: Path = CFG.CKPT_DIR / "stage1.onnx",
     opset: int = 17,
 ) -> Path:
@@ -113,7 +113,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.stage == "1":
-        onnx_path = export_stage1_onnx(args.ckpt or CFG.CKPT_DIR / "stage1_best.pth")
+        onnx_path = export_stage1_onnx(args.ckpt or CFG.CKPT_DIR / f"stage1_{CFG.STAGE1['encoder']}_best.pth")
         if args.format == "engine":
             export_tensorrt_from_onnx(onnx_path)
     elif args.stage == "2a":

@@ -918,8 +918,14 @@ class CheckpointPanel(QWidget):
         layout.addWidget(_section_label("Checkpoints"))
 
         self._rows: list[tuple[str, QLabel, QLabel]] = []
+        try:
+            import config
+            stage1_ckpt = f"stage1_{config.STAGE1['encoder']}_best.pth"
+        except ImportError:
+            stage1_ckpt = "stage1_best.pth"
+
         stages = [
-            ("Stage 1", "stage1_best.pth"),
+            ("Stage 1", stage1_ckpt),
             ("Stage 2A", "stage2a_best.pth"),
         ]
         for label, fname in stages:

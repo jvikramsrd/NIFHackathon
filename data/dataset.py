@@ -251,23 +251,26 @@ def get_train_transforms(patch_size: int = 640, patch_sizes=None):
             ),
             A.OneOf(
                 [
-                    A.GaussNoise(std_range=(0.04, 0.24)),
+                    A.GaussNoise(std_range=(0.02, 0.18)),
                     A.GaussianBlur(blur_limit=(3, 7)),
                     A.MotionBlur(blur_limit=7),
                     A.MedianBlur(blur_limit=3),
                 ],
                 p=0.35,
             ),
-            A.Perspective(scale=(0.05, 0.1), p=0.20),
-            # NOTE: A.Affine with scale was removed — the multi-scale crop block
-            # above already handles scale augmentation, and double-scaling mis-aligns
-            # the segmentation mask relative to the image.
-            # CoarseDropout: simulates tree canopy occlusion
+            # GridDistortion: simulates terrain undulation and minor orthorectification
+            # artifacts present in drone imagery. More realistic than Perspective
+            # (which can tilt buildings beyond their true aerial appearance).
+            A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.20),
+            # CoarseDropout: simulates tree canopy / building shadow occlusion.
+            # fill=127 (neutral gray) instead of fill=0 (black) — fill=0 teaches the
+            # network to predict background class for occluded black patches, which
+            # incorrectly biases predictions toward class 0.
             A.CoarseDropout(
                 num_holes_range=(8, 16),
                 hole_height_range=(32, 64),
                 hole_width_range=(32, 64),
-                fill=0,
+                fill=127,
                 p=0.35,
             ),
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
@@ -298,14 +301,12 @@ def get_clf_train_transforms(
     randaugment_m: int = 7,
 ):
     transforms = [
-        # scale=(0.80,1.0): lower 0.70 was too aggressive — produced 157px
-        # texture snippets that barely showed a full rooftop at 224px crop size.
-        A.RandomResizedCrop(size=(crop_size, crop_size), scale=(0.80, 1.0)),
+        # scale=(0.60,1.0): larger variance handles different drone altitudes.
+        A.RandomResizedCrop(size=(crop_size, crop_size), scale=(0.60, 1.0)),
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
-        A.RandomRotate90(p=0.75),
+        A.SafeRotate(limit=180, p=0.85, border_mode=cv2.BORDER_REFLECT),
         # NOTE: A.Transpose removed — swaps row/col axes, breaking geospatial reference.
-        # The full D4 group is already covered by RandomRotate90 + HFlip + VFlip.
     ]
     if use_randaugment:
         transforms.append(_randaugment_block(randaugment_n, randaugment_m, p=0.85))
@@ -401,37 +402,69 @@ def split_clf_dataset(
     randaugment_n=2,
     randaugment_m=7,
 ):
+    from collections import defaultdict
     c2id = {c: i for i, c in enumerate(class_names)}
     trn_samples = []
     val_samples = []
     rng = random.Random(seed)
 
+    all_samples = []
     for cls in class_names:
         cls_dir = Path(root_dir) / cls
         if not cls_dir.is_dir():
             continue
-        cls_samples = [
-            (Path(e.path), c2id[cls])
-            for e in os.scandir(str(cls_dir))
-            if e.name.endswith(".png") and e.stat().st_size > 0
-        ]
-        if not cls_samples:
-            continue
-        cls_samples.sort(key=lambda x: str(x[0]))
-        rng.shuffle(cls_samples)
+        for e in os.scandir(str(cls_dir)):
+            if e.name.endswith(".png") and e.stat().st_size > 0:
+                all_samples.append((Path(e.path), c2id[cls]))
 
-        n_val = max(1, int(len(cls_samples) * val_fraction)) if len(cls_samples) > 1 else 0
-        val_samples.extend(cls_samples[:n_val])
-        trn_samples.extend(cls_samples[n_val:])
+    if not all_samples:
+        raise ValueError(f"No valid training samples found in {root_dir}")
+
+    raster_groups = defaultdict(list)
+    for p, label in all_samples:
+        if "_bldg" in p.stem:
+            parts = p.stem.split("_bldg")
+            prefix = parts[0] + "_bldg" + parts[1][:6]
+        else:
+            prefix = p.stem.rsplit("_", 1)[0]
+        if not prefix:
+            prefix = "ungrouped"
+        raster_groups[prefix].append((p, label))
+
+    raster_names = sorted(raster_groups.keys())
+    n_rasters = len(raster_names)
+    
+    rng.shuffle(raster_names)
+    n_val_rasters = max(1, round(n_rasters * val_fraction))
+    if n_val_rasters >= n_rasters and n_rasters > 1:
+        n_val_rasters = n_rasters - 1
+
+    val_raster_set = set(raster_names[:n_val_rasters])
+    
+    for prefix, samples in raster_groups.items():
+        if prefix in val_raster_set:
+            val_samples.extend(samples)
+        else:
+            trn_samples.extend(samples)
 
     if not trn_samples:
-        raise ValueError(f"No valid training samples found in {root_dir}")
-    if not val_samples:
+        trn_samples = all_samples
+        val_samples = []
+    elif not val_samples:
         val_samples = trn_samples[:max(1, len(trn_samples) // 10)] if len(trn_samples) > 10 else []
         trn_samples = trn_samples[len(val_samples):]
 
     rng.shuffle(trn_samples)
     rng.shuffle(val_samples)
+
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+    _log.info(
+        "split_clf_dataset: %d rasters -> %d train / %d val rasters  "
+        "(%d train crops, %d val crops)  [seed=%d]",
+        n_rasters, n_rasters - len(val_raster_set), len(val_raster_set),
+        len(trn_samples), len(val_samples), seed,
+    )
 
     train_ds = RooftopDataset(
         root_dir,

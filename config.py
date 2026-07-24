@@ -85,18 +85,6 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
 else:
     DEVICE = torch.device("cpu")
     AMP_DTYPE = torch.float32
-# torch.compile uses the OpenAI Triton compiler internally to JIT-compile
-# model graphs. It also enables CUDA Graphs via mode="reduce-overhead",
-# which captures and replays GPU operations to eliminate CPU launch overhead.
-# Available on Linux / WSL; not supported on native Windows (no Triton).
-# WSL (Windows Subsystem for Linux) is detected as "Linux" by platform.system()
-# so it will use Triton and CUDA Graphs normally.
-COMPILE_ENABLED = True
-COMPILE_MODE = "reduce-overhead"  # switch to "max-autotune" for final inference (+5% speed)
-# Explicit CUDA Graphs warmup: runs a dummy batch through the compiled model
-# to trigger compilation + graph capture before the main training loop.
-# Only meaningful when COMPILE_ENABLED=True and COMPILE_MODE="reduce-overhead".
-CUDA_GRAPHS_ENABLED = True
 FAST_TTA = False  # True = 2-scale×4-fold (8 passes); False = 3-scale×8-fold (24 passes, more accurate)
 # Enable model ensemble at inference: combines Stage2A predictions from multiple trained checkpoints.
 # Set to True when multiple stage2a_*.pth checkpoints are available in CKPT_DIR.
@@ -229,67 +217,75 @@ STAGE1 = dict(
     # training script's try/except falls through silently. With MAnet+MiT-B5
     # at 512px in bf16 the activation peak is ~12-13 GB at batch=2+accum=16,
     # effective batch 32 — tight but viable.
+    # Speed-optimized config:
     arch='MAnet',
-    encoder='mit_b5',
+    encoder='mit_b4',  # Swapped to mit_b4 per user request
     encoder_weights='imagenet',
     in_channels=3,
     decoder_attention_type='scse',
     patch_size=512,
-    patch_sizes=(384, 512, 640),  # multi-resolution patch training for scale invariance
-    overlap=128,
-    # batch_size=2 with grad_accum=16 → effective batch 32, same gradient signal as
-    # b4+accum8, but ~30% lower peak VRAM for the larger MiT-B5 encoder.
-    batch_size=2,
-    grad_accum=16,
-    lr=1.5e-4,  # slightly lower LR for larger encoder (avoids early divergence)
+    patch_sizes=None,  # Disabled multi-scale training to speed up dataset loading
+    overlap=102,
+    batch_size=4,      # Safely reduced for mit_b4 memory footprint
+    grad_accum=8,      # Maintained effective batch 32
+    lr=2e-4,
     encoder_lr_mult=0.1,
     weight_decay=1e-4,
-    epochs=90,  # 10 extra epochs for the larger encoder to converge
-    warmup_epochs=5,  # longer warmup for stable training of 82M encoder
+    epochs=60,         # Updated to 60 per user request
+    warmup_epochs=2,
     scheduler='cosine',
-    # Loss weights — SOTA recipe for IoU-maximising segmentation:
-    # Lovász directly optimises the IoU metric (not a proxy), so we give it the
-    # highest weight. Boundary loss sharpens building edges. Focal handles class imbalance.
-    focal_weight=0.35,
-    boundary_weight=0.25,  # raised: boundary precision is critical for polygon output
-    lovasz_weight=0.40,   # raised: directly optimises mIoU — our primary metric
-    # touching_weight=0.0: disabled — this loss penalises building predictions at
-    # ALL building edges (including isolated ones), conflicting with Dice + CE loss
-    # and suppressing mIoU. Instance separation is handled more cleanly by the
-    # watershed postprocessing in utils/postprocess.py (separate_touching_buildings).
-    touching_weight=0.0,
+    # ── LOSS WEIGHTS (v2 — 4 terms: Focal + Lovász + Boundary + Dice)
+    # Lovász directly optimises the mIoU metric → highest weight.
+    # Dice gives stable gradient near convergence (Lovász grad is noisier near 1.0).
+    # Boundary sharpens building polygon edges — critical for GIS output quality.
+    # Focal handles class imbalance (road = 5px thin objects).
+    focal_weight=0.25,    # reduced to make room for Dice
+    boundary_weight=0.20,
+    lovasz_weight=0.40,   # primary mIoU optimiser — keep dominant
+    dice_weight=0.15,     # NEW: Dice loss for stable gradient near convergence
+    touching_weight=0.0,  # disabled — watershed postprocess handles instance separation
     focal_gamma=3.0,
-    # class_weights: higher weight on road (5×) and waterbody (3×) to compensate
-    # for their rarer occurrence in SVAMITVA rural imagery. Background kept at 0.4.
-    class_weights=[0.40, 2.00, 5.00, 3.00],  # waterbody weight raised from 2.5 → 3.0
-    label_smoothing=0.06,  # slightly lower — MiT-B5 is already well-regularized
-    use_swa=True,
+    # ── CLASS WEIGHTS: higher weight on road (thin objects) and waterbody
+    # Background at 0.20 (was 0.40) — reduced further since near-BG patches
+    # are now filtered by min_fg_ratio=0.003, so background CE signal is less critical.
+    class_weights=[0.20, 2.00, 5.50, 3.00],
+    label_smoothing=0.06,
+    # ── EMA: ON. SWA: OFF.
+    # SWA BN update at end of training requires a full pass in train() mode —
+    # this conflicts with EMA restore and produces incorrect BN statistics
+    # when both are active simultaneously. EMA already provides weight averaging.
+    use_swa=False,
     swa_lr=1.5e-5,
     swa_start_frac=0.75,
     use_ema=True,
-    ema_decay=0.9999,  # tighter EMA decay for larger model (slower shadow update = smoother)
-    drop_path_rate=0.3,  # higher stochastic depth for 82M params encoder
+    ema_decay=0.9999,
+    drop_path_rate=0.3,
     val_fraction=0.15,
     seed=42,
     min_building_area_px=80,
     min_road_width_px=3,
     polygon_min_area_px={'building': 80, 'road': 120, 'waterbody': 160},
     polygon_simplify_tolerance=0.5,
-    crf_inference=True,
-    # 10 iterations: cleaner segment boundaries than 5 (Krähenbühl & Koltun
-    # converge by ~10). Inference-time only, no training cost.
+    # ── CRF: DISABLED (pydensecrf not installed; install separately with
+    # `pip install pydensecrf2` if needed for final submission inference).
+    # At 70GB+ TIF scale CRF creates ~120K tiles and takes 2-4 hours per inference.
+    # Enable only for final competition submission runs.
+    crf_inference=False,
     crf_iter=10,
     # CRF bilateral parameters (corrected for 5cm GSD drone imagery):
-    # bi_xy_std=20: spatial kernel = 20px = 1m at 5cm resolution.
-    # The old value of 80px = 4m, far too broad for fine-grained boundaries.
+    # bi_xy_std=20px = 1m at 5cm GSD (old bug: was 80px = 4m, far too broad).
     crf_bi_xy_std=20.0,
     crf_bi_rgb_std=13.0,
     crf_bi_w=10.0,
     crf_pos_xy_std=3.0,
     crf_pos_w=3.0,
     neg_tile_ratio=0.15,
-    min_fg_ratio=0.01,    # minimum foreground fraction to keep a patch
-    inference_batch_size=12,  # reduced from 16: MiT-B5 is larger, keep VRAM headroom
+    # ── MIN FG RATIO: raised from 1e-6 to 0.003 (0.3%)
+    # 1e-6 effectively kept ALL patches including 99.9% background tiles.
+    # 0.003 is permissive enough to keep edge-of-village tiles but filters
+    # tiles that are pure background — reduces training noise significantly.
+    min_fg_ratio=0.003,
+    inference_batch_size=12,
 )
 # --- Stage 2A: Rooftop Classification ---
 STAGE2A = dict(
@@ -298,28 +294,29 @@ STAGE2A = dict(
     shp_roof_col='Roof_type',
     shp_roof_cols=('Roof_type', 'roof_type', 'type', 'Type', 'bldg_type', 'building_type'),
     roof_type_map=ROOF_TYPE_MAP,
-    # Architecture: ConvNeXt V2 Large — state-of-the-art for fine-grained
-    # texture classification. ConvNeXt V2 uses fully-convolutional masked
-    # autoencoder pretraining (FCMAE) which transfers exceptionally well to
-    # aerial rooftop material classification (RCC vs Tiled vs Tin).
-    # The backbone outputs 1536-dim features with Global Response Normalization
-    # (GRN) for better feature competition.
-    arch='convnextv2_large',
+    # Middle-ground config (Best Approach):
+    arch='convnextv2_base',  # Swapped back to base per user request
     pretrained=True,
-    crop_size=256,  # raised from 224: EfficientNetV2-L was pre-trained at 256-480px
+    crop_size=256,           # Kept at high-res 256 for texture accuracy
     min_crop_px=40,
-    batch_size=24,  # slightly reduced for EfficientNetV2-L memory footprint
-    lr=3e-5,  # lower LR: EfficientNetV2-L converges best with conservative LR
-    epochs=100,   # extra epochs for new architecture to fully converge
+    batch_size=32,           # Increased from 24 due to lighter 'base' model
+    lr=5e-5,
+    epochs=60,               # Maintained at 60 epochs
     label_smoothing=0.05,
     mixup_alpha=0.4,
     cutmix_alpha=1.0,
     weight_decay=1e-4,
-    grad_accum=2,  # effective batch 48: better gradient signal for 4-class problem
+    grad_accum=2,            # Adjusted to maintain effective batch 48
     # Validation TTA: 8 folds × 3 scales → single batched forward per scale.
     tta_steps=8,
-    # Per-class confidence thresholds (calibrated for SVAMITVA class frequencies):
-    # Tin and Other are rare → lower threshold to improve recall on minority classes.
+    # Per-class confidence thresholds.
+    # NOTE: These were recalibrated after removing the ArcFace /4.0 hardcoded
+    # temperature. The old code returned cosine*(s/4) at inference \u2014 now it
+    # returns cosine*s (full scale). With s=32 the softmax outputs are more
+    # peaked, so probabilities for the top class approach ~1.0 more quickly.
+    # Thresholds remain as calibrated empirical values \u2014 re-run calibration
+    # (utils/calibration.py) after training to fine-tune per your dataset split.
+    # Tin and Other are rare \u2192 lower threshold to improve recall on minority classes.
     stage2a_conf_thresh={'RCC': 0.45, 'Tiled': 0.50, 'Tin': 0.42, 'Other': 0.35},
     use_arcface=True,
     arcface_s=32.0,  # slightly higher scale: tighter margin for 4-class problem
@@ -365,11 +362,9 @@ STAGE2B = dict(
     # objects. Falls back to AABB centroids for symmetric cases.
     use_obb=True,
     obb_model_variant='yolo11l-obb',
-    img_size=1280,
+    img_size=768,         # 768 is a perfect compromise for speed/accuracy with yolo11l
     cache='ram',
-    # Bumped from 2 → 4: YOLOv11l uses ~4.5 GB at 1280px (vs 7.2 GB for yolov9e),
-    # leaving room for batch=4 on the A4000. Bigger gradient signal per step.
-    batch_size=4,
+    batch_size=8,         # Increased from 4 since img_size is reduced
     # Use the same parallel-loader budget as Stage 1/2A. workers=0 made YOLO
     # decode + Mosaic happen serially on the main thread, leaving the GPU idle
     # between batches.
@@ -380,7 +375,7 @@ STAGE2B = dict(
     # mAP lift on a fixed dataset. Watch VRAM at high img_size.
     dropout=0.1,
     multi_scale=True,
-    epochs=120,
+    epochs=60,            # Updated to 60 per user request
     lr0=1e-3,
     lrf=0.01,
     warmup_epochs=3,

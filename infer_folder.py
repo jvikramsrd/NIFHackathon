@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import tempfile
 
-from utils.logger import get_logger
+from utils.core import get_logger
 
 log = get_logger(__name__)
 
@@ -51,7 +51,7 @@ def infer_folder(test_folder: str, out_base_dir: str):
     log.info("Loading models into VRAM (this happens only once)...")
     try:
         pipe = GeoIntelPipeline(
-            str(CFG.CKPT_DIR / "stage1_best.pth"),
+            str(CFG.CKPT_DIR / f"stage1_{CFG.STAGE1['encoder']}_best.pth"),
             str(CFG.CKPT_DIR / "stage2a_best.pth"),
             str(CFG.CKPT_DIR / f"stage2b_{CFG.STAGE2B['model_variant']}" / "weights" / "best.pt"),
         )

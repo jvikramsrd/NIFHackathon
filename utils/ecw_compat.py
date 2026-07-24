@@ -28,7 +28,7 @@ import tempfile
 from pathlib import Path
 from typing import List, Optional
 
-from utils.logger import get_logger
+from utils.core import get_logger
 
 log = get_logger(__name__)
 
@@ -150,12 +150,16 @@ def ensure_ecw_driver() -> bool:
     binary = _find_gdal_translate()
     if binary:
         root_name = Path(binary).parent.parent.name
-        log.info(
-            "[ECW] %s gdal_translate supports ECW — "
-            "ECW files will be pre-converted to temp TIFs before processing "
-            "(sequential, auto-deleted, zero permanent disk overhead).",
-            root_name,
-        )
+        import multiprocessing
+        if multiprocessing.current_process().name == "MainProcess":
+            log.info(
+                "[ECW] %s gdal_translate supports ECW — "
+                "ECW files will be pre-converted to temp TIFs before processing "
+                "(sequential, auto-deleted, zero permanent disk overhead).",
+                root_name,
+            )
+        else:
+            log.debug("[ECW] %s gdal_translate supports ECW", root_name)
         _ecw_ready = True
     else:
         log.warning(

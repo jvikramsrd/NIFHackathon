@@ -23,6 +23,7 @@ Key behaviours:
   • Detailed per-file logging so you know exactly what succeeded/failed
 """
 
+import argparse
 import gc
 import json
 import os
@@ -31,6 +32,8 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from shapely.geometry import box as shapely_box, Polygon
@@ -47,7 +50,7 @@ import rasterio.warp
 import rasterio.windows
 from tqdm import tqdm
 from utils.image_utils import to_uint8
-from utils.logger import get_logger
+from utils.core import get_logger
 
 log = get_logger(__name__)
 
@@ -60,8 +63,8 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _configure_runtime() -> None:
-    """Set GDAL + OpenCV runtime options for maximum throughput."""
-    os.environ.setdefault("GDAL_NUM_THREADS", "ALL_CPUS")
+    # Limit GDAL threads to avoid massive contention when running 10+ worker processes.
+    os.environ.setdefault("GDAL_NUM_THREADS", "2")
     os.environ.setdefault("GDAL_TIFF_INTERNAL_MASK", "YES")
     os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")
     os.environ.setdefault("VSI_CACHE", "TRUE")
@@ -453,8 +456,16 @@ def _tile_strip(
         # tiles that contain real buildings/roads near the raster boundary.
         # This bug was silently discarding ~15-20% of edge tiles.
         actual_area = ph * pw
-        if actual_area == 0 or np.count_nonzero(pm) / actual_area < min_fg:
+        if actual_area == 0:
             return 0
+            
+        fg_ratio = np.count_nonzero(pm) / actual_area
+        if fg_ratio < min_fg:
+            import random
+            # Keep ~10% of pure background tiles so the model learns "silence"
+            # and doesn't hallucinate buildings everywhere in rural areas.
+            if random.random() > 0.10:
+                return 0
 
         if ph == patch_size and pw == patch_size:
             pad_i = pi
@@ -475,7 +486,7 @@ def _tile_strip(
 
     saved = 0
     # Use all P-Cores (ThreadPoolExecutor avoids multiprocessing spawn overhead for IO-bound cv2 writes)
-    n_workers = max(1, (os.cpu_count() or 4) - 2)
+    n_workers = os.cpu_count() or 4
 
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         results = list(
@@ -860,7 +871,7 @@ def preprocess_folder(folder: str, config) -> Dict:
     # Workers get TIF paths (ECW paths replaced by their converted TIFs)
     work_items = [ecw_tif_map.get(r, r) for r in pending_rasters]
 
-    max_workers = min(5, max(1, multiprocessing.cpu_count() // 2))
+    max_workers = multiprocessing.cpu_count() or 4
     log.info("  Spawning ProcessPoolExecutor with %d workers...", max_workers)
 
     try:
@@ -930,7 +941,8 @@ def _extract_crops_streaming(
     saved = 0
     import re
 
-    stem = re.sub(r"[^\w]", "_", raster_path.stem)[:20]
+    stem = re.sub(r"[^\w]", "_", raster_path.stem)[:50]
+    folder_name = re.sub(r"[^\w]", "_", raster_path.parent.name)[:30]
 
     try:
         from pathlib import Path
@@ -984,12 +996,12 @@ def _extract_crops_streaming(
             from concurrent.futures import ThreadPoolExecutor
             from tqdm import tqdm
 
-            pool = ThreadPoolExecutor(max_workers=4)
+            pool = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
             futures = []
             label_dir_cache: dict = {}
 
             try:
-                for idx in tqdm(range(len(geoms_arr)), desc="      Crops", leave=False):
+                for idx in range(len(geoms_arr)):
                     geom = geoms_arr[idx]
                     if geom is None or geom.is_empty:
                         continue
@@ -1029,7 +1041,7 @@ def _extract_crops_streaming(
                         crop = cv2.resize(
                             crop, (crop_size, crop_size), interpolation=cv2.INTER_AREA
                         )
-                        out_p = str(label_dir / f"{stem}_{idx:06d}.png")
+                        out_p = str(label_dir / f"{folder_name}_bldg{idx:06d}_{stem}.png")
                         bgr = cv2.cvtColor(crop, cv2.COLOR_RGB2BGR)
                         futures.append(pool.submit(cv2.imwrite, out_p, bgr))
                         saved += 1
@@ -1085,7 +1097,8 @@ def _extract_infra_streaming(
     # Per-raster prefix prevents label collisions when multiple TIFs share the
     # same YOLO_DIR — without it, two rasters with an object at the same pixel
     # offset would overwrite each other's tiles silently.
-    safe_prefix = re.sub(r"[^\w]", "_", raster_path.stem)[:40]
+    folder_name = re.sub(r"[^\w]", "_", raster_path.parent.name)[:30]
+    safe_prefix = f"{folder_name}_" + re.sub(r"[^\w]", "_", raster_path.stem)[:40]
 
     try:
         with rasterio.open(str(raster_path)) as src:
@@ -1195,7 +1208,7 @@ def _extract_infra_streaming(
     # safe to background it onto a small thread pool.
     from concurrent.futures import ThreadPoolExecutor as _Pool
 
-    write_pool = _Pool(max_workers=4)
+    write_pool = _Pool(max_workers=os.cpu_count() or 4)
     write_futures = []
 
     def _write_tile(img_path, bgr, lbl_path, label_text):
@@ -1205,9 +1218,7 @@ def _extract_infra_streaming(
     try:
         with rasterio.open(str(raster_path)) as src:
             n_b = src.count
-            for (tr, tc), pts in tqdm(
-                tile_contents.items(), desc="      Infra+", leave=False
-            ):
+            for (tr, tc), pts in tile_contents.items():
                 r2, c2 = min(tr + tile_size, H), min(tc + tile_size, W)
                 ph, pw = r2 - tr, c2 - tc
                 if ph <= 0 or pw <= 0:
@@ -1454,13 +1465,16 @@ def _load_vector_layer(shp_path: Path, target_crs, class_id: int) -> VectorLayer
     geometries = []
     for geom in gdf.geometry.values:
         if geom is None or geom.is_empty:
+            geometries.append(None)
             continue
         if not geom.is_valid:
             try:
                 geom = geom.buffer(0)
             except Exception:
+                geometries.append(None)
                 continue
         if geom is None or geom.is_empty:
+            geometries.append(None)
             continue
         geometries.append(geom)
     if not geometries:
@@ -1524,14 +1538,14 @@ def _query_indices(layer: VectorLayer, tile_box):
 
 
 def _rasterize_window(
-    src: rasterio.io.DatasetReader,
+    src_transform,
     layers: Sequence[VectorLayer],
     window: rasterio.windows.Window,
     patch_size: int,
 ) -> np.ndarray:
     mask = np.zeros((patch_size, patch_size), dtype=np.uint8)
-    tile_transform = rasterio.windows.transform(window, src.transform)
-    tile_box = shapely_box(*rasterio.windows.bounds(window, src.transform))
+    tile_transform = rasterio.windows.transform(window, src_transform)
+    tile_box = shapely_box(*rasterio.windows.bounds(window, src_transform))
     for layer in layers:
         shapes = []
         for idx in _query_indices(layer, tile_box):
@@ -1598,10 +1612,25 @@ def process_raster(
     saved = 0
     skipped_background = 0
     layer_cache: list[VectorLayer] = []
+    built_up_shp = None
+    utility_shps = []
+
     with rasterio.open(str(raster_path)) as src:
         target_crs = src.crs
         for shp_path in shapefiles:
             role_key = _normalize_name(shp_path.stem)
+            
+            raw_role = role_map.get(shp_path.stem.lower()) or role_map.get(role_key) if role_map else None
+            if isinstance(raw_role, tuple):
+                seg_id, _ = raw_role
+            else:
+                seg_id = -1
+                
+            if seg_id == 1 or "built_up" in role_key:
+                built_up_shp = shp_path
+            if seg_id == 0 and "utility" in role_key:
+                utility_shps.append(shp_path)
+
             class_id = resolved_roles.get(role_key)
             if class_id is None or class_id <= 0:
                 continue
@@ -1609,30 +1638,99 @@ def process_raster(
             if layer is not None:
                 layer_cache.append(layer)
         if not layer_cache:
-            return {"raster": str(raster_path), "saved": 0, "skipped_background": 0, "layers": 0}
+            return {"raster": str(raster_path), "saved": 0, "skipped_background": 0, "layers": 0, "crops": 0, "infra": 0}
         prefix = _safe_prefix(raster_path)
-        for window in tqdm(
-            _iter_tile_windows(src.width, src.height, patch_size, stride),
-            desc=f"Rasterizing {raster_path.name}",
-            leave=False,
-        ):
-            image = _read_rgb_window(src, window)
-            mask = _rasterize_window(src, layer_cache, window, patch_size)
+        src_transform = src.transform
+        
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import random
+        
+        def _process_single_window(window, image):
+            mask = _rasterize_window(src_transform, layer_cache, window, patch_size)
             if not np.any(mask):
-                skipped_background += 1
-                continue
+                if random.random() > 0.10:
+                    return 0
             row = int(window.row_off)
             col = int(window.col_off)
             name = f"{prefix}_{row:06d}_{col:06d}.png"
             cv2.imwrite(str(images_dir / name), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
             cv2.imwrite(str(masks_dir / name), mask)
-            saved += 1
+            return 1
+            
+        # Bound thread pool to avoid massive contention when many processes run
+        with ThreadPoolExecutor(max_workers=max(2, (os.cpu_count() or 4) // 4)) as pool:
+            import concurrent.futures
+            from tqdm import tqdm
+            
+            futures = set()
+            with tqdm(desc=f"    {raster_path.name[:20]} patches", leave=False) as pbar:
+                for window in _iter_tile_windows(src.width, src.height, patch_size, stride):
+                    image = _read_rgb_window(src, window)
+                    f = pool.submit(_process_single_window, window, image)
+                    futures.add(f)
+                    
+                    # Bound memory usage by blocking if queue gets too large
+                    while len(futures) > 50:
+                        done, futures = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+                        for d in done:
+                            res = d.result()
+                            if res == 0:
+                                skipped_background += 1
+                            else:
+                                saved += 1
+                            pbar.update(1)
+                
+                # Drain remaining
+                for f in concurrent.futures.as_completed(futures):
+                    res = f.result()
+                    if res == 0:
+                        skipped_background += 1
+                    else:
+                        saved += 1
+                    pbar.update(1)
+
+    n_crops = 0
+    n_infra = 0
+    try:
+        import config as CFG
+        if built_up_shp is not None:
+            raw = CFG.SHP_LAYER_ROLES.get(built_up_shp.stem.lower(), (1, "type"))
+            roof_col = raw[1] if isinstance(raw, tuple) else "type"
+            n_crops = _extract_crops_streaming(
+                raster_path=raster_path,
+                built_up_shp=built_up_shp,
+                roof_col=roof_col,
+                roof_type_map=CFG.ROOF_TYPE_MAP,
+                out_dir=str(output_root / "building_crops"),
+                crop_size=int(CFG.STAGE2A.get("crop_size", 160)),
+                min_px=int(CFG.STAGE2A.get("min_crop_px", 16)),
+            )
+        if utility_shps:
+            raw = CFG.SHP_LAYER_ROLES.get("utility", (0, "utility_type"))
+            infra_col = raw[1] if isinstance(raw, tuple) else "utility_type"
+            n_infra = _extract_infra_streaming(
+                raster_path=raster_path,
+                utility_shps=utility_shps,
+                infra_col=infra_col,
+                infra_type_map=CFG.INFRA_TYPE_MAP,
+                class_names=CFG.STAGE2B.get("class_names", ["transformer", "well", "overhead_tank"]),
+                out_img_dir=str(output_root / "yolo_infra" / "images" / "train"),
+                out_label_dir=str(output_root / "yolo_infra" / "labels" / "train"),
+                tile_size=int(CFG.STAGE2B.get("img_size", 640)),
+                buffer_px=int(CFG.STAGE2B.get("buffer_px", 20)),
+                class_buffer_px=dict(CFG.STAGE2B.get("class_buffer_px", {})),
+            )
+    except Exception as e:
+        log.error(f"Failed to extract Stage 2 data for {raster_path.name}: {e}")
+
     gc.collect()
     return {
         "raster": str(raster_path),
         "saved": saved,
         "skipped_background": skipped_background,
         "layers": len(layer_cache),
+        "crops": n_crops,
+        "infra": n_infra,
     }
 
 
@@ -1664,6 +1762,11 @@ def preprocess_dataset_root(
     total_failed = 0
     total_patches = 0
     total_skipped_background = 0
+    total_crops = 0
+    total_infra = 0
+    import concurrent.futures
+
+    tasks = []
     for unit in units:
         for raster_path in unit.rasters:
             total_rasters += 1
@@ -1676,22 +1779,43 @@ def preprocess_dataset_root(
             }
             if resume and state.get(key) == meta:
                 continue
-            try:
-                result = process_raster(
-                    raster_path=raster_path,
-                    shapefiles=unit.shapefiles,
+            tasks.append((raster_path, unit.shapefiles, key, meta))
+
+    if tasks:
+        max_workers = os.cpu_count() or 4
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_to_task = {
+                executor.submit(
+                    process_raster,
+                    raster_path=t[0],
+                    shapefiles=t[1],
                     output_root=output_root,
                     role_map=role_map,
                     patch_size=patch_size,
                     overlap=overlap,
-                )
-                total_patches += int(result.get("saved", 0))
-                total_skipped_background += int(result.get("skipped_background", 0))
-                state[key] = meta
-            except Exception:
-                total_failed += 1
-            finally:
-                gc.collect()
+                ): t for t in tasks
+            }
+            
+            from tqdm import tqdm
+            for future in tqdm(
+                concurrent.futures.as_completed(future_to_task),
+                total=len(future_to_task),
+                desc="Processing Rasters",
+                unit="raster"
+            ):
+                t = future_to_task[future]
+                key, meta = t[2], t[3]
+                try:
+                    result = future.result()
+                    total_patches += int(result.get("saved", 0))
+                    total_skipped_background += int(result.get("skipped_background", 0))
+                    total_crops += int(result.get("crops", 0))
+                    total_infra += int(result.get("infra", 0))
+                    state[key] = meta
+                except Exception as exc:
+                    log.error(f"Raster {t[0].name} generated an exception: {exc}")
+                    total_failed += 1
+
     if resume:
         _save_checkpoint(checkpoint_path, state)
     return {
@@ -1700,6 +1824,8 @@ def preprocess_dataset_root(
         "failed": total_failed,
         "patches": total_patches,
         "skipped_background": total_skipped_background,
+        "crops": total_crops,
+        "infra": total_infra,
         "checkpoint": str(checkpoint_path),
     }
 
@@ -1712,26 +1838,23 @@ def build_preprocess_parser() -> argparse.ArgumentParser:
     parser.add_argument("--patch-size", type=int, default=512)
     parser.add_argument("--overlap", type=float, default=0.20)
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--clean", action="store_true", help="Alias for --no-resume")
     return parser
 
 
 def preprocess_main(argv: Sequence[str] | None = None) -> int:
     args = build_preprocess_parser().parse_args(argv)
+    no_resume = args.no_resume or args.clean
     summary = preprocess_dataset_root(
         data_root=args.data_root,
         output_root=args.output_root,
         patch_size=args.patch_size,
         overlap=args.overlap,
-        resume=not args.no_resume,
+        resume=not no_resume,
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-
-
+if __name__ == "__main__":
+    import sys
+    sys.exit(preprocess_main())
